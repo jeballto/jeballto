@@ -1,0 +1,105 @@
+# ===============================
+# macOS
+# ===============================
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+
+# ===============================
+# Xcode
+# ===============================
+build/
+DerivedData/
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+xcuserdata/
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+
+# Xcode playgrounds
+timeline.xctimeline
+playground.xcworkspace
+
+# ===============================
+# Swift / SPM
+# ===============================
+.build/
+.swiftpm/
+Package.resolved
+
+# ===============================
+# App Bundles & Artifacts
+# ===============================
+*.app
+*.dSYM
+*.ipa
+
+# ===============================
+# Logs & Runtime State
+# ===============================
+*.log
+logs/
+tmp/
+.cache/
+
+# ===============================
+# VM / AVF Artifacts (IMPORTANT)
+# ===============================
+# VM disks, snapshots, runtime state
+vm-data/
+vms/
+*.img
+*.qcow2
+*.raw
+*.vhd
+*.vhdx
+
+# ===============================
+# Secrets & Local Config
+# ===============================
+.env
+.env.local
+.env.*.local
+secrets/
+config.local.json
+
+# ===============================
+# Certificates & Signing
+# ===============================
+*.p12
+*.cer
+*.pem
+*.key
+Signing/
+ProvisioningProfiles/
+
+# ===============================
+# Fastlane (if ever used)
+# ===============================
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/
+fastlane/test_output/
+
+# ===============================
+# Downloaded Binaries
+# ===============================
+Resources/oras
+
+# ===============================
+# DocC
+# ===============================
+**/.docc-build/
+
+# ===============================
+# Misc
+# ===============================
+.idea/
+.vscode/
+*.swp
+*.swo

@@ -1,0 +1,32 @@
+# SwiftFormat configuration (nicklockwood/SwiftFormat)
+# Equivalent to .swift-format settings
+
+# Line length
+--maxwidth 120
+
+# Indentation
+--indent 2
+--tabwidth 2
+--indentcase false
+--ifdef no-indent
+
+# Function arguments
+--wraparguments before-first
+--wrapcollections before-first
+--wrapparameters before-first
+
+# Other formatting
+--stripunusedargs closure-only
+--self remove
+--header strip
+--importgrouping testable-bottom
+--commas always
+--trimwhitespace always
+--semicolons inline
+--elseposition same-line
+--guardelse same-line
+--patternlet inline
+--empty void
+
+# Excluded directories
+--exclude tmp,.agents,GuestAdditions

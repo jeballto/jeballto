@@ -1,0 +1,390 @@
+# https://taskfile.dev
+
+version: '3'
+
+set: [pipefail]
+
+vars:
+  # Paths
+  DOCC_BUNDLE: "{{.ROOT_DIR}}/JeballtoAgent/JeballtoAgent.docc"
+  DIAGRAMS_DIR: "{{.DOCC_BUNDLE}}/Diagrams"
+  ORAS_BINARY: "{{.ROOT_DIR}}/Resources/oras"
+  OPENAPI_SRC: "{{.ROOT_DIR}}/openapi/jeballto-api.yaml"
+  DERIVED_DATA: "{{.ROOT_DIR}}/.build/DerivedData"
+  DOCS_OUTPUT: "{{.ROOT_DIR}}/.build/Docs"
+  DOCS_DERIVED_DATA: "{{.DOCS_OUTPUT}}/DerivedData"
+  # Xcode
+  PROJECT: "JeballtoProject.xcodeproj"
+  SCHEME: "JeballtoAgent"
+  BUNDLE_ID: "com.jeballto.vmagent"
+  DESTINATION: "platform=macOS,arch=arm64"
+  XCODE_PROJECT_SCHEME: '-project "{{.PROJECT}}" -scheme "{{.SCHEME}}"'
+  XCODE_BUILD_FLAGS: '{{.XCODE_PROJECT_SCHEME}} -derivedDataPath "{{.DERIVED_DATA}}"'
+  XCODE_TEST_FLAGS: '{{.XCODE_BUILD_FLAGS}} {{.TEST_ARGS}}'
+  XCODE_DOCBUILD_FLAGS: '{{.XCODE_PROJECT_SCHEME}} -destination "{{.DESTINATION}}" -derivedDataPath "{{.DOCS_DERIVED_DATA}}"'
+  TEST_ARGS: '-destination "{{.DESTINATION}}" -only-testing:JeballtoAgentTests'
+  # Versions
+  ORAS_VERSION: "1.3.0"
+  APP_VERSION:
+    sh: grep -m1 'MARKETING_VERSION' "{{.PROJECT}}/project.pbxproj" | sed 's/.*= \(.*\);/\1/' | tr -d ' '
+
+tasks:
+  # ─── Top-level ────────────────────────────────────────────────────────────────
+
+  default:
+    desc: List all available tasks
+    silent: true
+    cmds:
+      - task --list
+
+  version:
+    desc: Print the current MARKETING_VERSION
+    silent: true
+    cmds:
+      - 'echo "{{.APP_VERSION}}"'
+
+  info:
+    desc: Print project info and installed tool versions
+    silent: true
+    cmds:
+      - |
+        echo "Jeballto VM Agent v{{.APP_VERSION}}"
+        echo ""
+        line() { printf "  %-18s %s\n" "$1:" "$2"; }
+        line swift            "$(swift --version 2>&1 | head -1)"
+        line xcodebuild       "$(xcodebuild -version 2>/dev/null | head -1)"
+        line task             "$(task --version 2>/dev/null)"
+        line pre-commit       "$(pre-commit --version 2>/dev/null || echo 'not installed')"
+        line xcbeautify       "$(xcbeautify --version 2>/dev/null || echo 'not installed')"
+        line check-jsonschema "$(check-jsonschema --version 2>/dev/null || echo 'not installed')"
+        line mmdc             "$(mmdc --version 2>/dev/null || echo 'not installed (optional)')"
+        if [[ -x "{{.ORAS_BINARY}}" ]]; then
+          line oras "$("{{.ORAS_BINARY}}" version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+        else
+          line oras "not downloaded (task oras:download)"
+        fi
+
+  check:
+    desc: Verify all required and optional tools are installed
+    silent: true
+    cmds:
+      - |
+        missing=0
+        check() {
+          local cmd="$1" kind="$2" install="$3"
+          if command -v "$cmd" &>/dev/null; then
+            printf "  [ok]      %-18s %s\n" "$cmd" "${kind:+($kind)}"
+          elif [[ "$kind" == optional ]]; then
+            printf "  [-]       %-18s (optional) <- %s\n" "$cmd" "$install"
+          else
+            printf "  [MISSING] %-18s <- %s\n" "$cmd" "$install"
+            missing=1
+          fi
+        }
+        echo "Required tools:"
+        check task             required "brew install go-task/tap/go-task"
+        check pre-commit       required "brew install pre-commit"
+        check xcbeautify       required "brew install xcbeautify"
+        check check-jsonschema required "brew install check-jsonschema"
+        echo ""
+        echo "Optional tools:"
+        check mmdc             optional "npm install -g @mermaid-js/mermaid-cli"
+        echo ""
+        echo "Bundled binaries:"
+        if [[ -x "{{.ORAS_BINARY}}" ]]; then
+          printf "  [ok]      oras\n"
+        else
+          printf "  [MISSING] oras               <- task oras:download\n"
+          missing=1
+        fi
+        echo ""
+        if [[ $missing -eq 0 ]]; then
+          echo "All required tools present."
+        else
+          echo "Some required tools are missing."
+          exit 1
+        fi
+
+  # ─── Setup ────────────────────────────────────────────────────────────────────
+
+  setup:
+    desc: Install all dev dependencies
+    cmds:
+      - task: setup:brew
+      - task: setup:npm
+      - task: oras:download
+      - echo ""
+      - echo "Setup complete. Run 'task check' to verify."
+
+  setup:brew:
+    desc: Install required brew packages (pre-commit, xcbeautify, check-jsonschema)
+    cmds:
+      - |
+        install_formula() {
+          if brew list "$1" &>/dev/null; then
+            echo "  [skip]    $1 already installed"
+          else
+            echo "  [install] $1"
+            brew install "$1"
+          fi
+        }
+        install_formula pre-commit
+        install_formula xcbeautify
+        install_formula check-jsonschema
+
+  setup:npm:
+    desc: Install mermaid CLI for diagram generation (optional)
+    cmds:
+      - |
+        if ! command -v npm &>/dev/null; then
+          echo "  [skip]    npm not found - install Node.js for mermaid CLI"
+          exit 0
+        fi
+        if npm list -g @mermaid-js/mermaid-cli &>/dev/null; then
+          echo "  [skip]    @mermaid-js/mermaid-cli already installed"
+        else
+          echo "  [install] @mermaid-js/mermaid-cli"
+          npm install -g @mermaid-js/mermaid-cli
+        fi
+
+  # ─── Build ────────────────────────────────────────────────────────────────────
+
+  build:
+    desc: Build Debug configuration
+    cmds:
+      - 'xcodebuild {{.XCODE_BUILD_FLAGS}} -configuration Debug | xcbeautify'
+
+  build:release:
+    desc: Build Release configuration
+    cmds:
+      - 'xcodebuild {{.XCODE_BUILD_FLAGS}} -configuration Release | xcbeautify'
+
+  build:archive:
+    desc: Create a release archive
+    vars:
+      ARCHIVE_PATH: "{{.ROOT_DIR}}/.build/{{.SCHEME}}.xcarchive"
+    cmds:
+      - 'xcodebuild archive {{.XCODE_BUILD_FLAGS}} -configuration Release -archivePath "{{.ARCHIVE_PATH}}" | xcbeautify'
+      - 'echo "Archive: {{.ARCHIVE_PATH}}"'
+
+  # ─── Test ─────────────────────────────────────────────────────────────────────
+
+  test:
+    desc: Run unit tests
+    cmds:
+      - 'xcodebuild test {{.XCODE_TEST_FLAGS}} | xcbeautify'
+
+  test:verbose:
+    desc: Run unit tests, keep full xcodebuild log, and print prettified output
+    cmds:
+      - mkdir -p "{{.DERIVED_DATA}}"
+      - 'xcodebuild test {{.XCODE_TEST_FLAGS}} 2>&1 | tee "{{.DERIVED_DATA}}/xcodebuild-test.log" | xcbeautify'
+      - 'echo "Raw xcodebuild log: {{.DERIVED_DATA}}/xcodebuild-test.log"'
+
+  # ─── Docs ─────────────────────────────────────────────────────────────────────
+
+  docs:build:
+    desc: Build DocC archive
+    cmds:
+      - mkdir -p "{{.DOCS_OUTPUT}}"
+      - 'xcodebuild docbuild {{.XCODE_DOCBUILD_FLAGS}} | xcbeautify'
+      - 'echo "DocC archive: {{.DOCS_DERIVED_DATA}}/Build/Products/Debug/{{.SCHEME}}.doccarchive"'
+
+  docs:preview:
+    desc: Live-preview DocC articles at localhost:8000
+    cmds:
+      - |
+        SYMBOLS_DIR=$(mktemp -d)
+        echo "Preview: http://localhost:8000/documentation/jeballtoagent"
+        xcrun docc preview "{{.DOCC_BUNDLE}}" \
+          --additional-symbol-graph-dir "$SYMBOLS_DIR" \
+          --fallback-display-name "{{.SCHEME}}" \
+          --fallback-bundle-identifier "{{.BUNDLE_ID}}" \
+          --fallback-bundle-version "{{.APP_VERSION}}" \
+          --port 8000
+
+  # ─── Diagrams ─────────────────────────────────────────────────────────────────
+
+  diagrams:generate:
+    desc: Convert all Mermaid diagrams to SVG
+    preconditions:
+      - sh: command -v mmdc
+        msg: "mmdc not found. Install with: task setup:npm"
+    cmds:
+      - bash "{{.ROOT_DIR}}/scripts/build-diagrams.sh"
+
+  diagrams:watch:
+    desc: Watch Diagrams/ and regenerate SVGs on change
+    preconditions:
+      - sh: command -v mmdc
+        msg: "mmdc not found. Install with: task setup:npm"
+      - sh: command -v fswatch
+        msg: "fswatch not found. Install with: brew install fswatch"
+    cmds:
+      - 'echo "Watching {{.DIAGRAMS_DIR}} for changes..."'
+      - fswatch -o "{{.DIAGRAMS_DIR}}"/*.mmd | xargs -n1 -I{} task diagrams:generate
+
+  # ─── Oras ─────────────────────────────────────────────────────────────────────
+
+  oras:download:
+    desc: Download oras binary to Resources/
+    status:
+      - test -x "{{.ORAS_BINARY}}"
+    cmds:
+      - bash "{{.ROOT_DIR}}/scripts/download-oras.sh" "{{.ORAS_VERSION}}"
+
+  oras:verify:
+    desc: Verify oras binary version matches the configured version
+    preconditions:
+      - sh: test -x "{{.ORAS_BINARY}}"
+        msg: "oras binary not found. Run: task oras:download"
+    cmds:
+      - |
+        actual=$("{{.ORAS_BINARY}}" version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        if [[ "$actual" == "{{.ORAS_VERSION}}" ]]; then
+          echo "oras version ok: $actual"
+        else
+          echo "error: expected {{.ORAS_VERSION}}, got $actual"
+          exit 1
+        fi
+
+  oras:clean:
+    desc: Remove the downloaded oras binary
+    prompt: "Delete {{.ORAS_BINARY}}?"
+    cmds:
+      - rm -f "{{.ORAS_BINARY}}"
+      - 'echo "Removed {{.ORAS_BINARY}}"'
+
+  # ─── OpenAPI ──────────────────────────────────────────────────────────────────
+
+  openapi:validate:
+    desc: Validate jeballto-api.yaml against the OpenAPI 3.0 schema
+    preconditions:
+      - sh: test -f "{{.OPENAPI_SRC}}"
+        msg: "OpenAPI file not found at {{.OPENAPI_SRC}}"
+    cmds:
+      - 'check-jsonschema --schemafile https://spec.openapis.org/oas/3.0/schema/2021-09-28 "{{.OPENAPI_SRC}}"'
+      - echo "OpenAPI schema valid."
+
+  openapi:stamp:
+    desc: Stamp the version field in jeballto-api.yaml with the current MARKETING_VERSION
+    preconditions:
+      - sh: test -f "{{.OPENAPI_SRC}}"
+        msg: "OpenAPI file not found at {{.OPENAPI_SRC}}"
+    cmds:
+      - |
+        /usr/bin/sed -i '' "s/^  version: .*/  version: {{.APP_VERSION}}/" "{{.OPENAPI_SRC}}"
+      - 'echo "Stamped {{.OPENAPI_SRC}} with version {{.APP_VERSION}}"'
+
+  # ─── Pre-commit ───────────────────────────────────────────────────────────────
+
+  pre-commit:run:
+    desc: Run pre-commit hooks on staged files
+    cmds:
+      - pre-commit run
+
+  pre-commit:all:
+    desc: Run pre-commit hooks on all files
+    cmds:
+      - pre-commit run --all-files
+
+  pre-commit:update:
+    desc: Update pre-commit hook revisions to latest
+    cmds:
+      - pre-commit autoupdate
+
+  # ─── Clean ────────────────────────────────────────────────────────────────────
+
+  clean:
+    desc: Remove build artifacts (.build/)
+    prompt: "Delete {{.DERIVED_DATA}} and {{.DOCS_OUTPUT}}?"
+    cmds:
+      - rm -rf "{{.DERIVED_DATA}}"
+      - rm -rf "{{.DOCS_OUTPUT}}"
+      - echo "Cleaned .build/"
+
+  clean:all:
+    desc: Remove all generated artifacts including SVGs and oras binary
+    prompt: "Delete .build/, generated SVGs, and the oras binary?"
+    cmds:
+      - task: clean
+      - rm -f "{{.DOCC_BUNDLE}}/Resources"/*.svg
+      - task: oras:clean
+
+  # ─── Xcode build phase helpers ────────────────────────────────────────────────
+  # These tasks are called by Xcode build phases. Do not run them manually.
+
+  _xcode:require-app-bundle-env:
+    internal: true
+    preconditions:
+      - sh: test -n "${BUILT_PRODUCTS_DIR:-}" && test -n "${PRODUCT_NAME:-}"
+        msg: "BUILT_PRODUCTS_DIR / PRODUCT_NAME not set - Xcode build phases only"
+    cmds:
+      - true
+
+  _xcode:require-openapi-src:
+    internal: true
+    preconditions:
+      - sh: test -f "{{.OPENAPI_SRC}}"
+        msg: "OpenAPI schema not found at {{.OPENAPI_SRC}}"
+    cmds:
+      - true
+
+  _xcode:require-oras-binary:
+    internal: true
+    preconditions:
+      - sh: test -f "{{.ORAS_BINARY}}"
+        msg: "oras binary not found at {{.ORAS_BINARY}}. Run: task oras:download"
+    cmds:
+      - true
+
+  xcode:set-build-number:
+    desc: "[Xcode] Stamp CFBundleVersion with current timestamp"
+    preconditions:
+      - sh: test -n "${BUILT_PRODUCTS_DIR:-}" && test -n "${INFOPLIST_PATH:-}"
+        msg: "BUILT_PRODUCTS_DIR / INFOPLIST_PATH not set - Xcode build phases only"
+    cmds:
+      - |
+        BUILD_NUMBER=$(date +%Y%m%d%H%M%S)
+        /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" \
+          "${BUILT_PRODUCTS_DIR}/${INFOPLIST_PATH}"
+        echo "Set CFBundleVersion to $BUILD_NUMBER"
+
+  xcode:diagrams:
+    desc: "[Xcode] Generate SVG diagrams (non-fatal if mmdc missing)"
+    cmds:
+      - |
+        if command -v mmdc &>/dev/null; then
+          bash "{{.ROOT_DIR}}/scripts/build-diagrams.sh"
+        else
+          echo "warning: mmdc not found - diagrams not generated (task setup:npm)"
+        fi
+
+  xcode:copy-openapi:
+    desc: "[Xcode] Stamp and copy jeballto-api.yaml into the app bundle"
+    deps:
+      - task: _xcode:require-app-bundle-env
+      - task: _xcode:require-openapi-src
+    cmds:
+      - |
+        SCHEMA_DST="${BUILT_PRODUCTS_DIR}/${PRODUCT_NAME}.app/Contents/Resources/jeballto-api.yaml"
+        if [ -n "${MARKETING_VERSION:-}" ]; then
+          /usr/bin/sed -i '' "s/^  version: .*/  version: ${MARKETING_VERSION}/" "{{.OPENAPI_SRC}}"
+          echo "Stamped OpenAPI with version ${MARKETING_VERSION}"
+        fi
+        mkdir -p "$(dirname "$SCHEMA_DST")"
+        cp "{{.OPENAPI_SRC}}" "$SCHEMA_DST"
+        echo "Copied OpenAPI schema to app bundle"
+
+  xcode:copy-oras:
+    desc: "[Xcode] Copy oras binary into the app bundle"
+    deps:
+      - task: _xcode:require-app-bundle-env
+      - task: _xcode:require-oras-binary
+    cmds:
+      - |
+        ORAS_DST="${BUILT_PRODUCTS_DIR}/${PRODUCT_NAME}.app/Contents/Resources/oras"
+        mkdir -p "$(dirname "$ORAS_DST")"
+        cp "{{.ORAS_BINARY}}" "$ORAS_DST"
+        chmod +x "$ORAS_DST"
+        echo "Copied oras to app bundle"

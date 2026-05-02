@@ -1,0 +1,593 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 70;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A01F6F412F811CFC00BF224D /* Yams in Frameworks */ = {isa = PBXBuildFile; productRef = A0YMS0022F500000000000 /* Yams */; };
+		A02AA3CC2F7044C30055C189 /* Jeballto.icon in Resources */ = {isa = PBXBuildFile; fileRef = A02AA3CB2F7044C30055C189 /* Jeballto.icon */; };
+		A038C88F2F236CF900254AE0 /* Virtualization.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 8F87D54626C3427C000EADA4 /* Virtualization.framework */; };
+		A038C8922F236E2B00254AE0 /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A038C8912F236E2B00254AE0 /* Foundation.framework */; };
+		A038C8942F236E3100254AE0 /* Network.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A038C8932F236E3100254AE0 /* Network.framework */; };
+		A0SPK0032F500000000000 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = A0SPK0022F500000000000 /* Sparkle */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		B10000012F70000000000030 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 8F87D51526C34111000EADA4 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = A038C8132F236AD100254AE0;
+			remoteInfo = JeballtoAgent;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		8F87D54626C3427C000EADA4 /* Virtualization.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Virtualization.framework; path = System/Library/Frameworks/Virtualization.framework; sourceTree = SDKROOT; };
+		8F87D54D26C344C4000EADA4 /* README.md */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
+		A00210872F237A1600CFA8C0 /* JeballtoAgent.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = JeballtoAgent.entitlements; sourceTree = "<group>"; };
+		A02AA3CB2F7044C30055C189 /* Jeballto.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.iconcomposer.icon; path = Jeballto.icon; sourceTree = "<group>"; };
+		A038C8142F236AD100254AE0 /* JeballtoAgent.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = JeballtoAgent.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A038C8912F236E2B00254AE0 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = System/Library/Frameworks/Foundation.framework; sourceTree = SDKROOT; };
+		A038C8932F236E3100254AE0 /* Network.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Network.framework; path = System/Library/Frameworks/Network.framework; sourceTree = SDKROOT; };
+		B10000012F70000000000001 /* JeballtoAgentTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = JeballtoAgentTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFileSystemSynchronizedRootGroup section */
+		A038C8152F236AD100254AE0 /* JeballtoAgent */ = {isa = PBXFileSystemSynchronizedRootGroup; explicitFileTypes = {}; explicitFolders = (); path = JeballtoAgent; sourceTree = "<group>"; };
+		B10000012F70000000000002 /* JeballtoAgentTests */ = {isa = PBXFileSystemSynchronizedRootGroup; explicitFileTypes = {}; explicitFolders = (); path = JeballtoAgentTests; sourceTree = "<group>"; };
+/* End PBXFileSystemSynchronizedRootGroup section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A038C8112F236AD100254AE0 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A01F6F412F811CFC00BF224D /* Yams in Frameworks */,
+				A038C8942F236E3100254AE0 /* Network.framework in Frameworks */,
+				A038C8922F236E2B00254AE0 /* Foundation.framework in Frameworks */,
+				A038C88F2F236CF900254AE0 /* Virtualization.framework in Frameworks */,
+				A0SPK0032F500000000000 /* Sparkle in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		B10000012F70000000000011 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		8F87D51426C34111000EADA4 = {
+			isa = PBXGroup;
+			children = (
+				8F87D54D26C344C4000EADA4 /* README.md */,
+				A038C8152F236AD100254AE0 /* JeballtoAgent */,
+				B10000012F70000000000002 /* JeballtoAgentTests */,
+				8F87D51E26C34111000EADA4 /* Products */,
+				8F87D54526C3427C000EADA4 /* Frameworks */,
+				A00210872F237A1600CFA8C0 /* JeballtoAgent.entitlements */,
+				A02AA3CB2F7044C30055C189 /* Jeballto.icon */,
+			);
+			sourceTree = "<group>";
+		};
+		8F87D51E26C34111000EADA4 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				A038C8142F236AD100254AE0 /* JeballtoAgent.app */,
+				B10000012F70000000000001 /* JeballtoAgentTests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		8F87D54526C3427C000EADA4 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				A038C8932F236E3100254AE0 /* Network.framework */,
+				A038C8912F236E2B00254AE0 /* Foundation.framework */,
+				8F87D54626C3427C000EADA4 /* Virtualization.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		A038C8132F236AD100254AE0 /* JeballtoAgent */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A038C81A2F236AD100254AE0 /* Build configuration list for PBXNativeTarget "JeballtoAgent" */;
+			buildPhases = (
+				A0DIAG0012F500000000000 /* Generate Diagrams */,
+				A038C8102F236AD100254AE0 /* Sources */,
+				A038C8112F236AD100254AE0 /* Frameworks */,
+				A038C8FF2F236AD100254AE0 /* Resources */,
+				A0BNUM0012F600000000000 /* Set Build Number */,
+				A0ORAS0012F300000000000 /* Copy oras binary */,
+				A0OAPI0012F400000000000 /* Copy OpenAPI schema */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				A038C8152F236AD100254AE0 /* JeballtoAgent */,
+			);
+			name = JeballtoAgent;
+			packageProductDependencies = (
+				A0SPK0022F500000000000 /* Sparkle */,
+				A0YMS0022F500000000000 /* Yams */,
+			);
+			productName = JeballtoAgent;
+			productReference = A038C8142F236AD100254AE0 /* JeballtoAgent.app */;
+			productType = "com.apple.product-type.application";
+		};
+		B10000012F70000000000020 /* JeballtoAgentTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = B10000012F70000000000021 /* Build configuration list for PBXNativeTarget "JeballtoAgentTests" */;
+			buildPhases = (
+				B10000012F70000000000010 /* Sources */,
+				B10000012F70000000000011 /* Frameworks */,
+				B10000012F70000000000012 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				B10000012F70000000000031 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				B10000012F70000000000002 /* JeballtoAgentTests */,
+			);
+			name = JeballtoAgentTests;
+			packageProductDependencies = (
+			);
+			productName = JeballtoAgentTests;
+			productReference = B10000012F70000000000001 /* JeballtoAgentTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		8F87D51526C34111000EADA4 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				DefaultBuildSystemTypeForWorkspace = Latest;
+				LastSwiftUpdateCheck = 2620;
+				LastUpgradeCheck = 1300;
+				ORGANIZATIONNAME = Apple;
+				TargetAttributes = {
+					A038C8132F236AD100254AE0 = {
+						CreatedOnToolsVersion = 26.2;
+					};
+					B10000012F70000000000020 = {
+						CreatedOnToolsVersion = 26.2;
+						TestTargetID = A038C8132F236AD100254AE0;
+					};
+				};
+			};
+			buildConfigurationList = 8F87D51826C34111000EADA4 /* Build configuration list for PBXProject "JeballtoProject" */;
+			compatibilityVersion = "Xcode 13.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = 8F87D51426C34111000EADA4;
+			packageReferences = (
+				A0SPK0012F500000000000 /* XCRemoteSwiftPackageReference "Sparkle" */,
+				A0YMS0012F500000000000 /* XCRemoteSwiftPackageReference "Yams" */,
+			);
+			productRefGroup = 8F87D51E26C34111000EADA4 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				A038C8132F236AD100254AE0 /* JeballtoAgent */,
+				B10000012F70000000000020 /* JeballtoAgentTests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		A038C8FF2F236AD100254AE0 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A02AA3CC2F7044C30055C189 /* Jeballto.icon in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		B10000012F70000000000012 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		A0BNUM0012F600000000000 /* Set Build Number */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputPaths = (
+			);
+			name = "Set Build Number";
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/bash;
+			shellScript = "export PATH=\"/opt/homebrew/bin:$PATH\"\ncd \"$SRCROOT\" && task xcode:set-build-number\n";
+		};
+		A0DIAG0012F500000000000 /* Generate Diagrams */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputPaths = (
+				"$(SRCROOT)/JeballtoAgent/JeballtoAgent.docc/Diagrams/architecture.mmd",
+				"$(SRCROOT)/JeballtoAgent/JeballtoAgent.docc/Diagrams/state-machine.mmd",
+				"$(SRCROOT)/JeballtoAgent/JeballtoAgent.docc/Diagrams/config.json",
+			);
+			name = "Generate Diagrams";
+			outputPaths = (
+				"$(SRCROOT)/JeballtoAgent/JeballtoAgent.docc/Resources/architecture.svg",
+				"$(SRCROOT)/JeballtoAgent/JeballtoAgent.docc/Resources/state-machine.svg",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/bash;
+			shellScript = "export PATH=\"/opt/homebrew/bin:$PATH\"\ncd \"$SRCROOT\" && task xcode:diagrams\n";
+		};
+		A0OAPI0012F400000000000 /* Copy OpenAPI schema */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputPaths = (
+				"$(SRCROOT)/openapi/jeballto-api.yaml",
+			);
+			name = "Copy OpenAPI schema";
+			outputPaths = (
+				"$(BUILT_PRODUCTS_DIR)/$(PRODUCT_NAME).app/Contents/Resources/jeballto-api.yaml",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/bash;
+			shellScript = "export PATH=\"/opt/homebrew/bin:$PATH\"\ncd \"$SRCROOT\" && task xcode:copy-openapi\n";
+		};
+		A0ORAS0012F300000000000 /* Copy oras binary */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputPaths = (
+				"$(SRCROOT)/Resources/oras",
+			);
+			name = "Copy oras binary";
+			outputPaths = (
+				"$(BUILT_PRODUCTS_DIR)/$(PRODUCT_NAME).app/Contents/Resources/oras",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/bash;
+			shellScript = "export PATH=\"/opt/homebrew/bin:$PATH\"\ncd \"$SRCROOT\" && task xcode:copy-oras\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		A038C8102F236AD100254AE0 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		B10000012F70000000000010 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		B10000012F70000000000031 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = A038C8132F236AD100254AE0 /* JeballtoAgent */;
+			targetProxy = B10000012F70000000000030 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		8F87D52726C34111000EADA4 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++17";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		8F87D52826C34111000EADA4 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++17";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+			};
+			name = Release;
+		};
+		A038C8182F236AD100254AE0 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = Jeballto;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CODE_SIGN_ENTITLEMENTS = JeballtoAgent.entitlements;
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "-";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_APP_SANDBOX = NO;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Info.plist;
+				INFOPLIST_KEY_LSUIElement = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MARKETING_VERSION = 1.0.0-beta.1;
+				PRODUCT_BUNDLE_IDENTIFIER = com.jeballto.vmagent;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SPARKLE_FEED_URL = "https://jeballto.com/releases/beta/appcast.xml";
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		A038C8192F236AD100254AE0 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = Jeballto;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CODE_SIGN_ENTITLEMENTS = JeballtoAgent.entitlements;
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "-";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_APP_SANDBOX = NO;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Info.plist;
+				INFOPLIST_KEY_LSUIElement = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MARKETING_VERSION = 1.0.0-beta.1;
+				PRODUCT_BUNDLE_IDENTIFIER = com.jeballto.vmagent;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SPARKLE_FEED_URL = "https://jeballto.com/releases/stable/appcast.xml";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		B10000012F70000000000022 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "-";
+				CODE_SIGN_STYLE = Automatic;
+				ENABLE_TESTING_SEARCH_PATHS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.2;
+				PRODUCT_BUNDLE_IDENTIFIER = com.jeballto.vmagent.tests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/JeballtoAgent.app/Contents/MacOS/JeballtoAgent";
+				TEST_TARGET_NAME = JeballtoAgent;
+			};
+			name = Debug;
+		};
+		B10000012F70000000000023 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "-";
+				CODE_SIGN_STYLE = Automatic;
+				ENABLE_TESTING_SEARCH_PATHS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.2;
+				PRODUCT_BUNDLE_IDENTIFIER = com.jeballto.vmagent.tests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/JeballtoAgent.app/Contents/MacOS/JeballtoAgent";
+				TEST_TARGET_NAME = JeballtoAgent;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		8F87D51826C34111000EADA4 /* Build configuration list for PBXProject "JeballtoProject" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				8F87D52726C34111000EADA4 /* Debug */,
+				8F87D52826C34111000EADA4 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A038C81A2F236AD100254AE0 /* Build configuration list for PBXNativeTarget "JeballtoAgent" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A038C8182F236AD100254AE0 /* Debug */,
+				A038C8192F236AD100254AE0 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		B10000012F70000000000021 /* Build configuration list for PBXNativeTarget "JeballtoAgentTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B10000012F70000000000022 /* Debug */,
+				B10000012F70000000000023 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		A0SPK0012F500000000000 /* XCRemoteSwiftPackageReference "Sparkle" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/sparkle-project/Sparkle";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 2.9.0;
+			};
+		};
+		A0YMS0012F500000000000 /* XCRemoteSwiftPackageReference "Yams" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/jpsim/Yams";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 5.0.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		A0SPK0022F500000000000 /* Sparkle */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A0SPK0012F500000000000 /* XCRemoteSwiftPackageReference "Sparkle" */;
+			productName = Sparkle;
+		};
+		A0YMS0022F500000000000 /* Yams */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A0YMS0012F500000000000 /* XCRemoteSwiftPackageReference "Yams" */;
+			productName = Yams;
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = 8F87D51526C34111000EADA4 /* Project object */;
+}

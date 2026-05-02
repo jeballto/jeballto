@@ -1,0 +1,23 @@
+baseline: .swiftlint-baseline.json
+
+disabled_rules:
+  - identifier_name  # Allow short variable names like 'vm', 'to'
+  - trailing_comma  # Handled by SwiftFormat
+  - opening_brace  # Handled by SwiftFormat
+
+excluded:
+  - tmp
+  - .agents
+  - GuestAdditions
+
+line_length:
+  warning: 120
+  error: 200  # Match SwiftFormat max width
+
+type_body_length:
+  warning: 400
+  error: 700
+
+file_length:
+  warning: 500
+  error: 1000

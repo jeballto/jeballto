@@ -1,0 +1,2876 @@
+openapi: 3.0.3
+info:
+  title: Jeballto VM Agent API
+  description: REST API for managing macOS virtual machines on Apple Silicon
+  version: 1.0.0-beta.1
+  contact:
+    name: Jeballto Project
+  license:
+    name: See LICENSE
+
+servers:
+  - url: http://localhost:8011/v1
+    description: Local development server
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: health
+    description: Health and status endpoints
+  - name: vms
+    description: Virtual machine management
+  - name: lifecycle
+    description: VM lifecycle operations
+  - name: installation
+    description: macOS installation
+  - name: networking
+    description: Network, SSH, and VNC
+  - name: gui
+    description: GUI window management
+  - name: monitoring
+    description: State and events
+  - name: images
+    description: OCI image management
+  - name: registries
+    description: OCI registry authentication
+  - name: config
+    description: Runtime configuration management
+  - name: jeballtofiles
+    description: Jeballtofile blueprint execution
+  - name: system
+    description: System-level operations
+  - name: auth
+    description: Authentication utilities
+
+paths:
+  /health:
+    get:
+      tags:
+        - health
+      summary: Health check
+      description: Check agent health status
+      operationId: getHealth
+      security: []
+      responses:
+        '200':
+          description: Agent is healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /vms:
+    post:
+      tags:
+        - vms
+      summary: Create VM
+      description: Create a new virtual machine
+      operationId: createVM
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateVMRequest'
+      responses:
+        '201':
+          description: VM created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VMResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    get:
+      tags:
+        - vms
+      summary: List VMs
+      description: List all virtual machines with optional pagination
+      operationId: listVMs
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of results to return (1-1000)
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+        - name: offset
+          in: query
+          required: false
+          description: Number of results to skip
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+      responses:
+        '200':
+          description: List of VMs
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VMListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    delete:
+      tags:
+        - vms
+      summary: Wipe all VMs
+      description: >
+        Delete all VMs and clear the database. Requires confirm=true query
+        parameter as a safety guard. Each VM is force-stopped before deletion.
+      operationId: wipeAllVMs
+      parameters:
+        - name: confirm
+          in: query
+          required: true
+          description: Must be "true" to confirm the wipe operation
+          schema:
+            type: string
+            enum:
+              - 'true'
+      responses:
+        '200':
+          description: Wipe completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WipeAllResponse'
+        '400':
+          description: Missing confirmation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: CONFIRMATION_REQUIRED
+                  message: "Add ?confirm=true to confirm deletion of all VMs"
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /vms/{id}:
+    get:
+      tags:
+        - vms
+      summary: Get VM
+      description: Get virtual machine details
+      operationId: getVM
+      parameters:
+        - $ref: '#/components/parameters/vmId'
+      responses:
+        '200':
+          description: VM details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VMResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    delete:
+      tags:
+        - vms
+      summary: Delete VM
+      description: >
+        Delete a virtual machine and its files. The VM must be stopped first
+        unless force=true is used, which auto-stops the VM before deletion.
+      operationId: deleteVM
+      parameters:
+        - $ref: '#/components/parameters/vmId'
+        - name: force
+          in: query
+          required: false
+          description: Force-stop the VM before deleting
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '204':
+          description: VM deleted successfully
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: VM is not in a deletable state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: INVALID_STATE
+                  message: "VM must be stopped before deletion"
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    patch:
+      tags:
+        - vms
+      summary: Update VM
+      description: >
+        Update name and/or resources (CPU, memory, disk) for a VM.
+        Name can be changed in any non-deleted state.
+        Resource changes require the VM to be stopped or created.
+        Disk can only be enlarged, not shrunk. Resource changes take effect on next VM start.
+        Guest OS filesystem must be expanded separately after disk resize.
+      operationId: updateVM
+      parameters:
+        - $ref: '#/components/parameters/vmId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateVMRequest'
+      responses:
+        '200':
+          description: VM updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VMResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: VM is not in a valid state for resource modification
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: INVALID_STATE
+                  message: "VM must be stopped or created to update resources"
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /vms/{id}/start:
+    post:
+      tags:
+        - lifecycle
+      summary: Start VM
+      description: Start a virtual machine
+      operationId: startVM
+      parameters:
+        - $ref: '#/components/parameters/vmId'
+      responses:
+        '200':
+          description: VM started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VMResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/ConcurrentVMLimit'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /vms/{id}/stop:
+    post:
+      tags:
+        - lifecycle
+      summary: Stop VM
+      description: Stop a virtual machine. Idempotent when the VM is already stopped.
+      operationId: stopVM
+      parameters:
+        - $ref: '#/components/parameters/vmId'
+      responses:
+        '200':
+          description: VM stopped, or already stopped
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VMResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /vms/{id}/pause:
+    post:
+      tags:
+        - lifecycle
+      summary: Pause VM
+      description: Pause a running virtual machine
+      operationId: pauseVM
+      parameters:
+        - $ref: '#/components/parameters/vmId'
+      responses:
+        '200':
+          description: VM paused
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VMResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /vms/{id}/resume:
+    post:
+      tags:
+        - lifecycle
+      summary: Resume VM
+      description: Resume a paused virtual machine
+      operationId: resumeVM
+      parameters:
+        - $ref: '#/components/parameters/vmId'
+      responses:
+        '200':
+          description: VM resumed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VMResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /vms/{id}/install:
+    post:
+      tags:
+        - installation
+      summary: Install macOS
+      description: Start macOS installation in the VM (async operation)
+      operationId: installVM
+      parameters:
+        - $ref: '#/components/parameters/vmId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InstallVMRequest'
+      responses:
+        '202':
+          description: Installation started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InstallStatusResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/ConcurrentVMLimit'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /vms/{id}/install/status:
+    get:
+      tags:
+        - installation
+      summary: Installation status
+      description: Get macOS installation status
+      operationId: getInstallStatus
+      parameters:
+        - $ref: '#/components/parameters/vmId'
+      responses:
+        '200':
+          description: Installation status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InstallStatusResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /vms/{id}/ssh:
+    get:
+      tags:
+        - networking
+      summary: Get SSH info
+      description: >
+        Get SSH connection information. The VM must be installed (not in
+        CREATED or INSTALLING state).
+      operationId: getSSHInfo
+      parameters:
+        - $ref: '#/components/parameters/vmId'
+      responses:
+        '200':
+          description: SSH connection info
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SSHInfoResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: VM is not yet installed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: INVALID_STATE
+                  message: "VM must be installed before SSH can be used"
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    post:
+      tags:
+        - networking
+      summary: Enable SSH forwarding
+      description: >
+        Enable SSH port forwarding for a VM. Allocates a host port from the
+        configured SSH port range and creates a TCP proxy to the VM's SSH
+        server (port 22). The VM must be RUNNING and have a detected NAT IP.
+        Idempotent - if SSH is already enabled, returns the current connection info.
+        Remote Login must be enabled in the macOS guest.
+      operationId: enableSSH
+      parameters:
+        - $ref: '#/components/parameters/vmId'
+      responses:
+        '200':
+          description: SSH forwarding enabled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SSHInfoResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: VM is not in RUNNING state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: INVALID_STATE
+                  message: "VM must be RUNNING to enable SSH forwarding"
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    delete:
+      tags:
+        - networking
+      summary: Disable SSH forwarding
+      description: >
+        Disable SSH port forwarding for a VM. Stops the TCP proxy and
+        releases the allocated port. The VM must be installed (not in
+        CREATED or INSTALLING state).
+      operationId: disableSSH
+      parameters:
+        - $ref: '#/components/parameters/vmId'
+      responses:
+        '200':
+          description: SSH forwarding disabled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SSHInfoResponse'
+              example:
+                host: "127.0.0.1"
+                port: 0
+                status: disabled
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: VM is not yet installed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: INVALID_STATE
+                  message: "VM must be installed before SSH can be managed"
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /vms/{id}/vnc:
+    post:
+      tags:
+        - networking
+      summary: Enable VNC forwarding
+      description: >
+        Enable VNC port forwarding for a VM. Allocates a host port from the
+        configured VNC port range and creates a TCP proxy to the VM's VNC
+        server (port 5900). The VM must be RUNNING. Idempotent - if VNC is
+        already enabled, returns the current connection info.
+        Screen Sharing must be enabled in the macOS guest.
+      operationId: enableVNC
+      parameters:
+        - $ref: '#/components/parameters/vmId'
+      responses:
+        '200':
+          description: VNC forwarding enabled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VNCInfoResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: VM is not in RUNNING state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: INVALID_STATE
+                  message: "VM must be RUNNING to enable VNC forwarding"
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    delete:
+      tags:
+        - networking
+      summary: Disable VNC forwarding
+      description: >
+        Disable VNC port forwarding for a VM. Stops the TCP proxy and
+        releases the allocated port. The VM must be installed (not in
+        CREATED or INSTALLING state).
+      operationId: disableVNC
+      parameters:
+        - $ref: '#/components/parameters/vmId'
+      responses:
+        '200':
+          description: VNC forwarding disabled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VNCInfoResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: VM is not yet installed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: INVALID_STATE
+                  message: "VM must be installed before VNC can be managed"
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    get:
+      tags:
+        - networking
+      summary: Get VNC info
+      description: >
+        Get VNC connection information. The VM must be installed (not in
+        CREATED or INSTALLING state).
+      operationId: getVNCInfo
+      parameters:
+        - $ref: '#/components/parameters/vmId'
+      responses:
+        '200':
+          description: VNC connection info
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VNCInfoResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: VM is not yet installed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: INVALID_STATE
+                  message: "VM must be installed before VNC can be used"
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /vms/{id}/state:
+    get:
+      tags:
+        - monitoring
+      summary: Get VM state
+      description: Get current VM state
+      operationId: getVMState
+      parameters:
+        - $ref: '#/components/parameters/vmId'
+      responses:
+        '200':
+          description: VM state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VMStateResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /vms/{id}/events:
+    get:
+      tags:
+        - monitoring
+      summary: Get VM events
+      description: Get recent VM events
+      operationId: getVMEvents
+      parameters:
+        - $ref: '#/components/parameters/vmId'
+        - name: limit
+          in: query
+          description: Maximum number of events to return
+          required: false
+          schema:
+            type: integer
+            default: 100
+            minimum: 1
+            maximum: 1000
+      responses:
+        '200':
+          description: VM events
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /vms/{id}/gui:
+    post:
+      tags:
+        - gui
+      summary: Open GUI
+      description: Open a graphical window displaying the VM screen. Requires VM to be running. Idempotent - if GUI is already open, brings window to front.
+      operationId: openGUI
+      parameters:
+        - $ref: '#/components/parameters/vmId'
+      responses:
+        '200':
+          description: GUI opened successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GUIStatusResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    delete:
+      tags:
+        - gui
+      summary: Close GUI
+      description: Close the graphical window for a VM. Idempotent - if GUI is already closed, returns success. Does not affect VM state.
+      operationId: closeGUI
+      parameters:
+        - $ref: '#/components/parameters/vmId'
+      responses:
+        '200':
+          description: GUI closed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GUIStatusResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    get:
+      tags:
+        - gui
+      summary: Get GUI status
+      description: Check if a GUI window is open for a VM
+      operationId: getGUIStatus
+      parameters:
+        - $ref: '#/components/parameters/vmId'
+      responses:
+        '200':
+          description: GUI status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GUIStatusResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /vms/{id}/screenshot:
+    get:
+      tags:
+        - gui
+      summary: Capture VM screenshot
+      description: |
+        Captures a screenshot of the VM's display and returns it as a PNG image.
+        Works headlessly without requiring a GUI window to be open. The VM must be
+        in RUNNING state. Useful for CI/CD debugging and automated visual testing.
+      operationId: captureScreenshot
+      parameters:
+        - $ref: '#/components/parameters/vmId'
+      responses:
+        '200':
+          description: Screenshot captured successfully
+          content:
+            image/png:
+              schema:
+                type: string
+                format: binary
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: VM is not in RUNNING state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /vms/{id}/execute:
+    post:
+      tags:
+        - lifecycle
+      summary: Execute command via SSH
+      description: |
+        Runs a shell command on the VM via SSH. Requires VM to be RUNNING
+        with SSH (Remote Login) enabled. Uses password authentication by default (admin/admin).
+      operationId: executeCommandOnVM
+      parameters:
+        - $ref: '#/components/parameters/vmId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CommandExecuteRequest'
+      responses:
+        '200':
+          description: Command executed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandExecuteResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: VM is in wrong state for this operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: INVALID_STATE
+                  message: "VM must be running for command execution"
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '504':
+          description: Command timed out
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: EXECUTE_FAILED
+                  message: "Command timed out after 30 seconds"
+
+  /vms/{id}/keystrokes:
+    post:
+      tags:
+        - lifecycle
+      summary: Inject keystrokes
+      description: |
+        Injects keystroke sequences into the VM. Works in both RUNNING
+        and INSTALLING states. Useful for automating macOS setup wizard before SSH is available.
+
+        Keystroke DSL supports:
+        - Plain text: each character is typed as keyDown+keyUp
+        - `<enter>`, `<tab>`, `<spacebar>`, `<esc>`, `<delete>` - special keys
+        - `<left>`, `<right>`, `<up>`, `<down>` - arrow keys
+        - `<f1>` through `<f12>` - function keys
+        - `<home>`, `<end>`, `<pageup>`, `<pagedown>` - navigation keys
+        - `<leftCmdOn>`, `<leftCmdOff>` - hold/release Command
+        - `<leftShiftOn>`, `<leftShiftOff>` - hold/release Shift
+        - `<leftCtrlOn>`, `<leftCtrlOff>` - hold/release Control
+        - `<leftAltOn>`, `<leftAltOff>` - hold/release Option
+        - `<wait5s>`, `<wait10s>` - pause for N seconds
+      operationId: injectKeystrokesOnVM
+      parameters:
+        - $ref: '#/components/parameters/vmId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/KeystrokesRequest'
+      responses:
+        '200':
+          description: Keystrokes injected
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KeystrokesResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: VM is in wrong state for this operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: INVALID_STATE
+                  message: "VM must be running or installing for keystroke injection"
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /vms/{id}/clone:
+    post:
+      tags:
+        - vms
+      summary: Clone VM
+      description: >
+        Create a 1:1 copy of an existing VM with a new UUID, MachineIdentifier,
+        and MAC address. The source VM must be stopped unless force=true is used.
+      operationId: cloneVM
+      parameters:
+        - $ref: '#/components/parameters/vmId'
+        - name: force
+          in: query
+          required: false
+          description: Force-stop the source VM before cloning
+          schema:
+            type: boolean
+            default: false
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CloneVMRequest'
+      responses:
+        '201':
+          description: VM cloned successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VMResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Source VM is not in a clonable state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: INVALID_STATE
+                  message: "Source VM must be stopped before cloning (use force=true to auto-stop)"
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /config:
+    get:
+      tags:
+        - config
+      summary: Get config
+      description: >
+        Returns the current runtime configuration. Sensitive values (API token,
+        file paths, binary paths) are intentionally excluded for security.
+      operationId: getConfig
+      responses:
+        '200':
+          description: Current configuration
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConfigResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    patch:
+      tags:
+        - config
+      summary: Update config
+      description: >
+        Update writable configuration values. Only include fields to change.
+        Changes are persisted to disk and take effect immediately. Read-only
+        fields (api.port, api.host, etc.) cannot be updated via this endpoint.
+      operationId: updateConfig
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateConfigRequest'
+      responses:
+        '200':
+          description: Configuration updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConfigResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /images:
+    get:
+      tags:
+        - images
+      summary: List images
+      description: List all locally stored OCI images with optional pagination
+      operationId: listImages
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of results to return (1-1000)
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+        - name: offset
+          in: query
+          required: false
+          description: Number of results to skip
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+      responses:
+        '200':
+          description: List of images
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImageListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    delete:
+      tags:
+        - images
+      summary: Wipe all images
+      description: >
+        Delete all locally stored OCI images. Requires confirm=true query
+        parameter as a safety guard.
+      operationId: wipeAllImages
+      parameters:
+        - name: confirm
+          in: query
+          required: true
+          description: Must be "true" to confirm the wipe operation
+          schema:
+            type: string
+            enum:
+              - 'true'
+      responses:
+        '200':
+          description: Wipe completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WipeAllResponse'
+        '400':
+          description: Missing confirmation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: CONFIRMATION_REQUIRED
+                  message: "Add ?confirm=true to confirm deletion of all images"
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /images/{id}:
+    get:
+      tags:
+        - images
+      summary: Get image
+      description: Get details of a locally stored OCI image
+      operationId: getImage
+      parameters:
+        - $ref: '#/components/parameters/imageId'
+      responses:
+        '200':
+          description: Image details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImageResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    delete:
+      tags:
+        - images
+      summary: Delete image
+      description: Delete a locally stored OCI image and its files
+      operationId: deleteImage
+      parameters:
+        - $ref: '#/components/parameters/imageId'
+      responses:
+        '204':
+          description: Image deleted successfully
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /images/pull:
+    post:
+      tags:
+        - images
+      summary: Pull image
+      description: >
+        Pull an OCI image from a registry. If the image already exists locally,
+        returns the existing record without re-pulling. Synchronous - blocks
+        until pull completes. By default there is no timeout (unlimited).
+        Use the optional `timeout` field to set a limit in seconds.
+      operationId: pullImage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PullImageRequest'
+      responses:
+        '200':
+          description: Image pulled (or already local)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImagePullResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /images/push:
+    post:
+      tags:
+        - images
+      summary: Push image
+      description: >
+        Push a VM bundle or existing local image to an OCI registry.
+        Use the `source` field with format 'vm:<uuid>' or 'image:<uuid>'.
+        The VM must be stopped before pushing to ensure a consistent disk image.
+        A connectivity check is performed before compression begins to fail fast
+        if the registry is unreachable.
+        The bundle is automatically compressed (gzip) during transfer.
+        By default there is no timeout (unlimited). Use the optional
+        `timeout` field to set a limit in seconds.
+      operationId: pushImage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PushImageRequest'
+      responses:
+        '200':
+          description: Image pushed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImagePushResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: VM is not in a stopped state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          description: Registry is unreachable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /registries/login:
+    post:
+      tags:
+        - registries
+      summary: Registry login
+      description: Authenticate to an OCI registry. Credentials are stored by oras.
+      operationId: registryLogin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegistryLoginRequest'
+      responses:
+        '200':
+          description: Authenticated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegistryLoginResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          description: Authentication failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: REGISTRY_AUTH_FAILED
+                  message: Authentication failed
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /registries/logout:
+    post:
+      tags:
+        - registries
+      summary: Registry logout
+      description: Remove stored credentials for an OCI registry
+      operationId: registryLogout
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegistryLogoutRequest'
+      responses:
+        '200':
+          description: Logged out
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /jeballtofiles:
+    post:
+      tags:
+        - jeballtofiles
+      summary: Execute a Jeballtofile blueprint
+      description: >
+        Validates and executes a Jeballtofile blueprint. Creates a VM and runs
+        all steps asynchronously. Returns immediately with an execution ID for
+        status polling.
+      operationId: createJeballtofile
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JeballtofileRequest'
+          application/yaml:
+            schema:
+              $ref: '#/components/schemas/JeballtofileRequest'
+          text/yaml:
+            schema:
+              $ref: '#/components/schemas/JeballtofileRequest'
+      responses:
+        '202':
+          description: Jeballtofile execution started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JeballtofileResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    get:
+      tags:
+        - jeballtofiles
+      summary: List Jeballtofile executions
+      description: Returns all active and recent Jeballtofile executions.
+      operationId: listJeballtofiles
+      responses:
+        '200':
+          description: List of executions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JeballtofileListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /jeballtofiles/{executionId}:
+    get:
+      tags:
+        - jeballtofiles
+      summary: Get Jeballtofile execution status
+      description: Returns the current status and per-step results of a Jeballtofile execution.
+      operationId: getJeballtofileStatus
+      parameters:
+        - name: executionId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Execution status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JeballtofileStatusResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags:
+        - jeballtofiles
+      summary: Delete a Jeballtofile execution
+      description: >
+        Removes a completed, failed, or cancelled Jeballtofile execution from memory.
+        Running executions cannot be deleted - cancel them first.
+      operationId: deleteJeballtofile
+      parameters:
+        - name: executionId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Execution deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Cannot delete a running execution
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /jeballtofiles/{executionId}/cancel:
+    post:
+      tags:
+        - jeballtofiles
+      summary: Cancel a Jeballtofile execution
+      description: >
+        Requests cancellation of a running Jeballtofile execution.
+        The current step will finish before execution halts.
+      operationId: cancelJeballtofile
+      parameters:
+        - name: executionId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Cancellation requested
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Execution is not running
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /system/reset:
+    post:
+      tags:
+        - system
+      summary: Reset system
+      description: >
+        Reset the agent to a clean state. Soft mode deletes all VMs, images, and
+        IPSW cache but keeps configuration and logs. Hard mode deletes everything
+        the application stores and terminates the process so the next startup is
+        completely fresh. Requires confirm=true as a safety guard.
+      operationId: systemReset
+      parameters:
+        - name: confirm
+          in: query
+          required: true
+          description: Must be "true" to confirm the reset operation
+          schema:
+            type: string
+            enum:
+              - 'true'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SystemResetRequest'
+      responses:
+        '200':
+          description: Reset completed (hard mode will terminate the process shortly after)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SystemResetResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /auth/verify:
+    get:
+      tags:
+        - auth
+      summary: Verify auth token
+      description: >
+        Returns 200 if the bearer token is valid. Since the auth middleware runs before
+        every route handler, a 200 response confirms the token is accepted.
+        Returns 401 if the token is missing or invalid.
+      operationId: verifyAuth
+      responses:
+        '200':
+          description: Token is valid
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - status
+                properties:
+                  status:
+                    type: string
+                    enum:
+                      - ok
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: token
+      description: >
+        Bearer token from agent configuration.
+        Pass as: Authorization: Bearer <your-token>
+
+  parameters:
+    vmId:
+      name: id
+      in: path
+      description: VM identifier (UUID)
+      required: true
+      schema:
+        type: string
+        format: uuid
+    imageId:
+      name: id
+      in: path
+      description: Image identifier (UUID)
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  schemas:
+    CreateVMRequest:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+          description: VM name
+          example: my-macos-vm
+        resources:
+          allOf:
+            - $ref: '#/components/schemas/VMResourcesDTO'
+          description: >
+            Hardware resources. Must NOT be set together with `image` - use
+            PATCH /v1/vms/{id} to change resources after cloning from an image.
+        image:
+          type: string
+          nullable: true
+          description: >
+            OCI image reference (e.g. registry.example.com/vms/macos:v1).
+            When provided, the image is pulled if not already local and the
+            VM is created from it. The VM will be in STOPPED state (already installed).
+            Cannot be combined with `resources`.
+          example: registry.example.com/vms/macos:v1
+        ephemeral:
+          type: boolean
+          default: false
+          description: >
+            When true, the VM is automatically deleted when it reaches a terminal
+            state (stopped or error), and is also stopped+deleted on agent shutdown.
+            Useful for CI/CD jobs where VMs are disposable.
+        lifetimeSeconds:
+          type: integer
+          minimum: 1
+          maximum: 604800
+          nullable: true
+          description: >
+            Optional maximum lifetime in seconds. Countdown starts the first time
+            the VM enters RUNNING state and is persisted, so it survives agent
+            restarts. On expiry the VM is stopped (and, if ephemeral, deleted).
+          example: 3600
+
+    VMResourcesDTO:
+      type: object
+      properties:
+        cpuCount:
+          type: integer
+          minimum: 1
+          maximum: 32
+          description: Number of CPU cores
+          example: 4
+        memorySize:
+          oneOf:
+            - type: integer
+              format: int64
+              minimum: 2147483648
+            - type: string
+              pattern: '^\d+(\.\d+)?\s*(MB|GB|mb|gb)$'
+          description: >
+            Memory size as bytes (integer) or human-readable string (e.g., "4GB", "512MB").
+            Minimum 2 GB.
+          example: "4GB"
+        diskSize:
+          oneOf:
+            - type: integer
+              format: int64
+              minimum: 21474836480
+            - type: string
+              pattern: '^\d+(\.\d+)?\s*(MB|GB|mb|gb)$'
+          description: >
+            Disk size as bytes (integer) or human-readable string (e.g., "64GB", "128GB").
+            Minimum 20 GB.
+          example: "64GB"
+
+    CloneVMRequest:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+          description: Name for the cloned VM
+          example: cloned-vm
+        resources:
+          $ref: '#/components/schemas/VMResourcesDTO'
+        ephemeral:
+          type: boolean
+          default: false
+          description: >
+            When true, the cloned VM is automatically deleted when it reaches a
+            terminal state (stopped or error).
+
+    UpdateVMRequest:
+      type: object
+      description: >
+        At least one field must be provided. Name can be changed in any non-deleted state.
+        Resource changes require the VM to be stopped or created.
+        Disk can only be enlarged, not shrunk.
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+          description: New name for the VM
+          example: "renamed-vm"
+        resources:
+          type: object
+          properties:
+            cpuCount:
+              type: integer
+              minimum: 1
+              maximum: 32
+              description: Number of virtual CPU cores
+              example: 8
+            memorySize:
+              oneOf:
+                - type: integer
+                  format: int64
+                  minimum: 2147483648
+                - type: string
+                  pattern: '^\d+(\.\d+)?\s*(MB|GB|TB|mb|gb|tb)$'
+              description: >
+                Memory as bytes (integer) or human-readable string (e.g., "8GB", "16GB").
+                Minimum 2 GB.
+              example: "16GB"
+            diskSize:
+              oneOf:
+                - type: integer
+                  format: int64
+                  minimum: 21474836480
+                - type: string
+                  pattern: '^\d+(\.\d+)?\s*(MB|GB|TB|mb|gb|tb)$'
+              description: >
+                Disk size as bytes (integer) or human-readable string (e.g., "128GB").
+                Minimum 20 GB. Can only be enlarged, not shrunk.
+              example: "128GB"
+
+    WipeAllResponse:
+      type: object
+      required:
+        - deleted
+        - failed
+      properties:
+        deleted:
+          type: integer
+          description: Number of VMs successfully deleted
+        failed:
+          type: integer
+          description: Number of VMs that failed to delete
+        errors:
+          type: array
+          nullable: true
+          items:
+            type: string
+          description: Error messages for failed deletions
+
+    InstallVMRequest:
+      type: object
+      properties:
+        source:
+          type: string
+          nullable: true
+          description: >
+            IPSW source. Accepts an HTTPS URL, a file:// URL, or an absolute
+            file path. If omitted, the latest macOS is downloaded from Apple.
+            HTTP URLs are rejected for security reasons.
+          example: https://updates.cdn-apple.com/.../UniversalMac.ipsw
+
+    VMResponse:
+      type: object
+      required:
+        - id
+        - name
+        - state
+        - ephemeral
+        - resources
+        - createdAt
+        - updatedAt
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: VM identifier
+        name:
+          type: string
+          description: VM name
+        state:
+          type: string
+          enum:
+            - CREATED
+            - INSTALLING
+            - STOPPED
+            - STARTING
+            - RUNNING
+            - STOPPING
+            - PAUSING
+            - PAUSED
+            - RESUMING
+            - ERROR
+            - DELETED
+          description: Current VM state
+        ephemeral:
+          type: boolean
+          description: Whether the VM auto-deletes on terminal state (stopped or error)
+        resources:
+          $ref: '#/components/schemas/VMResourcesResponse'
+        network:
+          $ref: '#/components/schemas/VMNetworkResponse'
+        guiOpen:
+          type: boolean
+          description: Whether a GUI window is currently open for this VM
+        uptime:
+          type: integer
+          nullable: true
+          description: Seconds since the VM started running, null if not running
+        lifetimeSeconds:
+          type: integer
+          nullable: true
+          description: Configured max lifetime in seconds from first start, null if not set
+        expiresAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: ISO8601 timestamp when the VM will be auto-stopped, null if not set or not yet started
+        createdAt:
+          type: string
+          format: date-time
+          description: ISO8601 timestamp
+        updatedAt:
+          type: string
+          format: date-time
+          description: ISO8601 timestamp
+
+    VMResourcesResponse:
+      type: object
+      required:
+        - cpuCount
+        - memorySize
+        - diskSize
+      properties:
+        cpuCount:
+          type: integer
+          description: Number of CPU cores
+        memorySize:
+          type: string
+          description: Memory size as human-readable string
+          example: "8GB"
+        diskSize:
+          type: string
+          description: Disk size as human-readable string
+          example: "64GB"
+
+    VMNetworkResponse:
+      type: object
+      nullable: true
+      required:
+        - macAddress
+      properties:
+        macAddress:
+          type: string
+          pattern: '^([0-9A-Fa-f]{2}:){5}([0-9A-Fa-f]{2})$'
+          description: MAC address
+          example: "02:ab:cd:ef:01:23"
+        sshPort:
+          type: integer
+          nullable: true
+          description: SSH forwarding port
+          example: 2222
+        vncPort:
+          type: integer
+          nullable: true
+          description: VNC forwarding port
+          example: 5900
+        natIP:
+          type: string
+          nullable: true
+          description: NAT IP address
+          example: "192.168.64.1"
+
+    VMListResponse:
+      type: object
+      required:
+        - vms
+        - total
+      properties:
+        vms:
+          type: array
+          items:
+            $ref: '#/components/schemas/VMResponse'
+        total:
+          type: integer
+          description: Total number of VMs (across all pages)
+        limit:
+          type: integer
+          nullable: true
+          description: Maximum number of results per page
+        offset:
+          type: integer
+          nullable: true
+          description: Number of results skipped
+
+    SSHInfoResponse:
+      type: object
+      required:
+        - host
+        - port
+        - status
+      properties:
+        host:
+          type: string
+          description: SSH host
+          example: "127.0.0.1"
+        port:
+          type: integer
+          description: SSH port
+          example: 2222
+        status:
+          type: string
+          description: "Connection status: ready, unavailable, or disabled"
+          example: "ready"
+        user:
+          type: string
+          nullable: true
+          description: SSH user
+          example: admin
+
+    VNCInfoResponse:
+      type: object
+      required:
+        - host
+        - port
+        - status
+      properties:
+        host:
+          type: string
+          description: VNC host
+          example: "127.0.0.1"
+        port:
+          type: integer
+          description: VNC port
+          example: 5900
+        status:
+          type: string
+          description: "Forwarding status: ready, unavailable, or disabled"
+          example: "ready"
+
+    VMStateResponse:
+      type: object
+      required:
+        - state
+      properties:
+        state:
+          type: string
+          enum:
+            - CREATED
+            - INSTALLING
+            - STOPPED
+            - STARTING
+            - RUNNING
+            - STOPPING
+            - PAUSING
+            - PAUSED
+            - RESUMING
+            - ERROR
+            - DELETED
+          description: Current VM state
+        uptime:
+          type: integer
+          nullable: true
+          description: Uptime in seconds (if running)
+
+    HealthResponse:
+      type: object
+      required:
+        - status
+        - version
+        - vmsTotal
+        - vmsRunning
+        - uptime
+      properties:
+        status:
+          type: string
+          description: Health status
+          example: healthy
+        version:
+          type: string
+          description: Agent version
+          example: "0.1.0"
+        vmsTotal:
+          type: integer
+          description: Total VMs
+        vmsRunning:
+          type: integer
+          description: Running VMs
+        uptime:
+          type: integer
+          description: Agent uptime in seconds
+
+    InstallStatusResponse:
+      type: object
+      required:
+        - vmId
+        - status
+      properties:
+        vmId:
+          type: string
+          format: uuid
+          description: VM identifier
+        status:
+          type: string
+          description: Installation status
+          enum:
+            - not_started
+            - started
+            - downloading
+            - installing
+            - completed
+            - failed
+        progress:
+          type: number
+          format: double
+          nullable: true
+          minimum: 0
+          maximum: 1
+          description: >
+            Overall progress from 0.0 to 1.0. Setup/download is 0.0 to 0.5,
+            macOS installation is 0.5 to 1.0.
+        phaseProgress:
+          type: number
+          format: double
+          nullable: true
+          minimum: 0
+          maximum: 1
+          description: >
+            Progress within the current phase from 0.0 to 1.0. Matches the
+            percentage reported in the message field.
+        message:
+          type: string
+          nullable: true
+          description: Human-readable status message
+        phase:
+          type: string
+          nullable: true
+          description: Current installation phase
+          enum:
+            - setup
+            - downloading
+            - installing
+            - completed
+            - failed
+        bytesDownloaded:
+          type: integer
+          format: int64
+          nullable: true
+          description: Bytes downloaded so far (only during downloading phase)
+          example: 12348030976
+        bytesTotal:
+          type: integer
+          format: int64
+          nullable: true
+          description: Total bytes expected for download (only during downloading phase)
+          example: 19729670144
+        downloadSpeed:
+          type: integer
+          format: int64
+          nullable: true
+          description: Current download speed in bytes per second (only during downloading phase)
+          example: 52428800
+
+    GUIStatusResponse:
+      type: object
+      required:
+        - vmId
+        - guiOpen
+      properties:
+        vmId:
+          type: string
+          format: uuid
+          description: VM identifier
+        guiOpen:
+          type: boolean
+          description: Whether a GUI window is currently open
+
+    CommandExecuteRequest:
+      type: object
+      required:
+        - command
+      properties:
+        command:
+          type: string
+          description: Shell command to execute via SSH
+          example: whoami
+        user:
+          type: string
+          default: admin
+          description: SSH username
+        password:
+          type: string
+          default: admin
+          nullable: true
+          description: SSH password. Set to null for key-based auth.
+        timeout:
+          type: integer
+          minimum: 1
+          default: 30
+          description: Timeout in seconds (max 600)
+
+    CommandExecuteResponse:
+      type: object
+      required:
+        - vmId
+        - exitCode
+        - stdout
+        - stderr
+      properties:
+        vmId:
+          type: string
+          format: uuid
+          description: VM identifier
+        exitCode:
+          type: integer
+          description: Command exit code
+        stdout:
+          type: string
+          description: Standard output
+        stderr:
+          type: string
+          description: Standard error
+
+    KeystrokesRequest:
+      type: object
+      required:
+        - keystrokes
+      properties:
+        keystrokes:
+          type: array
+          items:
+            type: string
+          description: |
+            Keystroke sequences to inject.
+            Each string is parsed as a keystroke DSL sequence.
+          example: ["admin", "<tab>", "admin", "<enter>"]
+
+    KeystrokesResponse:
+      type: object
+      required:
+        - vmId
+        - keystrokesCount
+        - message
+      properties:
+        vmId:
+          type: string
+          format: uuid
+          description: VM identifier
+        keystrokesCount:
+          type: integer
+          description: Number of keystroke actions injected
+        message:
+          type: string
+          description: Human-readable result message
+
+    EventResponse:
+      type: object
+      required:
+        - timestamp
+        - type
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+          description: ISO8601 timestamp
+        type:
+          type: string
+          enum:
+            - STATE_CHANGED
+            - VM_CREATED
+            - VM_DELETED
+            - VM_STARTING
+            - VM_RUNNING
+            - VM_STOPPING
+            - VM_STOPPED
+            - VM_PAUSED
+            - VM_RESUMED
+            - ERROR_OCCURRED
+            - SSH_PORT_ASSIGNED
+            - SSH_PORT_RELEASED
+            - VNC_PORT_ASSIGNED
+            - VNC_PORT_RELEASED
+            - INSTALL_STARTED
+            - INSTALL_PROGRESS
+            - INSTALL_COMPLETED
+            - INSTALL_FAILED
+            - GUI_OPENED
+            - GUI_CLOSED
+            - IMAGE_PULL_STARTED
+            - IMAGE_PULLED
+            - IMAGE_PULL_FAILED
+            - IMAGE_PUSH_STARTED
+            - IMAGE_PUSHED
+            - IMAGE_PUSH_FAILED
+            - IMAGE_DELETED
+            - VM_CLONED
+            - VM_RESOURCES_UPDATED
+            - SSH_READY
+            - JEBALLTOFILE_STARTED
+            - JEBALLTOFILE_STEP_STARTED
+            - JEBALLTOFILE_STEP_COMPLETED
+            - JEBALLTOFILE_STEP_FAILED
+            - JEBALLTOFILE_COMPLETED
+            - JEBALLTOFILE_CANCELLED
+            - JEBALLTOFILE_FAILED
+          description: Event type
+        vmId:
+          type: string
+          format: uuid
+          nullable: true
+          description: VM identifier
+        data:
+          type: object
+          nullable: true
+          additionalProperties:
+            type: string
+          description: Event-specific data
+
+    EventListResponse:
+      type: object
+      required:
+        - events
+        - total
+      properties:
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/EventResponse'
+        total:
+          type: integer
+          description: Total number of events
+
+    PullImageRequest:
+      type: object
+      required:
+        - reference
+      properties:
+        reference:
+          type: string
+          description: OCI image reference
+          example: registry.example.com/vms/macos:v1
+        timeout:
+          type: integer
+          nullable: true
+          minimum: 1
+          description: >
+            Timeout in seconds for the pull operation. If omitted or null,
+            the operation runs without a time limit (unlimited).
+          example: 3600
+
+    PushImageRequest:
+      type: object
+      required:
+        - reference
+        - source
+      properties:
+        reference:
+          type: string
+          description: OCI image reference to push to
+          example: registry.example.com/vms/macos:v2
+        source:
+          type: string
+          description: >
+            Source to push from. Use 'vm:<uuid>' to push from a VM bundle
+            or 'image:<uuid>' to re-push an existing local image.
+          example: "vm:550e8400-e29b-41d4-a716-446655440000"
+        timeout:
+          type: integer
+          nullable: true
+          minimum: 1
+          description: >
+            Timeout in seconds for the push operation. If omitted or null,
+            the operation runs without a time limit (unlimited).
+          example: 7200
+
+    RegistryLoginRequest:
+      type: object
+      required:
+        - registry
+        - username
+        - password
+      properties:
+        registry:
+          type: string
+          description: Registry hostname
+          example: registry.example.com
+        username:
+          type: string
+          description: Registry username
+        password:
+          type: string
+          description: Registry password
+
+    RegistryLogoutRequest:
+      type: object
+      required:
+        - registry
+      properties:
+        registry:
+          type: string
+          description: Registry hostname
+          example: registry.example.com
+
+    ImageResponse:
+      type: object
+      required:
+        - id
+        - reference
+        - localPath
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Image identifier
+        reference:
+          type: string
+          description: OCI image reference
+        digest:
+          type: string
+          nullable: true
+          description: Image digest (sha256)
+        localPath:
+          type: string
+          description: Local storage path
+        size:
+          type: integer
+          format: int64
+          nullable: true
+          description: Image size in bytes
+        pulledAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: When the image was pulled
+        pushedAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: When the image was last pushed
+        metadata:
+          type: object
+          nullable: true
+          additionalProperties:
+            type: string
+          description: Image metadata
+
+    ImageListResponse:
+      type: object
+      required:
+        - images
+        - total
+      properties:
+        images:
+          type: array
+          items:
+            $ref: '#/components/schemas/ImageResponse'
+        total:
+          type: integer
+          description: Total number of images (across all pages)
+        limit:
+          type: integer
+          nullable: true
+          description: Maximum number of results per page
+        offset:
+          type: integer
+          nullable: true
+          description: Number of results skipped
+
+    ImagePullResponse:
+      type: object
+      required:
+        - reference
+        - status
+      properties:
+        reference:
+          type: string
+          description: OCI image reference
+        status:
+          type: string
+          description: Pull status
+          example: completed
+        digest:
+          type: string
+          nullable: true
+          description: Image digest
+        image:
+          $ref: '#/components/schemas/ImageResponse'
+        message:
+          type: string
+          nullable: true
+          description: Status message
+
+    ImagePushResponse:
+      type: object
+      required:
+        - reference
+        - status
+      properties:
+        reference:
+          type: string
+          description: OCI image reference
+        status:
+          type: string
+          description: Push status
+          example: completed
+        digest:
+          type: string
+          nullable: true
+          description: Image digest
+        image:
+          $ref: '#/components/schemas/ImageResponse'
+        message:
+          type: string
+          nullable: true
+          description: Status message
+
+    ConfigResponse:
+      type: object
+      required:
+        - api
+        - logging
+        - networking
+        - images
+      properties:
+        api:
+          type: object
+          required:
+            - port
+            - host
+            - enableHTTPS
+            - maxConcurrentRequests
+          properties:
+            port:
+              type: integer
+              description: API server port
+            host:
+              type: string
+              description: API server host
+            enableHTTPS:
+              type: boolean
+              description: Whether HTTPS is enabled
+            maxConcurrentRequests:
+              type: integer
+              description: Maximum concurrent requests
+        logging:
+          type: object
+          required:
+            - level
+            - enableFileLogging
+            - retentionDays
+            - maxTotalSize
+          properties:
+            level:
+              type: string
+              enum:
+                - debug
+                - info
+                - warning
+                - error
+              description: Current log level
+            enableFileLogging:
+              type: boolean
+              description: Whether file logging is enabled
+            retentionDays:
+              type: integer
+              description: Number of days to retain log files
+            maxTotalSize:
+              type: string
+              description: 'Maximum total log storage (e.g. "2GB", "500MB")'
+            timezone:
+              type: string
+              nullable: true
+              description: >
+                IANA timezone identifier for log timestamps (e.g. 'UTC', 'America/New_York').
+                When null, the system timezone is used.
+        networking:
+          type: object
+          required:
+            - sshPortRangeStart
+            - sshPortRangeEnd
+            - autoEnableSSHForwarding
+            - vncPortRangeStart
+            - vncPortRangeEnd
+          properties:
+            sshPortRangeStart:
+              type: integer
+              description: Start of SSH port range
+            sshPortRangeEnd:
+              type: integer
+              description: End of SSH port range
+            autoEnableSSHForwarding:
+              type: boolean
+              description: Whether SSH forwarding is auto-enabled
+            vncPortRangeStart:
+              type: integer
+              description: Start of VNC port range
+            vncPortRangeEnd:
+              type: integer
+              description: End of VNC port range
+        images:
+          type: object
+          required:
+            - insecureRegistries
+          properties:
+            defaultRegistry:
+              type: string
+              nullable: true
+              description: Default OCI registry
+            insecureRegistries:
+              type: array
+              items:
+                type: string
+              description: Registries that use HTTP instead of HTTPS
+
+    UpdateConfigRequest:
+      type: object
+      properties:
+        logging:
+          type: object
+          properties:
+            level:
+              type: string
+              enum:
+                - debug
+                - info
+                - warning
+                - error
+              description: Log level
+            retentionDays:
+              type: integer
+              minimum: 1
+              description: Number of days to retain log files
+            maxTotalSize:
+              type: string
+              description: 'Maximum total log storage (e.g. "2GB", "500MB"). Minimum 1MB.'
+            timezone:
+              type: string
+              nullable: true
+              description: >
+                IANA timezone identifier for log timestamps (e.g. 'UTC', 'America/New_York').
+                Set to null to use system timezone.
+        networking:
+          type: object
+          properties:
+            sshPortRangeStart:
+              type: integer
+              minimum: 1024
+              maximum: 65535
+              description: Start of SSH port range
+            sshPortRangeEnd:
+              type: integer
+              minimum: 1024
+              maximum: 65535
+              description: End of SSH port range
+            autoEnableSSHForwarding:
+              type: boolean
+              description: Auto-enable SSH forwarding for new VMs
+            vncPortRangeStart:
+              type: integer
+              minimum: 1024
+              maximum: 65535
+              description: Start of VNC port range
+            vncPortRangeEnd:
+              type: integer
+              minimum: 1024
+              maximum: 65535
+              description: End of VNC port range
+        images:
+          type: object
+          properties:
+            defaultRegistry:
+              type: string
+              nullable: true
+              description: Default OCI registry
+            insecureRegistries:
+              type: array
+              items:
+                type: string
+              description: Registries that use HTTP instead of HTTPS
+
+    SystemResetRequest:
+      type: object
+      required:
+        - mode
+      properties:
+        mode:
+          type: string
+          enum:
+            - soft
+            - hard
+          description: >
+            Reset mode. "soft" deletes all VMs, images, and IPSW cache.
+            "hard" deletes everything and terminates the application.
+
+    SystemResetResponse:
+      type: object
+      required:
+        - mode
+        - vmsDeleted
+        - vmsFailed
+        - imagesDeleted
+        - imagesFailed
+        - ipswCacheCleared
+        - configDeleted
+        - logsDeleted
+        - willTerminate
+      properties:
+        mode:
+          type: string
+          enum:
+            - soft
+            - hard
+          description: The reset mode that was executed
+        vmsDeleted:
+          type: integer
+          description: Number of VMs successfully deleted
+        vmsFailed:
+          type: integer
+          description: Number of VMs that failed to delete
+        imagesDeleted:
+          type: integer
+          description: Number of images successfully deleted
+        imagesFailed:
+          type: integer
+          description: Number of images that failed to delete
+        ipswCacheCleared:
+          type: boolean
+          description: Whether the IPSW download cache was cleared
+        configDeleted:
+          type: boolean
+          description: Whether config.json was deleted (hard mode only)
+        logsDeleted:
+          type: boolean
+          description: Whether log files were deleted (hard mode only)
+        willTerminate:
+          type: boolean
+          description: Whether the application will terminate after this response (hard mode only)
+        errors:
+          type: array
+          nullable: true
+          items:
+            type: string
+          description: List of errors encountered during reset
+
+    RegistryLoginResponse:
+      type: object
+      required:
+        - registry
+        - status
+      properties:
+        registry:
+          type: string
+          description: Registry hostname
+        status:
+          type: string
+          description: Authentication status
+          example: authenticated
+        message:
+          type: string
+          nullable: true
+          description: Status message
+
+    SuccessResponse:
+      type: object
+      required:
+        - success
+      properties:
+        success:
+          type: boolean
+          description: Whether the operation succeeded
+        message:
+          type: string
+          nullable: true
+          description: Status message
+
+    ErrorResponse:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: object
+          required:
+            - code
+            - message
+          properties:
+            code:
+              type: string
+              description: Error code
+              enum:
+                - UNAUTHORIZED
+                - INVALID_ID
+                - INVALID_REQUEST
+                - NOT_FOUND
+                - CREATE_FAILED
+                - START_FAILED
+                - STOP_FAILED
+                - PAUSE_FAILED
+                - RESUME_FAILED
+                - DELETE_FAILED
+                - SSH_NOT_CONFIGURED
+                - VNC_NOT_CONFIGURED
+                - VNC_ENABLE_FAILED
+                - VNC_DISABLE_FAILED
+                - GUI_OPEN_FAILED
+                - GUI_CLOSE_FAILED
+                - VM_LIMIT_REACHED
+                - INSTALL_FAILED
+                - EXECUTE_FAILED
+                - INVALID_STATE
+                - IMAGE_NOT_FOUND
+                - IMAGE_PULL_FAILED
+                - IMAGE_PUSH_FAILED
+                - INVALID_REFERENCE
+                - REGISTRY_AUTH_FAILED
+                - REGISTRY_LOGOUT_FAILED
+                - CONFIRMATION_REQUIRED
+                - CLONE_FAILED
+                - WIPE_FAILED
+                - RESET_FAILED
+                - CONFIG_UPDATE_FAILED
+                - INTERNAL_ERROR
+            message:
+              type: string
+              description: Error message
+            details:
+              type: object
+              nullable: true
+              additionalProperties:
+                type: string
+              description: Additional error details
+
+    JeballtofileRequest:
+      type: object
+      required:
+        - name
+        - steps
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+          description: VM name
+          example: my-dev-vm
+        source:
+          type: string
+          description: >
+            IPSW source for macOS installation. Required when steps contain
+            an 'install' step. Accepts HTTPS URL, file:// URL, or absolute path.
+          example: "https://updates.cdn-apple.com/.../RestoreImage.ipsw"
+        resources:
+          $ref: '#/components/schemas/VMResourcesDTO'
+        steps:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/JeballtofileStep'
+          description: Ordered list of steps to execute
+
+    JeballtofileStep:
+      type: object
+      required:
+        - type
+      properties:
+        type:
+          type: string
+          enum: [install, start, stop, gui-open, gui-close, keystrokes, execute, wait]
+          description: Step type
+        keystrokes:
+          type: array
+          items:
+            type: string
+          description: Keystroke sequences (required for 'keystrokes' type)
+        command:
+          type: string
+          description: Shell command to execute (required for 'execute' type)
+        user:
+          type: string
+          default: admin
+          description: SSH user (for 'execute' type)
+        password:
+          type: string
+          default: admin
+          description: SSH password (for 'execute' type)
+        timeout:
+          type: integer
+          minimum: 1
+          maximum: 600
+          default: 30
+          description: Command timeout in seconds (for 'execute' type)
+        seconds:
+          type: integer
+          minimum: 1
+          maximum: 300
+          description: Wait duration in seconds (required for 'wait' type)
+
+    JeballtofileResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Execution ID for status polling
+        vmId:
+          type: string
+          format: uuid
+          description: ID of the created VM
+        status:
+          type: string
+          enum: [running]
+        currentStep:
+          type: integer
+        totalSteps:
+          type: integer
+        message:
+          type: string
+
+    JeballtofileStatusResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        vmId:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [running, completed, failed, cancelled]
+        currentStep:
+          type: integer
+        totalSteps:
+          type: integer
+        stepResults:
+          type: array
+          items:
+            $ref: '#/components/schemas/JeballtofileStepResult'
+        error:
+          type: string
+          nullable: true
+
+    JeballtofileStepResult:
+      type: object
+      properties:
+        step:
+          type: integer
+          description: Step index (0-based)
+        type:
+          type: string
+          enum: [install, start, stop, gui-open, gui-close, keystrokes, execute, wait]
+        status:
+          type: string
+          enum: [in_progress, completed, cancelled, failed]
+        message:
+          type: string
+          nullable: true
+
+    JeballtofileListResponse:
+      type: object
+      properties:
+        executions:
+          type: array
+          items:
+            $ref: '#/components/schemas/JeballtofileStatusResponse'
+        total:
+          type: integer
+
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: INVALID_REQUEST
+              message: Invalid request body
+
+    Unauthorized:
+      description: Unauthorized
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: UNAUTHORIZED
+              message: Invalid or missing authentication token
+
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: NOT_FOUND
+              message: VM not found
+
+    ConcurrentVMLimit:
+      description: Concurrent VM limit reached (max 2 on Apple Silicon)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: VM_LIMIT_REACHED
+              message: Cannot start VM - 2 VMs already active (max 2)
+
+    InternalError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: INTERNAL_ERROR
+              message: Internal server error

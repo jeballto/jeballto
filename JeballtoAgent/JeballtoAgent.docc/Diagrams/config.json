@@ -1,0 +1,31 @@
+{
+  "theme": "base",
+  "flowchart": {
+    "nodeSpacing": 80,
+    "rankSpacing": 80,
+    "padding": 24,
+    "diagramPadding": 48
+  },
+  "themeVariables": {
+    "background": "#0d0f14",
+    "primaryColor": "#1a1d28",
+    "primaryTextColor": "#f0f0f0",
+    "primaryBorderColor": "#e8611a",
+    "lineColor": "#e8611a",
+    "secondaryColor": "#13151e",
+    "tertiaryColor": "#181b25",
+    "clusterBkg": "#13151e",
+    "clusterBorder": "#2e3350",
+    "titleColor": "#f0f0f0",
+    "edgeLabelBackground": "#1a1d28",
+    "fontFamily": "-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif",
+    "fontSize": "14px",
+    "nodeBorder": "#e8611a",
+    "mainBkg": "#1a1d28",
+    "nodeTextColor": "#f0f0f0",
+    "labelBackground": "#0d0f14",
+    "labelColor": "#f0f0f0",
+    "attributeBackgroundColorEven": "#13151e",
+    "attributeBackgroundColorOdd": "#1a1d28"
+  }
+}

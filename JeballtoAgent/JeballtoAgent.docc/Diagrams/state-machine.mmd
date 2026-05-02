@@ -1,0 +1,39 @@
+flowchart TD
+    Start(( )) --> created
+
+    created -->|install| installing
+    created -->|start| starting
+    created --> deleted
+
+    installing -->|completed| stopped
+    installing -->|start| starting
+    installing --> deleted
+
+    stopped -->|start| starting
+    stopped --> deleted
+
+    starting -->|booted| running
+    starting -->|from save| paused
+
+    running -->|stop| stopping
+    running -->|pause| pausing
+
+    stopping -->|done| stopped
+
+    pausing -->|saved| paused
+
+    paused -->|resume| resuming
+    paused -->|restart| starting
+    paused -->|stop| stopping
+
+    resuming -->|restored| running
+
+    error -->|recover| stopped
+    error --> deleted
+
+    deleted --> End(( ))
+
+    style Start fill:#e8611a,stroke:#e8611a
+    style End fill:#e8611a,stroke:#e8611a
+    style error fill:#3a1010,stroke:#e8611a
+    style deleted fill:#1a1d28,stroke:#666

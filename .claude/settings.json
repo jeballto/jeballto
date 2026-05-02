@@ -1,0 +1,32 @@
+{
+  "hooks": {
+    "on_session_end": ".claude/on_session_end.sh"
+  },
+  "rules": [
+    {
+      "description": "Run pre-commit checks before committing",
+      "pattern": ".*\\.swift$",
+      "instruction": "Run 'task pre-commit:run' on staged files before suggesting commits"
+    },
+    {
+      "description": "Validate OpenAPI spec changes",
+      "pattern": "openapi/.*\\.yaml$",
+      "instruction": "Validate OpenAPI specification with 'task openapi:validate' before committing"
+    },
+    {
+      "description": "Maintain actor-based concurrency in Manager classes",
+      "pattern": ".*Manager\\.swift$",
+      "instruction": "All *Manager classes should use actor pattern for thread safety, not DispatchQueue"
+    },
+    {
+      "description": "Use Task<Void, Never> for background tasks",
+      "pattern": ".*\\.swift$",
+      "instruction": "When creating background tasks, use Task<Void, Never> to enforce explicit error handling"
+    },
+    {
+      "description": "Minimal comments only",
+      "pattern": ".*\\.swift$",
+      "instruction": "Only add comments that explain non-obvious behavior or gotchas. Do not add comments that restate what the code does, describe parameters/returns for self-explanatory methods, or label sections of straightforward logic."
+    }
+  ]
+}

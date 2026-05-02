@@ -1,0 +1,20 @@
+flowchart TD
+    Client["API Client"]
+    Client -->|"HTTP / REST"| APIServer
+
+    subgraph Agent["JeballtoAgent"]
+        APIServer["APIServer\nHTTP · auth · routing"]
+
+        APIServer --> VMManager
+        APIServer --> ImageManager
+        APIServer --> CommandExecutor
+        APIServer --> KeystrokeInjector
+
+        VMManager["VMManager\ncreate · start · stop · delete\npause · resume · clone · update\nlifetime expiry · shutdown cleanup"]
+        ImageManager["ImageManager\npull · push · delete\nlogin · logout"]
+        CommandExecutor["CommandExecutor\nSSH commands"]
+        KeystrokeInjector["KeystrokeInjector\nGUI keystrokes"]
+
+        VMManager --> VZVirtualMachine["VZVirtualMachine\nApple Virtualization"]
+        ImageManager -->|"oras CLI"| Registry[("OCI Registry")]
+    end

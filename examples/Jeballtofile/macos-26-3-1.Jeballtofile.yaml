@@ -1,0 +1,220 @@
+name: macos-26-3-1
+source: https://updates.cdn-apple.com/2026WinterFCS/fullrestores/047-88313/2E098049-1731-4415-A206-546D09301973/UniversalMac_26.3.1_25D2128_Restore.ipsw
+resources:
+  cpuCount: 4
+  memorySize: 8GB
+  diskSize: 64GB
+
+steps:
+  # Install macOS from IPSW
+  - type: install
+
+  # Boot into Setup Assistant
+  - type: start
+  - type: wait
+    seconds: 30
+  - type: gui-open
+
+  # Automate the macOS Setup Assistant
+  - type: keystrokes
+    keystrokes:
+      - "<wait10s>"
+
+      # Language selection
+      - "<spacebar>"
+      - "<wait5s>"
+      - "english"
+      - "<enter>"
+      - "<wait30s>"
+
+      # Country/Region
+      - "<tab>"
+      - "<wait1s>"
+      - "<tab>"
+      - "<wait1s>"
+      - "<tab>"
+      - "<wait1s>"
+      - "<spacebar>"
+      - "<wait10s>"
+
+      # Setup as new Mac
+      - "<tab>"
+      - "<wait1s>"
+      - "<tab>"
+      - "<wait1s>"
+      - "<tab>"
+      - "<wait1s>"
+      - "<spacebar>"
+      - "<wait1s>"
+      - "<tab>"
+      - "<wait1s>"
+      - "<tab>"
+      - "<wait1s>"
+      - "<spacebar>"
+      - "<wait10s>"
+
+      # Written and Spoken Language
+      - "<tab>"
+      - "<wait1s>"
+      - "<tab>"
+      - "<wait1s>"
+      - "<tab>"
+      - "<wait1s>"
+      - "<spacebar>"
+      - "<wait10s>"
+
+      # Accessibility
+      - "<tab>"
+      - "<wait1s>"
+      - "<tab>"
+      - "<wait1s>"
+      - "<tab>"
+      - "<wait1s>"
+      - "<tab>"
+      - "<wait1s>"
+      - "<tab>"
+      - "<wait1s>"
+      - "<tab>"
+      - "<wait1s>"
+      - "<spacebar>"
+      - "<wait10s>"
+
+      # Data & Privacy
+      - "<tab>"
+      - "<wait1s>"
+      - "<tab>"
+      - "<wait1s>"
+      - "<tab>"
+      - "<wait1s>"
+      - "<spacebar>"
+      - "<wait10s>"
+
+      # Create account: admin / admin
+      - "<tab>"
+      - "<wait1s>"
+      - "<tab>"
+      - "<wait1s>"
+      - "<tab>"
+      - "<wait1s>"
+      - "<tab>"
+      - "<wait1s>"
+      - "<tab>"
+      - "<wait1s>"
+      - "<tab>"
+      - "<wait1s>"
+      - "admin"
+      - "<wait1s>"
+      - "<tab>"
+      - "<wait1s>"
+      - "<tab>"
+      - "<wait1s>"
+      - "admin"
+      - "<wait1s>"
+      - "<tab>"
+      - "<wait1s>"
+      - "admin"
+      - "<wait1s>"
+      - "<tab>"
+      - "<wait1s>"
+      - "<tab>"
+      - "<wait1s>"
+      - "<spacebar>"
+      - "<wait1s>"
+      - "<tab>"
+      - "<wait1s>"
+      - "<tab>"
+      - "<wait1s>"
+      - "<spacebar>"
+      - "<wait60s>"
+
+  # Reboot cycle to skip rest of Setup Assistant and reach desktop
+  - type: stop
+  - type: wait
+    seconds: 10
+  - type: start
+  - type: wait
+    seconds: 30
+  - type: gui-open
+
+  # Agree to Terms and Conditions and first login
+  - type: keystrokes
+    keystrokes:
+      - "<wait10s>"
+      - "<tab>"
+      - "<wait1s>"
+      - "<tab>"
+      - "<wait1s>"
+      - "<spacebar>"
+      - "<wait10s>"
+      - "<tab>"
+      - "<wait1s>"
+      - "<spacebar>"
+      - "<wait10s>"
+      - "<spacebar>"
+      - "<wait10s>"
+      - "admin"
+      - "<wait1s>"
+      - "<enter>"
+      - "<wait60s>"
+
+  # Enable SSH and Screen Sharing via keystrokes in Terminal.
+  # sudo password is entered once, then cached for subsequent sudo calls.
+  # Screen Sharing uses macOS user auth (admin/admin), not a separate VNC password.
+  - type: keystrokes
+    keystrokes:
+      - "<wait10s>"
+      # Open Terminal using Spotlight
+      - "<leftCmdOn><spacebar><leftCmdOff><wait5s>terminal"
+      - "<wait5s>"
+      - "<enter>"
+      - "<wait10s>"
+      # Enable SSH
+      - "sudo launchctl load -w /System/Library/LaunchDaemons/ssh.plist"
+      - "<enter>"
+      - "<wait3s>"
+      - "admin"
+      - "<enter>"
+      - "<wait5s>"
+      # Enable full keyboard navigation (Tab cycles all controls, not just text fields)
+      - "defaults write NSGlobalDomain AppleKeyboardUIMode -int 3"
+      - "<enter>"
+      - "<wait3s>"
+      # Open System Settings > Sharing and enable Screen Sharing via keystrokes.
+      # kickstart is broken on macOS 26, so we toggle it through the GUI.
+      - "open -a 'System Settings' && sleep 10 && open x-apple.systempreferences:com.apple.Sharing-Settings.extension"
+      - "<enter>"
+      - "<wait15s>"
+      - "<tab>"
+      - "<wait1s>"
+      - "<tab>"
+      - "<wait1s>"
+      - "<tab>"
+      - "<wait1s>"
+      - "<tab>"
+      - "<wait1s>"
+      - "<tab>"
+      - "<wait1s>"
+      - "<spacebar>"
+      - "<wait1s>"
+      - "<tab>"
+      - "<wait1s>"
+      - "<spacebar>"
+      - "<wait1s>"
+      - "<tab>"
+      - "<wait1s>"
+      - "<spacebar>"
+      - "<wait10s>"
+
+  # Wait for SSH daemon to become ready
+  - type: wait
+    seconds: 15
+
+  # Verify macOS is working
+  - type: execute
+    command: sw_vers
+    user: admin
+    password: admin
+    timeout: 30
+
+  # VM finished - stop it
+  - type: stop

@@ -1,0 +1,88 @@
+name: Jeballto CI
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_unit_tests:
+        description: "Run Xcode unit tests (macOS cost)"
+        required: true
+        type: boolean
+        default: false
+      run_build:
+        description: "Run Xcode debug build (macOS cost)"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  precommit_all_files:
+    name: Task pre-commit:all
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Task
+        uses: arduino/setup-task@v2
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pre-commit
+        run: python -m pip install --upgrade pip pre-commit
+
+      - name: Task pre-commit:all
+        run: task pre-commit:all
+
+  xcode_unit_tests:
+    name: Task test
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_unit_tests }}
+    needs: precommit_all_files
+    runs-on: macos-26
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Task
+        uses: arduino/setup-task@v2
+
+      - name: Task setup:brew
+        run: task setup:brew
+
+      - name: Task oras:download
+        run: task oras:download
+
+      - name: Task test
+        run: task test
+
+  xcode_build:
+    name: Task build
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_build }}
+    needs: precommit_all_files
+    runs-on: macos-26
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Task
+        uses: arduino/setup-task@v2
+
+      - name: Task setup:brew
+        run: task setup:brew
+
+      - name: Task oras:download
+        run: task oras:download
+
+      - name: Task build
+        run: task build
