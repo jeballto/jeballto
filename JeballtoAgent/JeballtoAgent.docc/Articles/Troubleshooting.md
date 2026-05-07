@@ -230,7 +230,7 @@ Lifecycle failures now automatically transition to ERROR state. If a VM is still
 
 ```bash
 killall JeballtoAgent
-./build/Release/JeballtoAgent
+open -a JeballtoAgent
 ```
 
 **VM in ERROR state**
@@ -260,26 +260,21 @@ Enable in config.json:
 }
 ```
 
-Restart agent. Logs at: `~/Library/Logs/Jeballto/agent.log`
+Restart agent. Logs are written to `~/Library/Logs/Jeballto/agent-YYYY-MM-DD.log`.
 
 Debug logging shows: all API requests, state transitions, event publishing, oras commands, SSH process details.
 
 ## Reset Everything
 
-Wipes all VMs, images, and config:
+Use hard reset to wipe VMs, images, config, caches, and logs. The agent exits after the response.
 
 ```bash
-# Stop agent
-killall JeballtoAgent
+curl -X POST "http://127.0.0.1:8011/v1/system/reset?confirm=true" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"mode":"hard"}'
 
-# Backup token if you want to keep it
-cp ~/Library/Application\ Support/Jeballto/config.json ~/jeballto-config.backup
-
-# Remove everything
-rm -rf ~/Library/Application\ Support/Jeballto
-
-# Restart (creates fresh config with new token)
-./build/Release/JeballtoAgent
+open -a JeballtoAgent
 ```
 
 ## Log Errors Reference

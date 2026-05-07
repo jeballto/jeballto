@@ -302,7 +302,7 @@ VM_ID=$(curl -s -X POST http://127.0.0.1:8011/v1/vms \
 curl -X POST http://127.0.0.1:8011/v1/vms/$VM_ID/start -H "Authorization: Bearer $TOKEN"
 ```
 
-**Debug logging:** Set `"level": "debug"` in config.json. Logs at `~/Library/Logs/Jeballto/agent.log`.
+**Debug logging:** Set `"level": "debug"` in config.json. Logs are written to `~/Library/Logs/Jeballto/agent-YYYY-MM-DD.log`.
 
 ## Common Pitfalls
 

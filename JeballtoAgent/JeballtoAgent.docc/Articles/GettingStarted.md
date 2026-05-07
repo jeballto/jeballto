@@ -1,28 +1,25 @@
 # Getting Started
 
-Build, run, and make your first API call in under five minutes.
+Install, run, and make your first API call in under five minutes.
 
 ## Prerequisites
 
 - Apple Silicon Mac (M1/M2/M3/M4)
 - macOS 26.0+
-- Xcode 26+ (for building)
 
-## Build and Run
+## Install and Run
 
-```bash
-git clone https://github.com/yourusername/jeballto.git
-cd jeballto
-xcodebuild -scheme JeballtoAgent -configuration Release
-./build/Release/JeballtoAgent
-```
+1. Download the latest release from [GitHub Releases](https://github.com/jeballto/jeballto/releases/latest).
+2. Unzip `JeballtoAgent.app`.
+3. Move it to `/Applications`.
+4. Open JeballtoAgent.
 
 On first launch, macOS asks for **Local Network** access. Click **Allow** - it is required for SSH and VNC port forwarding. If you miss the prompt, enable it later in System Settings > Privacy & Security > Local Network.
 
 First run also writes `~/Library/Application Support/Jeballto/config.json` with your auth token.
 
 ```bash
-# Grab the auth token (required for every API call)
+# Grab the auth token
 export TOKEN=$(cat ~/Library/Application\ Support/Jeballto/config.json | grep token | cut -d'"' -f4)
 ```
 
