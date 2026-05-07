@@ -21,7 +21,7 @@ JeballtoAgent is a headless macOS app built on Apple's Virtualization framework.
 ### APIServer
 
 - HTTP server on configurable host:port (default `0.0.0.0:8011`)
-- Bearer token authentication (checked before routing)
+- Request authentication before routing
 - RESTful endpoint routing
 - Request/response JSON serialization
 - Standardized error responses
@@ -99,7 +99,7 @@ OCI image operations using `oras` CLI:
 
 | Operation | What happens |
 |-----------|-------------|
-| `pullImage(reference)` | Checks local cache first - `oras pull` - stores in `Images/{uuid}/` - registers in ImageStore |
+| `pullImage(reference)` | Checks the local image store first - `oras pull` - stores in `Images/{uuid}/` - registers in ImageStore |
 | `pushImageFromVM(reference, vmBundlePath)` | Enumerates VM bundle files - `oras push` with artifact type `application/vnd.jeballto.vm.bundle.v1` |
 | `pushImage(reference, imageId)` | Re-pushes existing local image to new reference |
 | `deleteImage(id)` | Removes files (if owned, not a shared VM bundle) - removes from ImageStore |
@@ -185,11 +185,14 @@ On crash or forced kill, VM runtime state is lost and VMs revert to STOPPED on n
         +-- HardwareModel    # Serialized hardware model
         +-- MachineIdentifier # Unique machine ID
 
+~/Library/Caches/Jeballto/
++-- IPSWCache/               # Downloaded macOS IPSWs reused across installs
+
 ~/Library/Logs/Jeballto/
 +-- agent-YYYY-MM-DD.log     # Daily rotating application logs
 ```
 
-Images pulled from an OCI registry are stored as `.bundle` directories named after the image UUID, matching the VM storage format. The image UUID in `images.json` maps directly to the directory name on disk.
+Images pulled from an OCI registry are stored under `Application Support/Jeballto/Images/` as `.bundle` directories named after the image UUID. The image UUID in `images.json` maps directly to the directory name on disk. Transient `oras-tmp-*` directories may appear there during pull operations and are cleaned up by the image manager.
 
 ## Threading Model
 
@@ -211,7 +214,6 @@ Images pulled from an OCI registry are stored as `.bundle` directories named aft
 
 ## Security
 
-- Bearer token auth on all endpoints except `/v1/health`
 - Token auto-generated on first run, stored in config file with 600 permissions
 - API binds to localhost by default
 - SSH passwords passed via `SSH_ASKPASS` script (not in process arguments)

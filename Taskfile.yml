@@ -10,9 +10,12 @@ vars:
   DIAGRAMS_DIR: "{{.DOCC_BUNDLE}}/Diagrams"
   ORAS_BINARY: "{{.ROOT_DIR}}/Resources/oras"
   OPENAPI_SRC: "{{.ROOT_DIR}}/openapi/jeballto-api.yaml"
+  DOCS_INDEX_TEMPLATE: "{{.ROOT_DIR}}/scripts/docs-index.html"
   DERIVED_DATA: "{{.ROOT_DIR}}/.build/DerivedData"
   DOCS_OUTPUT: "{{.ROOT_DIR}}/.build/Docs"
   DOCS_DERIVED_DATA: "{{.DOCS_OUTPUT}}/DerivedData"
+  DOCS_SITE: "{{.DOCS_OUTPUT}}/site"
+  DOCS_LOCAL_SITE: "{{.DOCS_OUTPUT}}/local-site"
   # Xcode
   PROJECT: "JeballtoProject.xcodeproj"
   SCHEME: "JeballtoAgent"
@@ -21,7 +24,7 @@ vars:
   XCODE_PROJECT_SCHEME: '-project "{{.PROJECT}}" -scheme "{{.SCHEME}}"'
   XCODE_BUILD_FLAGS: '{{.XCODE_PROJECT_SCHEME}} -derivedDataPath "{{.DERIVED_DATA}}"'
   XCODE_TEST_FLAGS: '{{.XCODE_BUILD_FLAGS}} {{.TEST_ARGS}}'
-  XCODE_DOCBUILD_FLAGS: '{{.XCODE_PROJECT_SCHEME}} -destination "{{.DESTINATION}}" -derivedDataPath "{{.DOCS_DERIVED_DATA}}"'
+  XCODE_DOCBUILD_FLAGS: '{{.XCODE_PROJECT_SCHEME}} -scmProvider system -destination "{{.DESTINATION}}" -derivedDataPath "{{.DOCS_DERIVED_DATA}}"'
   TEST_ARGS: '-destination "{{.DESTINATION}}" -only-testing:JeballtoAgentTests'
   # Versions
   ORAS_VERSION: "1.3.0"
@@ -185,10 +188,49 @@ tasks:
 
   docs:build:
     desc: Build DocC archive
+    deps: [oras:download]
     cmds:
       - mkdir -p "{{.DOCS_OUTPUT}}"
-      - 'xcodebuild docbuild {{.XCODE_DOCBUILD_FLAGS}} | xcbeautify'
+      - |
+        if command -v xcbeautify &>/dev/null; then
+          xcodebuild docbuild {{.XCODE_DOCBUILD_FLAGS}} | xcbeautify
+        else
+          xcodebuild docbuild {{.XCODE_DOCBUILD_FLAGS}}
+        fi
       - 'echo "DocC archive: {{.DOCS_DERIVED_DATA}}/Build/Products/Debug/{{.SCHEME}}.doccarchive"'
+
+  docs:pages:
+    desc: Build GitHub Pages static site from DocC
+    deps: [docs:build]
+    cmds:
+      - |
+        ARCHIVE="{{.DOCS_DERIVED_DATA}}/Build/Products/Debug/{{.SCHEME}}.doccarchive"
+        HOSTING_BASE_PATH="${GITHUB_REPOSITORY#*/}"
+
+        if [[ -z "${GITHUB_REPOSITORY:-}" ]]; then
+          HOSTING_BASE_PATH="jeballto"
+        fi
+
+        rm -rf "{{.DOCS_SITE}}"
+        xcrun docc process-archive transform-for-static-hosting "$ARCHIVE" \
+          --hosting-base-path "$HOSTING_BASE_PATH" \
+          --output-path "{{.DOCS_SITE}}"
+
+        cp "{{.DOCS_INDEX_TEMPLATE}}" "{{.DOCS_SITE}}/index.html"
+
+        echo "Pages site: {{.DOCS_SITE}}"
+
+  docs:serve:
+    desc: Serve GitHub Pages DocC output locally
+    deps: [docs:pages]
+    cmds:
+      - |
+        rm -rf "{{.DOCS_LOCAL_SITE}}"
+        mkdir -p "{{.DOCS_LOCAL_SITE}}"
+        ln -s "{{.DOCS_SITE}}" "{{.DOCS_LOCAL_SITE}}/jeballto"
+        echo "Serving: http://localhost:8000/jeballto/documentation/jeballtoagent/"
+        cd "{{.DOCS_LOCAL_SITE}}"
+        python3 -m http.server 8000
 
   docs:preview:
     desc: Live-preview DocC articles at localhost:8000
