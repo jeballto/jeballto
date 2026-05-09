@@ -7,6 +7,14 @@ Headless, API-first macOS virtual machine manager for Apple Silicon.
 > [!IMPORTANT]
 > Jeballto is currently in public beta. Some functionality may be incomplete, unstable, or change in breaking ways before a stable release. Pin versions for critical workflows and review release notes before upgrading.
 
+## Version Compatibility
+
+Use matched beta versions unless release notes say otherwise.
+
+| JeballtoAgent | GitHub Actions Runner | GitLab Executor | Jenkins Plugin | Python CLI |
+|---|---|---|---|---|
+| `1.0.0-beta.1` | `1.0.0-beta.1` | `1.0.0-beta.1` | `1.0.0-beta.1` | `1.0.0b1` |
+
 ## Features
 
 - REST API for full VM lifecycle (create, start, stop, pause, resume, clone, delete etc.)
