@@ -90,6 +90,7 @@ task openapi:stamp    # sync version field in jeballto-api.yaml
 | `xcbeautify` | `task setup` | Required - formats xcodebuild output |
 | `check-jsonschema` | `task setup` | Required - OpenAPI schema validation |
 | `oras` | `task setup` | Required - bundled into the app at build time |
+| `zstd` | `task setup` | Required - bundled into the app at build time |
 | `mmdc` | `task setup` (needs npm) | Optional - diagram SVG generation |
 
 ### Xcode build phase integration
@@ -99,7 +100,7 @@ Xcode build phases delegate to task automatically during `Product - Build` or `x
 - `task xcode:set-build-number` - stamps CFBundleVersion with timestamp
 - `task xcode:diagrams` - generates SVGs (non-fatal if mmdc missing)
 - `task xcode:copy-openapi` - stamps and copies OpenAPI schema
-- `task xcode:copy-oras` - copies oras binary to app bundle
+- `task xcode:copy-tools` - copies oras and zstd binaries to app bundle
 
 Do not run `xcode:*` tasks manually.
 
@@ -169,11 +170,16 @@ First run creates `~/Library/Application Support/Jeballto/config.json` (permissi
   "images": {
     "imageStorageDir": "~/Library/Application Support/Jeballto/Images",
     "orasPath": null,
+    "zstdPath": null,
+    "maxParallelImageChunks": 0,
     "defaultRegistry": null,
     "insecureRegistries": []
   }
 }
 ```
+
+`maxParallelImageChunks` controls concurrent image chunk compression and decompression. `0` means automatic:
+`max(1, min(8, active CPU count - 1))`.
 
 ## Code Style
 

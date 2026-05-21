@@ -549,12 +549,14 @@ POST /v1/images/pull
 ```
 
 Downloads and stores locally. Idempotent - returns existing record if already local.
+Jeballto images use one OCI artifact format: `application/vnd.jeballto.vm.bundle`
+with zstd-compressed chunk layers.
 
 ```bash
 curl -X POST http://127.0.0.1:8011/v1/images/pull \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"reference":"ghcr.io/myorg/vms/dev-env:v1.2"}'
+  -d '{"reference":"ghcr.io/myorg/vms/dev-env:latest"}'
 ```
 
 Optional `timeout` field (seconds). No timeout by default.
@@ -577,7 +579,7 @@ curl -X POST http://127.0.0.1:8011/v1/images/push \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "reference": "ghcr.io/myorg/vms/dev-env:v1.2",
+    "reference": "ghcr.io/myorg/vms/dev-env:latest",
     "sourceVmId": "550e8400-e29b-41d4-a716-446655440000"
   }'
 ```
@@ -678,6 +680,7 @@ curl -X PATCH http://127.0.0.1:8011/v1/config \
 | `networking` | `autoEnableSSHForwarding` | bool |
 | `networking` | `vncPortRangeStart`, `vncPortRangeEnd` | 1024-65535 |
 | `images` | `defaultRegistry`, `insecureRegistries` | - |
+| `images` | `maxParallelImageChunks` | `0` auto, otherwise 1-32. Auto is `max(1, min(8, active CPU count - 1))` |
 
 ## System Reset
 

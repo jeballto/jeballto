@@ -238,12 +238,19 @@ struct NetworkingConfig: Codable {
 }
 
 /// OCI image management configuration
-struct ImageConfig: Codable {
+struct ImageConfig: Codable, Sendable {
   /// Base directory for local image storage
   var imageStorageDir: String
 
   /// Path to the `oras` CLI binary. When `nil`, uses the binary bundled in the app's Resources directory.
   var orasPath: String?
+
+  /// Path to the `zstd` CLI binary. When `nil`, uses the binary bundled in the app's Resources directory.
+  var zstdPath: String?
+
+  /// Maximum number of image chunks to compress or decompress concurrently.
+  /// Zero uses an automatic value based on CPU count, capped at 8.
+  var maxParallelImageChunks: Int
 
   /// Default OCI registry (optional, used when reference has no registry prefix)
   var defaultRegistry: String?
@@ -254,13 +261,31 @@ struct ImageConfig: Codable {
   init(
     imageStorageDir: String? = nil,
     orasPath: String? = nil,
+    zstdPath: String? = nil,
+    maxParallelImageChunks: Int = 0,
     defaultRegistry: String? = nil,
     insecureRegistries: [String] = []
   ) {
     let defaultBase = "\(NSHomeDirectory())/Library/Application Support/Jeballto"
     self.imageStorageDir = imageStorageDir ?? "\(defaultBase)/Images"
     self.orasPath = orasPath
+    self.zstdPath = zstdPath
+    self.maxParallelImageChunks = maxParallelImageChunks
     self.defaultRegistry = defaultRegistry
     self.insecureRegistries = insecureRegistries
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    let defaultBase = "\(NSHomeDirectory())/Library/Application Support/Jeballto"
+    imageStorageDir = try container.decodeIfPresent(String.self, forKey: .imageStorageDir) ?? "\(defaultBase)/Images"
+    orasPath = try container.decodeIfPresent(String.self, forKey: .orasPath)
+    zstdPath = try container.decodeIfPresent(String.self, forKey: .zstdPath)
+    maxParallelImageChunks = try container.decodeIfPresent(Int.self, forKey: .maxParallelImageChunks) ?? 0
+    guard (0 ... 32).contains(maxParallelImageChunks) else {
+      throw ConfigError.invalidFormat("images.maxParallelImageChunks must be between 0 and 32")
+    }
+    defaultRegistry = try container.decodeIfPresent(String.self, forKey: .defaultRegistry)
+    insecureRegistries = try container.decodeIfPresent([String].self, forKey: .insecureRegistries) ?? []
   }
 }

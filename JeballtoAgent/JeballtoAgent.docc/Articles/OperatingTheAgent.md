@@ -36,7 +36,7 @@ Use `Beta Updates` to switch between stable and beta release feeds. The choice i
 
 Notifications are posted through the standard macOS Notification Center, so they respect System Settings > Notifications > JeballtoAgent. Ephemeral VMs run through the usual shutdown path when you install an update.
 
-## IPSW Cache
+## Download Caches
 
 Downloaded macOS IPSWs are cached at:
 
@@ -46,9 +46,9 @@ Downloaded macOS IPSWs are cached at:
 
 The cache is reused across installs so repeated `POST /v1/vms/{id}/install` calls with the same source don't re-download.
 
-**Clearing the cache:**
+**Clearing caches:**
 
-- `POST /v1/system/reset` (either mode) clears it.
+- `POST /v1/system/reset` (either mode) clears the IPSW cache.
 - Or remove the directory manually while the agent is stopped.
 
 Typical IPSW size is 12-18 GB, so this is often the biggest user of disk space beyond the VM bundles themselves.

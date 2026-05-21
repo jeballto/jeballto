@@ -90,6 +90,7 @@ fastlane/test_output/
 # Downloaded Binaries
 # ===============================
 Resources/oras
+Resources/zstd
 
 # ===============================
 # DocC

@@ -824,10 +824,12 @@ struct NetworkingConfigResponse: Codable {
 struct ImageConfigResponse: Codable {
   let defaultRegistry: String?
   let insecureRegistries: [String]
+  let maxParallelImageChunks: Int
 
   init(from config: ImageConfig) {
     defaultRegistry = config.defaultRegistry
     insecureRegistries = config.insecureRegistries
+    maxParallelImageChunks = config.maxParallelImageChunks
   }
 }
 
@@ -904,6 +906,12 @@ struct UpdateConfigRequest: Codable {
         return (false, "VNC port range start must not exceed end")
       }
     }
+    if let images,
+       let maxParallelImageChunks = images.maxParallelImageChunks,
+       maxParallelImageChunks < 0 || maxParallelImageChunks > 32
+    {
+      return (false, "maxParallelImageChunks must be between 0 and 32")
+    }
     return (true, nil)
   }
 }
@@ -926,6 +934,7 @@ struct NetworkingConfigUpdate: Codable {
 struct ImageConfigUpdate: Codable {
   let defaultRegistry: String?
   let insecureRegistries: [String]?
+  let maxParallelImageChunks: Int?
 }
 
 // MARK: - System Reset Models

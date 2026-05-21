@@ -93,9 +93,9 @@ struct RequestValidationTests {
 
   @Test
   func pullImageRequestValidation() {
-    let valid = PullImageRequest(reference: "registry.example.com/vm/macos:v1", timeout: 10)
+    let valid = PullImageRequest(reference: "registry.example.com/vm/macos:latest", timeout: 10)
     let invalidRef = PullImageRequest(reference: "not valid", timeout: 10)
-    let invalidTimeout = PullImageRequest(reference: "registry.example.com/vm/macos:v1", timeout: 0)
+    let invalidTimeout = PullImageRequest(reference: "registry.example.com/vm/macos:latest", timeout: 0)
 
     #expect(valid.validate().valid)
     #expect(invalidRef.validate().valid == false)
@@ -108,14 +108,14 @@ struct RequestValidationTests {
     let vmSource = "vm:\(id)"
     let imageSource = "image:\(id)"
 
-    let vmRequest = PushImageRequest(reference: "registry.example.com/vm/macos:v1", source: vmSource, timeout: 10)
+    let vmRequest = PushImageRequest(reference: "registry.example.com/vm/macos:latest", source: vmSource, timeout: 10)
     let imageRequest = PushImageRequest(
-      reference: "registry.example.com/vm/macos:v1",
+      reference: "registry.example.com/vm/macos:latest",
       source: imageSource,
       timeout: nil
     )
     let invalidSource = PushImageRequest(
-      reference: "registry.example.com/vm/macos:v1",
+      reference: "registry.example.com/vm/macos:latest",
       source: "bad:\(id)",
       timeout: nil
     )
@@ -140,6 +140,34 @@ struct RequestValidationTests {
     #expect(loginInvalidHost.validate().valid == false)
     #expect(logoutValid.validate().valid)
     #expect(logoutInvalid.validate().valid == false)
+  }
+
+  @Test
+  func updateConfigImageParallelChunkValidation() throws {
+    let autoJSON = #"{"images":{"maxParallelImageChunks":0}}"#
+    let positiveJSON = #"{"images":{"maxParallelImageChunks":8}}"#
+    let negativeJSON = #"{"images":{"maxParallelImageChunks":-1}}"#
+    let tooHighJSON = #"{"images":{"maxParallelImageChunks":33}}"#
+
+    let auto = try JSONDecoder().decode(UpdateConfigRequest.self, from: Data(autoJSON.utf8))
+    let positive = try JSONDecoder().decode(UpdateConfigRequest.self, from: Data(positiveJSON.utf8))
+    let negative = try JSONDecoder().decode(UpdateConfigRequest.self, from: Data(negativeJSON.utf8))
+    let tooHigh = try JSONDecoder().decode(UpdateConfigRequest.self, from: Data(tooHighJSON.utf8))
+
+    #expect(auto.validate().valid)
+    #expect(positive.validate().valid)
+    #expect(negative.validate().valid == false)
+    #expect(tooHigh.validate().valid == false)
+  }
+
+  @Test
+  func configResponseIncludesImageParallelChunkSetting() {
+    var config = Config.default
+    config.images.maxParallelImageChunks = 6
+
+    let response = ConfigResponse(from: config)
+
+    #expect(response.images.maxParallelImageChunks == 6)
   }
 
   @Test
@@ -533,7 +561,7 @@ struct RequestValidationTests {
   @Test
   func createVMRequestRejectsResourcesWithImage() {
     let resources = VMResourcesDTO(cpuCount: 4, memorySize: nil, diskSize: nil)
-    let request = CreateVMRequest(name: "from-image", resources: resources, image: "registry.example.com/vms/m:v1")
+    let request = CreateVMRequest(name: "from-image", resources: resources, image: "registry.example.com/vms/m:latest")
 
     let validation = request.validate()
     #expect(validation.valid == false)
@@ -542,7 +570,7 @@ struct RequestValidationTests {
 
   @Test
   func createVMRequestAcceptsImageWithoutResources() {
-    let request = CreateVMRequest(name: "from-image", resources: nil, image: "registry.example.com/vms/m:v1")
+    let request = CreateVMRequest(name: "from-image", resources: nil, image: "registry.example.com/vms/m:latest")
     #expect(request.validate().valid)
   }
 

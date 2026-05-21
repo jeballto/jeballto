@@ -108,7 +108,7 @@
 				A038C8112F236AD100254AE0 /* Frameworks */,
 				A038C8FF2F236AD100254AE0 /* Resources */,
 				A0BNUM0012F600000000000 /* Set Build Number */,
-				A0ORAS0012F300000000000 /* Copy oras binary */,
+				A0ORAS0012F300000000000 /* Copy bundled tools */,
 				A0OAPI0012F400000000000 /* Copy OpenAPI schema */,
 			);
 			buildRules = (
@@ -262,21 +262,23 @@
 			shellPath = /bin/bash;
 			shellScript = "export PATH=\"/opt/homebrew/bin:$PATH\"\ncd \"$SRCROOT\" && task xcode:copy-openapi\n";
 		};
-		A0ORAS0012F300000000000 /* Copy oras binary */ = {
+		A0ORAS0012F300000000000 /* Copy bundled tools */ = {
 			isa = PBXShellScriptBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
 			);
 			inputPaths = (
 				"$(SRCROOT)/Resources/oras",
+				"$(SRCROOT)/Resources/zstd",
 			);
-			name = "Copy oras binary";
+			name = "Copy bundled tools";
 			outputPaths = (
 				"$(BUILT_PRODUCTS_DIR)/$(PRODUCT_NAME).app/Contents/Resources/oras",
+				"$(BUILT_PRODUCTS_DIR)/$(PRODUCT_NAME).app/Contents/Resources/zstd",
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/bash;
-			shellScript = "export PATH=\"/opt/homebrew/bin:$PATH\"\ncd \"$SRCROOT\" && task xcode:copy-oras\n";
+			shellScript = "export PATH=\"/opt/homebrew/bin:$PATH\"\ncd \"$SRCROOT\" && task xcode:copy-tools\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 

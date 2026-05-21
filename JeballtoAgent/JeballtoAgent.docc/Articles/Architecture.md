@@ -99,8 +99,8 @@ OCI image operations using `oras` CLI:
 
 | Operation | What happens |
 |-----------|-------------|
-| `pullImage(reference)` | Checks the local image store first - `oras pull` - stores in `Images/{uuid}/` - registers in ImageStore |
-| `pushImageFromVM(reference, vmBundlePath)` | Enumerates VM bundle files - `oras push` with artifact type `application/vnd.jeballto.vm.bundle.v1` |
+| `pullImage(reference)` | Checks the local image store first - fetches the image config and zstd chunks - reconstructs `Images/{uuid}.bundle` - registers in ImageStore |
+| `pushImageFromVM(reference, vmBundlePath)` | Chunks VM bundle files - compresses nonzero chunks with zstd - `oras push` with artifact type `application/vnd.jeballto.vm.bundle` |
 | `pushImage(reference, imageId)` | Re-pushes existing local image to new reference |
 | `deleteImage(id)` | Removes files (if owned, not a shared VM bundle) - removes from ImageStore |
 | `loginRegistry` / `logoutRegistry` | Delegates to `oras login/logout` |
@@ -113,8 +113,11 @@ Thin wrapper around the `oras` CLI binary. Key design choices:
 - Passwords passed via stdin (not in process args, not visible in `ps`)
 - Timeout protection: no limit for pull/push, 30s for login/logout/resolve
 - Output capped at 5 MB per stream
+- VM images are chunked by `VMImagePackager` and compressed by `zstd` before ORAS uploads each nonzero chunk as a separate layer
+- `maxParallelImageChunks = 0` uses `max(1, min(8, active CPU count - 1))`, leaving one CPU free and capping automatic chunk work at 8
 
 Resolves `oras` binary: checks `config.images.orasPath` first, then `Bundle.main.resourceURL/oras`.
+Resolves `zstd` binary: checks `config.images.zstdPath` first, then `Bundle.main.resourceURL/zstd`.
 
 ### EventBus
 
@@ -187,12 +190,13 @@ On crash or forced kill, VM runtime state is lost and VMs revert to STOPPED on n
 
 ~/Library/Caches/Jeballto/
 +-- IPSWCache/               # Downloaded macOS IPSWs reused across installs
++-- ImageWork/               # Transient image package and pull work directories
 
 ~/Library/Logs/Jeballto/
 +-- agent-YYYY-MM-DD.log     # Daily rotating application logs
 ```
 
-Images pulled from an OCI registry are stored under `Application Support/Jeballto/Images/` as `.bundle` directories named after the image UUID. The image UUID in `images.json` maps directly to the directory name on disk. Transient `oras-tmp-*` directories may appear there during pull operations and are cleaned up by the image manager.
+Images pulled from an OCI registry are stored under `Application Support/Jeballto/Images/` as `.bundle` directories named after the image UUID. The image UUID in `images.json` maps directly to the directory name on disk. Transient image work directories live under `~/Library/Caches/Jeballto/` and are disposable.
 
 ## Threading Model
 
@@ -210,7 +214,7 @@ Images pulled from an OCI registry are stored under `Application Support/Jeballt
 
 **Platform:** Apple Silicon only (ARM64 check on startup). macOS 26.0+.
 
-**oras dependency:** OCI image operations require the `oras` binary. It must be bundled in the app's Resources or configured via `images.orasPath`.
+**Image tool dependencies:** OCI image operations require `oras` and `zstd`. Both must be bundled in the app's Resources or configured via `images.orasPath` and `images.zstdPath`.
 
 ## Security
 

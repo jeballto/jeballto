@@ -152,16 +152,17 @@ extension APIServer {
   // MARK: - Helpers
 
   private func clearIPSWCache(_ errors: inout [String]) -> Bool {
-    let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-      .appendingPathComponent("Jeballto/IPSWCache")
+    clearCacheDirectory(JeballtoCachePaths.ipswCache, label: "IPSW", errors: &errors)
+  }
 
+  private func clearCacheDirectory(_ cacheDir: URL, label: String, errors: inout [String]) -> Bool {
     guard FileManager.default.fileExists(atPath: cacheDir.path) else { return true }
 
     do {
       try FileManager.default.removeItem(at: cacheDir)
       return true
     } catch {
-      errors.append("Failed to clear IPSW cache: \(error.localizedDescription)")
+      errors.append("Failed to clear \(label) cache: \(error.localizedDescription)")
       return false
     }
   }

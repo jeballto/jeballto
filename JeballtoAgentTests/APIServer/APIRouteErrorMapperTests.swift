@@ -118,7 +118,7 @@ struct APIRouteErrorMapperTests {
   @Test
   func imageNotFoundWithoutOverrideFallsBackTo500() throws {
     let response = APIRouteErrorMapper.imageManager(
-      .imageNotFound("registry/repo:v1"),
+      .imageNotFound("registry/repo:latest"),
       defaultCode: "DELETE_FAILED"
     )
     let decoded = try decodedError(response)

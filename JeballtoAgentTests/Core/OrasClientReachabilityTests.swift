@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Testing
 @testable import JeballtoAgent
@@ -138,5 +139,42 @@ struct OrasClientReachabilityTests {
       session: makeStubSession()
     )
     #expect(capturedURL?.scheme == "http")
+  }
+
+  @Test
+  func fetchBlobStreamsStdoutToOutputFileAndValidatesDigest() async throws {
+    try await withTemporaryDirectory(prefix: "oras-blob-fetch") { root in
+      let payload = Data("hello blob\n".utf8)
+      let digest = "sha256:" + SHA256.hash(data: payload).map { String(format: "%02x", $0) }.joined()
+      let orasPath = (root as NSString).appendingPathComponent("oras")
+      let outputPath = (root as NSString).appendingPathComponent("blob.zst")
+      let script = """
+      #!/bin/sh
+      if [ "$1" != "blob" ] || [ "$2" != "fetch" ] || [ "$3" != "--output" ] || [ "$4" != "-" ]; then
+        echo "unexpected args: $*" >&2
+        exit 2
+      fi
+      printf 'hello blob\\n'
+      """
+      try script.write(toFile: orasPath, atomically: true, encoding: .utf8)
+      try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: orasPath)
+
+      let client = OrasClient(config: ImageConfig(
+        imageStorageDir: root,
+        orasPath: orasPath,
+        defaultRegistry: nil,
+        insecureRegistries: []
+      ))
+
+      try await client.fetchBlob(
+        reference: ImageReference.parse("registry.example.com/repo:tag"),
+        digest: digest,
+        outputPath: outputPath,
+        expectedSize: UInt64(payload.count)
+      )
+
+      let output = try Data(contentsOf: URL(fileURLWithPath: outputPath))
+      #expect(output == payload)
+    }
   }
 }

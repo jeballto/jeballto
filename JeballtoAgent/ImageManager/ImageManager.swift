@@ -24,8 +24,7 @@ enum ImageManagerError: Error, LocalizedError {
 }
 
 /// Central orchestrator for OCI image operations.
-/// Pushes VM bundle directories directly via oras (which auto-compresses directories
-/// as tar+gzip OCI layers). No manual compression step needed.
+/// Pushes VM bundle directories as chunked Jeballto OCI artifacts while preserving the public REST API.
 actor ImageManager {
   private let imageStore: ImageStore
   private let orasClient: OrasClient
@@ -37,19 +36,74 @@ actor ImageManager {
     self.orasClient = orasClient
     self.eventBus = eventBus
     self.config = config
-    cleanupStaleOrasTempDirs(storageDir: config.images.imageStorageDir)
+    cleanupStaleImageWorkDirs(imageStorageDir: config.images.imageStorageDir)
   }
 
   // MARK: - Startup Cleanup
 
-  private nonisolated func cleanupStaleOrasTempDirs(storageDir: String) {
+  private nonisolated func cleanupStaleImageWorkDirs(imageStorageDir: String) {
     let fileManager = FileManager.default
-    guard let contents = try? fileManager.contentsOfDirectory(atPath: storageDir) else { return }
+    let workPath = JeballtoCachePaths.imageWork.path
+    if fileManager.fileExists(atPath: workPath) {
+      logInfo("Cleaning up stale image work directory: \(workPath)", category: "ImageManager")
+      try? fileManager.removeItem(atPath: workPath)
+    }
 
-    for item in contents where item.hasPrefix("oras-tmp-") {
-      let path = "\(storageDir)/\(item)"
-      logInfo("Cleaning up stale oras temp directory: \(path)", category: "ImageManager")
-      try? fileManager.removeItem(atPath: path)
+    _ = Self.cleanupStaleImageStorageArtifacts(imageStorageDir: imageStorageDir)
+  }
+
+  nonisolated static func cleanupStaleImageStorageArtifacts(
+    imageStorageDir: String
+  ) -> (deleted: Int, failed: Int, errors: [String]) {
+    let fileManager = FileManager.default
+    guard let contents = try? fileManager.contentsOfDirectory(atPath: imageStorageDir) else {
+      return (0, 0, [])
+    }
+
+    var deleted = 0
+    var failed = 0
+    var errors: [String] = []
+    let workPrefixes = ["oras-tmp-", "vm-image-", "oras-pull-"]
+    for item in contents {
+      let path = "\(imageStorageDir)/\(item)"
+      var isDirectory: ObjCBool = false
+      guard fileManager.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue else { continue }
+
+      let isWorkDir = workPrefixes.contains { item.hasPrefix($0) }
+      let isUnpackDir = item.hasPrefix(".") && item.contains(".bundle.unpack-")
+      let isEmptyImageBundle = item.hasSuffix(".bundle") && isDirectoryEmpty(atPath: path)
+      guard isWorkDir || isUnpackDir || isEmptyImageBundle else { continue }
+
+      logInfo("Cleaning up stale image storage directory: \(path)", category: "ImageManager")
+      do {
+        try fileManager.removeItem(atPath: path)
+        deleted += 1
+      } catch {
+        failed += 1
+        errors.append("Failed to remove stale image artifact \(path): \(error.localizedDescription)")
+      }
+    }
+    return (deleted, failed, errors)
+  }
+
+  private nonisolated static func isDirectoryEmpty(atPath path: String) -> Bool {
+    guard let contents = try? FileManager.default.contentsOfDirectory(atPath: path) else { return false }
+    return contents.isEmpty
+  }
+
+  nonisolated static func validateRunnableVMBundle(atPath bundlePath: String) throws {
+    let requiredFiles = ["Disk.img", "AuxiliaryStorage", "HardwareModel", "MachineIdentifier"]
+    let missingFiles = requiredFiles.filter { fileName in
+      let filePath = "\(bundlePath)/\(fileName)"
+      var isDirectory: ObjCBool = false
+      return FileManager.default.fileExists(atPath: filePath, isDirectory: &isDirectory) == false
+        || isDirectory.boolValue
+    }
+
+    guard missingFiles.isEmpty else {
+      throw VMImagePackagerError.invalidBundle(
+        "Pulled image at \(bundlePath) is missing required VM bundle files: \(missingFiles.joined(separator: ", "))"
+      )
     }
   }
 
@@ -77,9 +131,8 @@ actor ImageManager {
 
   /// Pulls an OCI artifact from a registry and stores it in the local image store.
   ///
-  /// Uses `oras pull` under the hood. Layers are decompressed and flattened so the VM bundle
-  /// files (`Disk.img`, `HardwareModel`, etc.) sit directly inside a `.bundle` directory
-  /// named after the image UUID, matching the VM storage format.
+  /// Uses ORAS blob fetches under the hood. Images are reconstructed from zstd-compressed chunks
+  /// into a `.bundle` directory named after the image UUID.
   /// If the image already exists locally (same reference), returns the existing record immediately
   /// without network access - this is intentional for CI/CD idempotency.
   func pullImage(reference: String, timeout: TimeInterval? = nil) async throws -> ImageRecord {
@@ -92,8 +145,18 @@ actor ImageManager {
 
     // CI/CD behavior: if already local, return immediately
     if let existing = await imageStore.getImageByReference(parsed.fullReference) {
-      logInfo("Image already local: \(parsed.fullReference)", category: "ImageManager")
-      return existing
+      do {
+        try Self.validateRunnableVMBundle(atPath: existing.localPath)
+        logInfo("Image already local: \(parsed.fullReference)", category: "ImageManager")
+        return existing
+      } catch {
+        logWarning(
+          "Discarding invalid cached image \(existing.id): \(error.localizedDescription)",
+          category: "ImageManager"
+        )
+        try? FileManager.default.removeItem(atPath: existing.localPath)
+        try? await imageStore.removeImage(id: existing.id)
+      }
     }
 
     logInfo("Pulling image: \(parsed.fullReference)", category: "ImageManager")
@@ -106,16 +169,24 @@ actor ImageManager {
       try FileManager.default.createDirectory(atPath: localDir, withIntermediateDirectories: true)
 
       let insecure = parsed.isInsecureAllowed(insecureRegistries: config.images.insecureRegistries)
-      let pullResult = try await orasClient.pull(
-        reference: parsed,
-        outputDir: localDir,
+      let manifest = try await orasClient.fetchManifest(reference: parsed, insecure: insecure)
+      do {
+        try manifest.validateJeballtoImage(reference: parsed.fullReference)
+      } catch {
+        logError(
+          "Unsupported Jeballto image format for \(parsed.fullReference): \(manifest.formatSummary)",
+          category: "ImageManager"
+        )
+        throw error
+      }
+      let pullResult = try await pullImageArtifact(
+        parsed,
+        manifest: manifest,
+        localDir: localDir,
         insecure: insecure,
         timeout: timeout
       )
-
-      // oras extracts directory layers into a subdirectory (e.g. localDir/VM.bundle/).
-      // Flatten so bundle files (Disk.img, HardwareModel, etc.) sit directly in localDir.
-      try flattenPulledBundle(inDir: localDir)
+      try Self.validateRunnableVMBundle(atPath: localDir)
 
       let size = directorySize(atPath: localDir)
 
@@ -138,16 +209,21 @@ actor ImageManager {
       // Clean up on failure
       try? FileManager.default.removeItem(atPath: localDir)
       eventBus.publish(.imagePullFailed(reference: parsed.fullReference, error: error.localizedDescription))
+      logError(
+        "Image pull failed for \(parsed.fullReference): \(error.localizedDescription)",
+        category: "ImageManager"
+      )
       throw ImageManagerError.pullFailed(error.localizedDescription)
     }
   }
 
   // MARK: - Push
 
-  /// Pushes a VM bundle directory to an OCI registry as a single OCI artifact.
+  /// Pushes a VM bundle directory to an OCI registry as a Jeballto OCI artifact.
   ///
-  /// Uses `oras push` with artifact type `application/vnd.jeballto.vm.bundle.v1`.
-  /// `oras` automatically compresses the directory contents as tar+gzip OCI layers.
+  /// Uses `oras push` with artifact type `application/vnd.jeballto.vm.bundle`.
+  /// The VM disk is split into deterministic zstd-compressed chunks so retries can reuse
+  /// already-present registry blobs.
   /// The VM must be stopped before calling this method to ensure a consistent disk image.
   func pushImageFromVM(
     reference: String,
@@ -173,9 +249,9 @@ actor ImageManager {
           "Cannot reach registry \(parsed.registry): \(error.localizedDescription)"
         )
       }
-      let pushResult = try await orasClient.push(
+      let pushResult = try await pushImageBundle(
         reference: parsed,
-        files: [vmBundlePath],
+        bundlePath: vmBundlePath,
         insecure: insecure,
         timeout: timeout
       )
@@ -189,7 +265,13 @@ actor ImageManager {
         localPath: vmBundlePath,
         size: directorySize(atPath: vmBundlePath),
         pushedAt: Date(),
-        metadata: ["sourceType": "vm"]
+        metadata: [
+          "sourceType": "vm",
+          "imageFormat": "chunked-zstd",
+          "artifactType": jeballtoImageArtifactType,
+          "compression": "zstd",
+          "chunkSize": String(VMImagePackager.defaultChunkSize),
+        ]
       )
 
       try await imageStore.addImage(record)
@@ -232,9 +314,9 @@ actor ImageManager {
           "Cannot reach registry \(parsed.registry): \(error.localizedDescription)"
         )
       }
-      let pushResult = try await orasClient.push(
+      let pushResult = try await pushImageBundle(
         reference: parsed,
-        files: [existing.localPath],
+        bundlePath: existing.localPath,
         insecure: insecure,
         timeout: timeout
       )
@@ -249,7 +331,13 @@ actor ImageManager {
         size: existing.size,
         pulledAt: existing.pulledAt,
         pushedAt: Date(),
-        metadata: ["sourceImageId": imageId.uuidString]
+        metadata: [
+          "sourceImageId": imageId.uuidString,
+          "imageFormat": "chunked-zstd",
+          "artifactType": jeballtoImageArtifactType,
+          "compression": "zstd",
+          "chunkSize": String(VMImagePackager.defaultChunkSize),
+        ]
       )
 
       try await imageStore.addImage(record)
@@ -306,6 +394,10 @@ actor ImageManager {
         errors.append("\(image.reference): \(error.localizedDescription)")
       }
     }
+    let staleArtifacts = Self.cleanupStaleImageStorageArtifacts(imageStorageDir: config.images.imageStorageDir)
+    deleted += staleArtifacts.deleted
+    failed += staleArtifacts.failed
+    errors.append(contentsOf: staleArtifacts.errors)
     logInfo("Wipe complete: \(deleted) deleted, \(failed) failed", category: "ImageManager")
     return (deleted, failed, errors)
   }
@@ -325,28 +417,109 @@ actor ImageManager {
 
   // MARK: - Helpers
 
-  /// After oras pull, directory layers are extracted as a subdirectory
-  /// (e.g. `localDir/SomeVM.bundle/`). This moves the contents up so
-  /// bundle files sit directly in localDir, which is what createVMFromImage expects.
-  private func flattenPulledBundle(inDir dir: String) throws {
-    let fileManager = FileManager.default
-    let contents = try fileManager.contentsOfDirectory(atPath: dir)
+  private func pushImageBundle(
+    reference: ImageReference,
+    bundlePath: String,
+    insecure: Bool,
+    timeout: TimeInterval?
+  ) async throws -> OrasPushResult {
+    let packager = VMImagePackager(
+      zstdClient: ZstdClient(config: config.images),
+      maxParallelChunks: config.images.maxParallelImageChunks
+    )
+    let package = try await packager.packBundle(
+      bundlePath: bundlePath,
+      stagingRoot: JeballtoCachePaths.imageWork.path,
+      timeout: timeout
+    )
+    defer { try? FileManager.default.removeItem(atPath: package.stagingDirectory) }
 
-    // Look for a single subdirectory (the extracted bundle)
-    for item in contents {
-      let itemPath = "\(dir)/\(item)"
-      var isDirectory: ObjCBool = false
-      if fileManager.fileExists(atPath: itemPath, isDirectory: &isDirectory), isDirectory.boolValue {
-        let bundleContents = try fileManager.contentsOfDirectory(atPath: itemPath)
-        for file in bundleContents {
-          try fileManager.moveItem(atPath: "\(itemPath)/\(file)", toPath: "\(dir)/\(file)")
-        }
-        try fileManager.removeItem(atPath: itemPath)
-        logInfo("Flattened pulled bundle directory: \(item)", category: "ImageManager")
-        return
-      }
+    return try await orasClient.pushImagePackage(
+      reference: reference,
+      package: package,
+      insecure: insecure,
+      timeout: timeout
+    )
+  }
+
+  private func pullImageArtifact(
+    _ reference: ImageReference,
+    manifest: OrasManifestInfo,
+    localDir: String,
+    insecure: Bool,
+    timeout: TimeInterval?
+  ) async throws -> OrasPullResult {
+    let pullDir = JeballtoCachePaths.imageWork
+      .appendingPathComponent("oras-pull-\(UUID().uuidString)", isDirectory: true)
+      .path
+    let configPath = "\(pullDir)/vm-bundle-config.json"
+    try FileManager.default.createDirectory(atPath: pullDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(atPath: pullDir) }
+    let resolvedDigest: String = if let digest = reference.digest {
+      digest
+    } else {
+      try await orasClient.resolve(reference: reference, insecure: insecure)
     }
-    // No subdirectory found - files are already flat (individual file push format)
+
+    guard let configDescriptor = manifest.configDescriptor else {
+      throw OrasError.invalidOutput("Jeballto image manifest is missing a config descriptor")
+    }
+
+    try await orasClient.fetchBlob(
+      reference: reference,
+      digest: configDescriptor.digest,
+      outputPath: configPath,
+      expectedSize: configDescriptor.size,
+      insecure: insecure,
+      timeout: timeout
+    )
+
+    var layerDescriptorsByDigest: [String: OrasDescriptor] = [:]
+    for descriptor in manifest.layers where layerDescriptorsByDigest[descriptor.digest] == nil {
+      layerDescriptorsByDigest[descriptor.digest] = descriptor
+    }
+    let descriptorsByDigest = layerDescriptorsByDigest
+    let orasClient = orasClient
+    let fetchLayer: VMImageLayerFetcher = { packedFile, chunk, destinationPath in
+      guard let compressedDigest = chunk.compressedDigest,
+            let compressedSize = chunk.compressedSize,
+            chunk.layerPath != nil else
+      {
+        throw VMImagePackagerError.invalidConfig("Missing layer metadata for \(packedFile.path) chunk \(chunk.index)")
+      }
+      guard let descriptor = descriptorsByDigest[compressedDigest] else {
+        throw OrasError.invalidOutput("Layer \(compressedDigest) is missing from the OCI manifest")
+      }
+      guard descriptor.mediaType == jeballtoImageChunkMediaType else {
+        throw OrasError.invalidOutput("Layer \(compressedDigest) has unsupported media type \(descriptor.mediaType)")
+      }
+      guard descriptor.size == compressedSize else {
+        throw OrasError.invalidOutput(
+          "Layer \(compressedDigest) size mismatch: manifest \(descriptor.size), config \(compressedSize)"
+        )
+      }
+      try await orasClient.fetchBlob(
+        reference: reference,
+        digest: compressedDigest,
+        outputPath: destinationPath,
+        expectedSize: compressedSize,
+        insecure: insecure,
+        timeout: timeout
+      )
+    }
+
+    let packager = VMImagePackager(
+      zstdClient: ZstdClient(config: config.images),
+      maxParallelChunks: config.images.maxParallelImageChunks
+    )
+    try await packager.unpackBundle(
+      configPath: configPath,
+      layerDirectory: pullDir,
+      outputBundlePath: localDir,
+      fetchLayer: fetchLayer,
+      timeout: timeout
+    )
+    return OrasPullResult(digest: resolvedDigest, rawOutput: manifest.rawManifest)
   }
 
   /// Computes total size of a directory's contents

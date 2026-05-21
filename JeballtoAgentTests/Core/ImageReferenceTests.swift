@@ -4,8 +4,8 @@ import Testing
 @Suite(.tags(.core))
 struct ImageReferenceTests {
   @Test(arguments: [
-    "registry.example.com/vms/macos:v1",
-    "registry.example.com:5000/vms/macos:v1",
+    "registry.example.com/vms/macos:latest",
+    "registry.example.com:5000/vms/macos:latest",
     "registry.example.com/vms/macos@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "registry.example.com/repo/path",
   ])
@@ -17,7 +17,7 @@ struct ImageReferenceTests {
   @Test(arguments: [
     "",
     "no-slash",
-    "registry.example.com/UpperCaseRepo:v1",
+    "registry.example.com/UpperCaseRepo:latest",
     "registry.example.com/repo:bad tag",
     "registry.example.com/repo@sha256:short",
   ])
@@ -29,7 +29,7 @@ struct ImageReferenceTests {
 
   @Test
   func insecureRegistryCheckUsesExactRegistryMatch() throws {
-    let parsed = try ImageReference.parse("registry.example.com:5000/repo/name:v1")
+    let parsed = try ImageReference.parse("registry.example.com:5000/repo/name:latest")
     #expect(parsed.isInsecureAllowed(insecureRegistries: ["registry.example.com:5000"]))
     #expect(parsed.isInsecureAllowed(insecureRegistries: ["registry.example.com"]) == false)
   }

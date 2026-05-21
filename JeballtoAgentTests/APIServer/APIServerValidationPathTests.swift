@@ -323,7 +323,7 @@ struct APIServerValidationPathTests {
   func cancellingJeballtofileWaitStepReturnsCancelledStatusAndEvent() async throws {
     try await withTemporaryDirectory { root in
       let server = makeTestAPIServer(root: root)
-      let createBody = Data(#"{"name":"cancelvm","steps":[{"type":"wait","seconds":1}]}"#.utf8)
+      let createBody = Data(#"{"name":"cancelvm","steps":[{"type":"wait","seconds":5}]}"#.utf8)
 
       let createResponse = await server.handleCreateJeballtofile(
         HTTPRequest(
@@ -338,6 +338,11 @@ struct APIServerValidationPathTests {
       let created = try JSONDecoder().decode(JeballtofileResponse.self, from: #require(createResponse.body))
       let executionId = try #require(UUID(uuidString: created.id))
 
+      let stepStarted = await waitUntil {
+        server.getJeballtofileExecutor(executionId)?.execution.stepResults.first?.status == .inProgress
+      }
+      #expect(stepStarted)
+
       let cancelResponse = await server.handleCancelJeballtofile(
         HTTPRequest(
           method: "POST",
@@ -350,7 +355,10 @@ struct APIServerValidationPathTests {
       #expect(cancelResponse.statusCode == 200)
 
       let cancelled = await waitUntil {
-        server.getJeballtofileExecutor(executionId)?.execution.status == .cancelled
+        guard let execution = server.getJeballtofileExecutor(executionId)?.execution else {
+          return false
+        }
+        return execution.status == .cancelled && execution.stepResults.first?.status == .cancelled
       }
       #expect(cancelled)
 
