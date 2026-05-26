@@ -99,8 +99,8 @@ OCI image operations using `oras` CLI:
 
 | Operation | What happens |
 |-----------|-------------|
-| `pullImage(reference)` | Checks the local image store first - fetches the image config and zstd chunks - reconstructs `Images/{uuid}.bundle` - registers in ImageStore |
-| `pushImageFromVM(reference, vmBundlePath)` | Chunks VM bundle files - compresses nonzero chunks with zstd - `oras push` with artifact type `application/vnd.jeballto.vm.bundle` |
+| `pullImage(reference)` | Checks the local image store first - fetches or reuses verified config and zstd chunks from session cache - reconstructs `Images/{uuid}.bundle` - registers in ImageStore |
+| `pushImageFromVM(reference, vmBundlePath)` | Chunks VM bundle files - reuses or compresses nonzero chunks with zstd - uploads config and chunk blobs - pushes the OCI manifest last |
 | `pushImage(reference, imageId)` | Re-pushes existing local image to new reference |
 | `deleteImage(id)` | Removes files (if owned, not a shared VM bundle) - removes from ImageStore |
 | `loginRegistry` / `logoutRegistry` | Delegates to `oras login/logout` |
@@ -114,7 +114,8 @@ Thin wrapper around the `oras` CLI binary. Key design choices:
 - Timeout protection: no limit for pull/push, 30s for login/logout/resolve
 - Output capped at 5 MB per stream
 - VM images are chunked by `VMImagePackager` and compressed by `zstd` before ORAS uploads each nonzero chunk as a separate layer
-- `maxParallelImageChunks = 0` uses `max(1, min(4, active CPU count / 2))`, capping automatic chunk fetch, compression, and decompression work at 4
+- Pull and push resume cache lives under `ImageWork/resume/` for the current agent session only. Startup removes all ImageWork data, successful transfers delete their operation cache, and failed or cancelled transfers keep verified work until the agent exits
+- `maxParallelImageChunks = 0` uses `max(1, min(4, active CPU count / 2))`, capping automatic chunk fetch, compression, decompression, and upload work at 4
 
 Resolves `oras` binary: checks `config.images.orasPath` first, then `Bundle.main.resourceURL/oras`.
 Resolves `zstd` binary: checks `config.images.zstdPath` first, then `Bundle.main.resourceURL/zstd`.

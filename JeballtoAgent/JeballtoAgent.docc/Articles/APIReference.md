@@ -680,7 +680,9 @@ curl -X PATCH http://127.0.0.1:8011/v1/config \
 | `networking` | `autoEnableSSHForwarding` | bool |
 | `networking` | `vncPortRangeStart`, `vncPortRangeEnd` | 1024-65535 |
 | `images` | `defaultRegistry`, `insecureRegistries` | - |
-| `images` | `maxParallelImageChunks` | Concurrent image chunk fetch, compression, and decompression. `0` auto, otherwise 1-32. Auto is `max(1, min(4, active CPU count / 2))` |
+| `images` | `maxParallelImageChunks` | Concurrent image chunk fetch, compression, decompression, and upload. `0` auto, otherwise 1-32. Auto is `max(1, min(4, active CPU count / 2))` |
+
+Image transfer resume data is kept only within the current agent session under `~/Library/Caches/Jeballto/ImageWork/`. Startup removes it, and successful pull or push removes the operation cache immediately.
 
 ## System Reset
 

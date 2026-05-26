@@ -33,7 +33,7 @@ struct OrasPushResult: Sendable {
 private let ociImageManifestMediaType = "application/vnd.oci.image.manifest.v1+json"
 
 /// Metadata from an OCI manifest
-struct OrasDescriptor: Decodable, Equatable, Sendable {
+struct OrasDescriptor: Codable, Equatable, Sendable {
   let mediaType: String
   let digest: String
   let size: UInt64
@@ -176,6 +176,83 @@ struct OrasClient: Sendable {
     return OrasPushResult(digest: digest, rawOutput: stdout)
   }
 
+  /// Checks if a blob digest exists in a repository.
+  func blobExists(repositoryReference: String, digest: String, insecure: Bool = false) async throws -> Bool {
+    try Task.checkCancellation()
+
+    var args = ["blob", "fetch", "--descriptor", "\(repositoryReference)@\(digest)"]
+    args.append(contentsOf: Self.transportSecurityArguments(plainHTTP: insecure))
+
+    do {
+      _ = try await execute(arguments: args, timeout: Self.shortTimeout)
+      return true
+    } catch is CancellationError {
+      throw CancellationError()
+    } catch {
+      return false
+    }
+  }
+
+  /// Uploads one OCI blob and returns its descriptor.
+  func pushBlob(
+    repositoryReference: String,
+    digest: String,
+    filePath: String,
+    mediaType: String,
+    expectedSize: UInt64,
+    insecure: Bool = false,
+    timeout: TimeInterval? = nil
+  ) async throws -> OrasDescriptor {
+    let actualSize = try fileSize(atPath: filePath)
+    guard actualSize == expectedSize else {
+      throw OrasError.invalidOutput("Blob \(digest) size mismatch: expected \(expectedSize), got \(actualSize)")
+    }
+    let actualDigest = try sha256File(atPath: filePath)
+    guard actualDigest == digest else {
+      throw OrasError.invalidOutput("Blob \(digest) digest mismatch: got \(actualDigest)")
+    }
+
+    var args = [
+      "blob", "push",
+      "--descriptor",
+      "--media-type", mediaType,
+      "--size", String(expectedSize),
+      "\(repositoryReference)@\(digest)",
+      filePath,
+    ]
+    args.append(contentsOf: Self.transportSecurityArguments(plainHTTP: insecure))
+
+    let result = try await execute(arguments: args, timeout: timeout ?? Self.defaultTimeout)
+    let stdout = String(data: result.stdout, encoding: .utf8) ?? ""
+    return parseDescriptorFromJSON(stdout) ?? OrasDescriptor(mediaType: mediaType, digest: digest, size: expectedSize)
+  }
+
+  /// Pushes an OCI image manifest and returns the pushed manifest digest.
+  func pushManifest(
+    reference: ImageReference,
+    manifestPath: String,
+    insecure: Bool = false,
+    timeout: TimeInterval? = nil
+  ) async throws -> OrasPushResult {
+    var args = [
+      "manifest", "push",
+      "--descriptor",
+      "--media-type", ociImageManifestMediaType,
+      reference.fullReference,
+      manifestPath,
+    ]
+    args.append(contentsOf: Self.transportSecurityArguments(plainHTTP: insecure))
+
+    let result = try await execute(arguments: args, timeout: timeout ?? Self.defaultTimeout)
+    let stdout = String(data: result.stdout, encoding: .utf8) ?? ""
+    let digest: String = if let descriptorDigest = parseDescriptorFromJSON(stdout)?.digest {
+      descriptorDigest
+    } else {
+      try sha256File(atPath: manifestPath)
+    }
+    return OrasPushResult(digest: digest, rawOutput: stdout)
+  }
+
   /// Fetches the raw OCI manifest so callers can verify the Jeballto image format.
   func fetchManifest(reference: ImageReference, insecure: Bool = false) async throws -> OrasManifestInfo {
     var args = ["manifest", "fetch", reference.fullReference]
@@ -236,6 +313,10 @@ struct OrasClient: Sendable {
 
   private func blobReference(_ reference: ImageReference, digest: String) -> String {
     "\(reference.registry)/\(reference.repository)@\(digest)"
+  }
+
+  static func repositoryReference(_ reference: ImageReference) -> String {
+    "\(reference.registry)/\(reference.repository)"
   }
 
   static func transportSecurityArguments(plainHTTP: Bool) -> [String] {
@@ -538,6 +619,11 @@ struct OrasClient: Sendable {
     }
 
     return nil
+  }
+
+  private func parseDescriptorFromJSON(_ output: String) -> OrasDescriptor? {
+    guard let data = output.data(using: .utf8), !data.isEmpty else { return nil }
+    return try? JSONDecoder().decode(OrasDescriptor.self, from: data)
   }
 
   private func fileSize(atPath path: String) throws -> UInt64 {

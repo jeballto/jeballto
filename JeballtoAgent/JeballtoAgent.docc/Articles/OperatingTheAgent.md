@@ -46,6 +46,8 @@ Downloaded macOS IPSWs are cached at:
 
 The cache is reused across installs so repeated `POST /v1/vms/{id}/install` calls with the same source don't re-download.
 
+OCI image pull and push operations use a separate resumable transfer cache at `~/Library/Caches/Jeballto/ImageWork/`. That cache is session-scoped: startup removes it, successful transfers delete their own operation cache, and failed or cancelled transfers keep verified work only until the agent exits.
+
 **Clearing caches:**
 
 - `POST /v1/system/reset` (either mode) clears the IPSW cache.

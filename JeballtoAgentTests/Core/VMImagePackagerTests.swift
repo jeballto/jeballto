@@ -127,6 +127,55 @@ struct VMImagePackagerTests {
   }
 
   @Test
+  func resumablePackReusesCachedCompressedChunksWhenSourceDigestMatches() async throws {
+    try await withTemporaryDirectory(prefix: "vm-image-packager-resume-reuse") { root in
+      let source = "\(root)/source.bundle"
+      let stagingDirectory = "\(root)/resume-package"
+      try makeFakeBundle(at: source)
+
+      let packager = try makePackager(chunkSize: 1024 * 1024)
+      let firstPackage = try await packager.packBundle(bundlePath: source, stagingDirectory: stagingDirectory)
+      let firstLayer = try #require(firstPackage.layers.first)
+      let firstModifiedAt = try modificationDate(atPath: firstLayer.absolutePath)
+      let firstConfig = try decodePackageConfig(firstPackage)
+
+      try await Task.sleep(nanoseconds: 1_100_000_000)
+      let secondPackage = try await packager.packBundle(bundlePath: source, stagingDirectory: stagingDirectory)
+      let secondLayer = try #require(secondPackage.layers.first)
+      let secondModifiedAt = try modificationDate(atPath: secondLayer.absolutePath)
+      let secondConfig = try decodePackageConfig(secondPackage)
+
+      #expect(firstLayer.absolutePath == secondLayer.absolutePath)
+      #expect(firstModifiedAt == secondModifiedAt)
+      #expect(firstConfig == secondConfig)
+    }
+  }
+
+  @Test
+  func resumablePackRecompressesChangedSourceChunk() async throws {
+    try await withTemporaryDirectory(prefix: "vm-image-packager-resume-changed") { root in
+      let source = "\(root)/source.bundle"
+      let stagingDirectory = "\(root)/resume-package"
+      try makeFakeBundle(at: source)
+
+      let packager = try makePackager(chunkSize: 1024 * 1024)
+      let firstPackage = try await packager.packBundle(bundlePath: source, stagingDirectory: stagingDirectory)
+      let firstConfig = try decodePackageConfig(firstPackage)
+      let firstAux = try #require(firstConfig.files.first { $0.path == "AuxiliaryStorage" })
+      let firstChunk = try #require(firstAux.chunks.first)
+
+      try Data("changed auxiliary storage".utf8).write(to: URL(fileURLWithPath: "\(source)/AuxiliaryStorage"))
+      let secondPackage = try await packager.packBundle(bundlePath: source, stagingDirectory: stagingDirectory)
+      let secondConfig = try decodePackageConfig(secondPackage)
+      let secondAux = try #require(secondConfig.files.first { $0.path == "AuxiliaryStorage" })
+      let secondChunk = try #require(secondAux.chunks.first)
+
+      #expect(firstChunk.uncompressedDigest != secondChunk.uncompressedDigest)
+      #expect(firstChunk.compressedDigest != secondChunk.compressedDigest)
+    }
+  }
+
+  @Test
   func corruptChunkFailsDigestValidation() async throws {
     try await withTemporaryDirectory(prefix: "vm-image-packager-corrupt") { root in
       let source = "\(root)/source.bundle"
@@ -473,6 +522,11 @@ struct VMImagePackagerTests {
   private func decodePackageConfig(_ package: VMImagePackage) throws -> VMImageBundleConfig {
     let data = try Data(contentsOf: URL(fileURLWithPath: package.configPath))
     return try JSONDecoder().decode(VMImageBundleConfig.self, from: data)
+  }
+
+  private func modificationDate(atPath path: String) throws -> Date {
+    let attrs = try FileManager.default.attributesOfItem(atPath: path)
+    return try #require(attrs[.modificationDate] as? Date)
   }
 
   private func regularFiles(in path: String) throws -> [String] {

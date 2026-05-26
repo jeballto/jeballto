@@ -241,6 +241,7 @@ struct ZstdClient: Sendable {
     pipe: Pipe
   ) throws -> ZstdRangeDigest {
     let outputHandle = pipe.fileHandleForWriting
+    _ = fcntl(outputHandle.fileDescriptor, F_SETNOSIGPIPE, 1)
     guard size > 0 else {
       return ZstdRangeDigest(size: 0, digest: emptyDigest, isZero: true)
     }

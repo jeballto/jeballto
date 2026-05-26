@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Testing
 @testable import JeballtoAgent
@@ -88,5 +89,61 @@ struct ImageManagerCleanupTests {
       #expect(result.errors.isEmpty)
       #expect(FileManager.default.fileExists(atPath: staleUnpack) == false)
     }
+  }
+
+  @Test
+  func startupCleanupRemovesSessionScopedImageWorkCache() throws {
+    let resumeCache = JeballtoCachePaths.imageWork
+      .appendingPathComponent("resume/pulls/sha256-test", isDirectory: true)
+      .path
+    try FileManager.default.createDirectory(atPath: resumeCache, withIntermediateDirectories: true)
+    try Data("partial blob".utf8).write(to: URL(fileURLWithPath: "\(resumeCache)/layer"))
+
+    ImageManager.cleanupImageWorkDirectory()
+
+    #expect(FileManager.default.fileExists(atPath: resumeCache) == false)
+    #expect(FileManager.default.fileExists(atPath: JeballtoCachePaths.imageWork.path) == false)
+  }
+
+  @Test
+  func cachedBlobValidationRequiresMatchingSizeAndDigest() throws {
+    try withTemporaryDirectory(prefix: "image-manager-blob-cache") { root in
+      let payload = Data("cached blob".utf8)
+      let path = "\(root)/blob"
+      let digest = "sha256:" + SHA256.hash(data: payload).map { String(format: "%02x", $0) }.joined()
+      try payload.write(to: URL(fileURLWithPath: path))
+
+      #expect(ImageManager.cachedBlobIsValid(path: path, expectedDigest: digest, expectedSize: UInt64(payload.count)))
+      #expect(ImageManager.cachedBlobIsValid(path: path, expectedDigest: digest, expectedSize: 1) == false)
+      #expect(
+        ImageManager.cachedBlobIsValid(
+          path: path,
+          expectedDigest: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+          expectedSize: UInt64(payload.count)
+        ) == false
+      )
+    }
+  }
+
+  @Test
+  func generatedManifestContainsExpectedDescriptors() throws {
+    let config = OrasDescriptor(
+      mediaType: jeballtoImageConfigMediaType,
+      digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      size: 12
+    )
+    let layer = OrasDescriptor(
+      mediaType: jeballtoImageChunkMediaType,
+      digest: "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      size: 34
+    )
+
+    let data = try ImageManager.ociImageManifestData(configDescriptor: config, layerDescriptors: [layer])
+    let rawManifest = try #require(String(data: data, encoding: .utf8))
+    let manifest = try OrasManifestInfo(rawManifest: rawManifest)
+
+    #expect(manifest.artifactType == jeballtoImageArtifactType)
+    #expect(manifest.configDescriptor == config)
+    #expect(manifest.layers == [layer])
   }
 }

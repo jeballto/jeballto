@@ -178,8 +178,10 @@ First run creates `~/Library/Application Support/Jeballto/config.json` (permissi
 }
 ```
 
-`maxParallelImageChunks` controls concurrent image chunk fetch, compression, and decompression. `0` means automatic:
+`maxParallelImageChunks` controls concurrent image chunk fetch, compression, decompression, and upload. `0` means automatic:
 `max(1, min(4, active CPU count / 2))`.
+
+OCI pull and push resume cache is session-scoped under `~/Library/Caches/Jeballto/ImageWork/`. Agent startup removes the whole ImageWork directory, and each successful transfer deletes its own resume cache. Failed or cancelled transfers keep verified blobs and packaged chunks only until the agent exits.
 
 ## Code Style
 

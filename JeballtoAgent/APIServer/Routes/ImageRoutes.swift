@@ -84,6 +84,8 @@ extension APIServer {
         message: nil
       )
       return HTTPResponse.json(response)
+    } catch is CancellationError {
+      return HTTPResponse.error("IMAGE_PULL_CANCELLED", message: "Image pull cancelled", statusCode: 499)
     } catch let error as ImageManagerError {
       return APIRouteErrorMapper.imageManager(error, defaultCode: "IMAGE_PULL_FAILED")
     } catch { return HTTPResponse.error("IMAGE_PULL_FAILED", message: error.localizedDescription, statusCode: 500) }
@@ -149,6 +151,8 @@ extension APIServer {
         message: nil
       )
       return HTTPResponse.json(response)
+    } catch is CancellationError {
+      return HTTPResponse.error("IMAGE_PUSH_CANCELLED", message: "Image push cancelled", statusCode: 499)
     } catch let error as VMManagerError {
       return APIRouteErrorMapper.vmManager(
         error,

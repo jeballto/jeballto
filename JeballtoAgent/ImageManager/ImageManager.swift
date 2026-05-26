@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 /// Errors from image management operations
@@ -25,7 +26,26 @@ enum ImageManagerError: Error, LocalizedError {
 
 /// Central orchestrator for OCI image operations.
 /// Pushes VM bundle directories as chunked Jeballto OCI artifacts while preserving the public REST API.
+// swiftlint:disable:next type_body_length
 actor ImageManager {
+  private struct PushBlobCandidate: Sendable {
+    let descriptor: OrasDescriptor
+    let filePath: String
+  }
+
+  private struct PushUploadState: Codable, Sendable {
+    let repositoryReference: String
+    var uploadedDigests: Set<String>
+  }
+
+  private struct OCIImageManifest: Encodable {
+    let schemaVersion: Int
+    let mediaType: String
+    let artifactType: String
+    let config: OrasDescriptor
+    let layers: [OrasDescriptor]
+  }
+
   private let imageStore: ImageStore
   private let orasClient: OrasClient
   private let eventBus: EventBus
@@ -42,14 +62,17 @@ actor ImageManager {
   // MARK: - Startup Cleanup
 
   private nonisolated func cleanupStaleImageWorkDirs(imageStorageDir: String) {
+    Self.cleanupImageWorkDirectory()
+    _ = Self.cleanupStaleImageStorageArtifacts(imageStorageDir: imageStorageDir)
+  }
+
+  nonisolated static func cleanupImageWorkDirectory() {
     let fileManager = FileManager.default
     let workPath = JeballtoCachePaths.imageWork.path
     if fileManager.fileExists(atPath: workPath) {
       logInfo("Cleaning up stale image work directory: \(workPath)", category: "ImageManager")
       try? fileManager.removeItem(atPath: workPath)
     }
-
-    _ = Self.cleanupStaleImageStorageArtifacts(imageStorageDir: imageStorageDir)
   }
 
   nonisolated static func cleanupStaleImageStorageArtifacts(
@@ -205,6 +228,10 @@ actor ImageManager {
       logInfo("Image pulled: \(parsed.fullReference) -> \(localDir)", category: "ImageManager")
 
       return record
+    } catch is CancellationError {
+      try? FileManager.default.removeItem(atPath: localDir)
+      logInfo("Image pull cancelled: \(parsed.fullReference)", category: "ImageManager")
+      throw CancellationError()
     } catch {
       // Clean up on failure
       try? FileManager.default.removeItem(atPath: localDir)
@@ -280,6 +307,9 @@ actor ImageManager {
       logInfo("Image pushed: \(parsed.fullReference) (digest: \(pushResult.digest))", category: "ImageManager")
 
       return record
+    } catch is CancellationError {
+      logInfo("Image push cancelled: \(parsed.fullReference)", category: "ImageManager")
+      throw CancellationError()
     } catch let error as ImageManagerError {
       eventBus.publish(.imagePushFailed(reference: parsed.fullReference, error: error.localizedDescription))
       throw error
@@ -346,6 +376,9 @@ actor ImageManager {
       logInfo("Image re-pushed: \(parsed.fullReference) (digest: \(pushResult.digest))", category: "ImageManager")
 
       return record
+    } catch is CancellationError {
+      logInfo("Image push cancelled: \(parsed.fullReference)", category: "ImageManager")
+      throw CancellationError()
     } catch let error as ImageManagerError {
       eventBus.publish(.imagePushFailed(reference: parsed.fullReference, error: error.localizedDescription))
       throw error
@@ -398,6 +431,7 @@ actor ImageManager {
     deleted += staleArtifacts.deleted
     failed += staleArtifacts.failed
     errors.append(contentsOf: staleArtifacts.errors)
+    Self.cleanupImageWorkDirectory()
     logInfo("Wipe complete: \(deleted) deleted, \(failed) failed", category: "ImageManager")
     return (deleted, failed, errors)
   }
@@ -427,19 +461,26 @@ actor ImageManager {
       zstdClient: ZstdClient(config: config.images),
       maxParallelChunks: config.images.maxParallelImageChunks
     )
+    let sourceFingerprint = try packager.sourceFingerprint(bundlePath: bundlePath)
+    let pushDir = Self.resumePushDirectory(sourceFingerprint: sourceFingerprint)
+    let packageDir = "\(pushDir)/package"
+    try FileManager.default.createDirectory(atPath: packageDir, withIntermediateDirectories: true)
+
     let package = try await packager.packBundle(
       bundlePath: bundlePath,
-      stagingRoot: JeballtoCachePaths.imageWork.path,
+      stagingDirectory: packageDir,
       timeout: timeout
     )
-    defer { try? FileManager.default.removeItem(atPath: package.stagingDirectory) }
 
-    return try await orasClient.pushImagePackage(
+    let pushResult = try await pushImagePackage(
       reference: reference,
       package: package,
       insecure: insecure,
+      operationDirectory: pushDir,
       timeout: timeout
     )
+    try? FileManager.default.removeItem(atPath: pushDir)
+    return pushResult
   }
 
   private func pullImageArtifact(
@@ -449,36 +490,44 @@ actor ImageManager {
     insecure: Bool,
     timeout: TimeInterval?
   ) async throws -> OrasPullResult {
-    let pullDir = JeballtoCachePaths.imageWork
-      .appendingPathComponent("oras-pull-\(UUID().uuidString)", isDirectory: true)
-      .path
-    let configPath = "\(pullDir)/vm-bundle-config.json"
-    try FileManager.default.createDirectory(atPath: pullDir, withIntermediateDirectories: true)
-    defer { try? FileManager.default.removeItem(atPath: pullDir) }
     let resolvedDigest: String = if let digest = reference.digest {
       digest
     } else {
       try await orasClient.resolve(reference: reference, insecure: insecure)
     }
+    let pullDir = Self.resumePullDirectory(manifestDigest: resolvedDigest)
+    let blobCacheDir = "\(pullDir)/blobs"
+    let configPath = "\(pullDir)/config/vm-bundle-config.json"
+    let layerDirectory = "\(pullDir)/layers"
+    try FileManager.default.createDirectory(atPath: blobCacheDir, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(
+      atPath: (configPath as NSString).deletingLastPathComponent,
+      withIntermediateDirectories: true
+    )
+    try? FileManager.default.removeItem(atPath: layerDirectory)
+    try FileManager.default.createDirectory(atPath: layerDirectory, withIntermediateDirectories: true)
 
     guard let configDescriptor = manifest.configDescriptor else {
       throw OrasError.invalidOutput("Jeballto image manifest is missing a config descriptor")
     }
 
-    try await orasClient.fetchBlob(
+    let configCachePath = Self.blobCachePath(blobCacheDir: blobCacheDir, digest: configDescriptor.digest)
+    try await Self.fetchBlobIntoCache(
       reference: reference,
-      digest: configDescriptor.digest,
-      outputPath: configPath,
-      expectedSize: configDescriptor.size,
+      descriptor: configDescriptor,
+      cachePath: configCachePath,
       insecure: insecure,
+      orasClient: orasClient,
       timeout: timeout
     )
+    try Self.copyCachedBlob(from: configCachePath, to: configPath)
 
     var layerDescriptorsByDigest: [String: OrasDescriptor] = [:]
     for descriptor in manifest.layers where layerDescriptorsByDigest[descriptor.digest] == nil {
       layerDescriptorsByDigest[descriptor.digest] = descriptor
     }
     let descriptorsByDigest = layerDescriptorsByDigest
+    let blobCacheDirectory = blobCacheDir
     let orasClient = orasClient
     let fetchLayer: VMImageLayerFetcher = { packedFile, chunk, destinationPath in
       guard let compressedDigest = chunk.compressedDigest,
@@ -498,14 +547,16 @@ actor ImageManager {
           "Layer \(compressedDigest) size mismatch: manifest \(descriptor.size), config \(compressedSize)"
         )
       }
-      try await orasClient.fetchBlob(
+      let cachedBlobPath = Self.blobCachePath(blobCacheDir: blobCacheDirectory, digest: compressedDigest)
+      try await Self.fetchBlobIntoCache(
         reference: reference,
-        digest: compressedDigest,
-        outputPath: destinationPath,
-        expectedSize: compressedSize,
+        descriptor: descriptor,
+        cachePath: cachedBlobPath,
         insecure: insecure,
+        orasClient: orasClient,
         timeout: timeout
       )
+      try Self.copyCachedBlob(from: cachedBlobPath, to: destinationPath)
     }
 
     let packager = VMImagePackager(
@@ -514,12 +565,329 @@ actor ImageManager {
     )
     try await packager.unpackBundle(
       configPath: configPath,
-      layerDirectory: pullDir,
+      layerDirectory: layerDirectory,
       outputBundlePath: localDir,
       fetchLayer: fetchLayer,
       timeout: timeout
     )
+    try? FileManager.default.removeItem(atPath: pullDir)
     return OrasPullResult(digest: resolvedDigest, rawOutput: manifest.rawManifest)
+  }
+
+  private nonisolated static func uniqueBlobCandidates(_ candidates: [PushBlobCandidate]) -> [PushBlobCandidate] {
+    var seenDigests: Set<String> = []
+    var uniqueCandidates: [PushBlobCandidate] = []
+    for candidate in candidates where seenDigests.insert(candidate.descriptor.digest).inserted {
+      uniqueCandidates.append(candidate)
+    }
+    return uniqueCandidates
+  }
+
+  private func pushImagePackage(
+    reference: ImageReference,
+    package: VMImagePackage,
+    insecure: Bool,
+    operationDirectory: String,
+    timeout: TimeInterval?
+  ) async throws -> OrasPushResult {
+    let repositoryReference = OrasClient.repositoryReference(reference)
+    let configDescriptor = try Self.descriptor(
+      filePath: package.configPath,
+      mediaType: jeballtoImageConfigMediaType
+    )
+    let layerCandidates = try package.layers.map { layer in
+      try PushBlobCandidate(
+        descriptor: Self.descriptor(filePath: layer.absolutePath, mediaType: layer.mediaType),
+        filePath: layer.absolutePath
+      )
+    }
+    let configCandidate = PushBlobCandidate(descriptor: configDescriptor, filePath: package.configPath)
+    let candidates = Self.uniqueBlobCandidates([configCandidate] + layerCandidates)
+    let statePath = Self.pushUploadStatePath(
+      operationDirectory: operationDirectory,
+      repositoryReference: repositoryReference
+    )
+    var state = Self.loadPushUploadState(path: statePath, repositoryReference: repositoryReference)
+
+    try await uploadBlobs(
+      candidates,
+      repositoryReference: repositoryReference,
+      insecure: insecure,
+      statePath: statePath,
+      state: &state,
+      timeout: timeout
+    )
+
+    let manifestPath = "\(operationDirectory)/manifest.json"
+    try Self.writeManifest(
+      configDescriptor: configDescriptor,
+      layerDescriptors: layerCandidates.map(\.descriptor),
+      manifestPath: manifestPath
+    )
+    return try await orasClient.pushManifest(
+      reference: reference,
+      manifestPath: manifestPath,
+      insecure: insecure,
+      timeout: timeout
+    )
+  }
+
+  private func uploadBlobs(
+    _ candidates: [PushBlobCandidate],
+    repositoryReference: String,
+    insecure: Bool,
+    statePath: String,
+    state: inout PushUploadState,
+    timeout: TimeInterval?
+  ) async throws {
+    guard candidates.isEmpty == false else { return }
+
+    let limit = min(effectiveImageTransferLimit(), candidates.count)
+    let orasClient = orasClient
+    let initialUploadedDigests = state.uploadedDigests
+
+    try await withThrowingTaskGroup(of: String.self) { group in
+      var nextIndex = 0
+
+      for _ in 0 ..< limit {
+        let candidate = candidates[nextIndex]
+        group.addTask {
+          try await Self.confirmOrUploadBlob(
+            candidate,
+            repositoryReference: repositoryReference,
+            insecure: insecure,
+            alreadyUploaded: initialUploadedDigests.contains(candidate.descriptor.digest),
+            orasClient: orasClient,
+            timeout: timeout
+          )
+        }
+        nextIndex += 1
+      }
+
+      do {
+        while let uploadedDigest = try await group.next() {
+          state.uploadedDigests.insert(uploadedDigest)
+          try Self.savePushUploadState(state, path: statePath)
+          if nextIndex < candidates.count {
+            let candidate = candidates[nextIndex]
+            group.addTask {
+              try await Self.confirmOrUploadBlob(
+                candidate,
+                repositoryReference: repositoryReference,
+                insecure: insecure,
+                alreadyUploaded: initialUploadedDigests.contains(candidate.descriptor.digest),
+                orasClient: orasClient,
+                timeout: timeout
+              )
+            }
+            nextIndex += 1
+          }
+        }
+      } catch {
+        group.cancelAll()
+        throw error
+      }
+    }
+  }
+
+  private nonisolated static func confirmOrUploadBlob(
+    _ candidate: PushBlobCandidate,
+    repositoryReference: String,
+    insecure: Bool,
+    alreadyUploaded: Bool,
+    orasClient: OrasClient,
+    timeout: TimeInterval?
+  ) async throws -> String {
+    if alreadyUploaded,
+       try await orasClient.blobExists(
+         repositoryReference: repositoryReference,
+         digest: candidate.descriptor.digest,
+         insecure: insecure
+       )
+    {
+      return candidate.descriptor.digest
+    }
+
+    if try await orasClient.blobExists(
+      repositoryReference: repositoryReference,
+      digest: candidate.descriptor.digest,
+      insecure: insecure
+    ) {
+      return candidate.descriptor.digest
+    }
+
+    _ = try await orasClient.pushBlob(
+      repositoryReference: repositoryReference,
+      digest: candidate.descriptor.digest,
+      filePath: candidate.filePath,
+      mediaType: candidate.descriptor.mediaType,
+      expectedSize: candidate.descriptor.size,
+      insecure: insecure,
+      timeout: timeout
+    )
+    return candidate.descriptor.digest
+  }
+
+  private nonisolated static func fetchBlobIntoCache(
+    reference: ImageReference,
+    descriptor: OrasDescriptor,
+    cachePath: String,
+    insecure: Bool,
+    orasClient: OrasClient,
+    timeout: TimeInterval?
+  ) async throws {
+    if cachedBlobIsValid(
+      path: cachePath,
+      expectedDigest: descriptor.digest,
+      expectedSize: descriptor.size
+    ) {
+      return
+    }
+    try? FileManager.default.removeItem(atPath: cachePath)
+    try await orasClient.fetchBlob(
+      reference: reference,
+      digest: descriptor.digest,
+      outputPath: cachePath,
+      expectedSize: descriptor.size,
+      insecure: insecure,
+      timeout: timeout
+    )
+  }
+
+  nonisolated static func cachedBlobIsValid(
+    path: String,
+    expectedDigest: String,
+    expectedSize: UInt64
+  ) -> Bool {
+    guard FileManager.default.fileExists(atPath: path),
+          (try? fileSize(atPath: path)) == expectedSize,
+          (try? sha256File(atPath: path)) == expectedDigest else
+    {
+      return false
+    }
+    return true
+  }
+
+  private func effectiveImageTransferLimit() -> Int {
+    if config.images.maxParallelImageChunks > 0 {
+      return config.images.maxParallelImageChunks
+    }
+    return VMImagePackager.automaticParallelChunkLimit()
+  }
+
+  private nonisolated static func resumePullDirectory(manifestDigest: String) -> String {
+    JeballtoCachePaths.imageWork
+      .appendingPathComponent("resume/pulls/\(sanitizeCacheKey(manifestDigest))", isDirectory: true)
+      .path
+  }
+
+  private nonisolated static func resumePushDirectory(sourceFingerprint: String) -> String {
+    JeballtoCachePaths.imageWork
+      .appendingPathComponent("resume/pushes/\(sanitizeCacheKey(sourceFingerprint))", isDirectory: true)
+      .path
+  }
+
+  private nonisolated static func blobCachePath(blobCacheDir: String, digest: String) -> String {
+    "\(blobCacheDir)/\(sanitizeCacheKey(digest))"
+  }
+
+  private nonisolated static func pushUploadStatePath(
+    operationDirectory: String,
+    repositoryReference: String
+  ) -> String {
+    "\(operationDirectory)/uploads-\(sanitizeCacheKey(repositoryReference)).json"
+  }
+
+  private nonisolated static func sanitizeCacheKey(_ value: String) -> String {
+    value.map { character in
+      character.isLetter || character.isNumber ? character : "-"
+    }.reduce(into: "") { result, character in
+      result.append(character)
+    }
+  }
+
+  private nonisolated static func loadPushUploadState(
+    path: String,
+    repositoryReference: String
+  ) -> PushUploadState {
+    guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+          let state = try? JSONDecoder().decode(PushUploadState.self, from: data),
+          state.repositoryReference == repositoryReference else
+    {
+      return PushUploadState(repositoryReference: repositoryReference, uploadedDigests: [])
+    }
+    return state
+  }
+
+  private nonisolated static func savePushUploadState(_ state: PushUploadState, path: String) throws {
+    let parent = (path as NSString).deletingLastPathComponent
+    try FileManager.default.createDirectory(atPath: parent, withIntermediateDirectories: true)
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+    try encoder.encode(state).write(to: URL(fileURLWithPath: path), options: .atomic)
+  }
+
+  private nonisolated static func writeManifest(
+    configDescriptor: OrasDescriptor,
+    layerDescriptors: [OrasDescriptor],
+    manifestPath: String
+  ) throws {
+    let parent = (manifestPath as NSString).deletingLastPathComponent
+    try FileManager.default.createDirectory(atPath: parent, withIntermediateDirectories: true)
+    try ociImageManifestData(
+      configDescriptor: configDescriptor,
+      layerDescriptors: layerDescriptors
+    ).write(to: URL(fileURLWithPath: manifestPath), options: .atomic)
+  }
+
+  nonisolated static func ociImageManifestData(
+    configDescriptor: OrasDescriptor,
+    layerDescriptors: [OrasDescriptor]
+  ) throws -> Data {
+    let manifest = OCIImageManifest(
+      schemaVersion: 2,
+      mediaType: "application/vnd.oci.image.manifest.v1+json",
+      artifactType: jeballtoImageArtifactType,
+      config: configDescriptor,
+      layers: layerDescriptors
+    )
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+    return try encoder.encode(manifest)
+  }
+
+  private nonisolated static func descriptor(filePath: String, mediaType: String) throws -> OrasDescriptor {
+    try OrasDescriptor(
+      mediaType: mediaType,
+      digest: sha256File(atPath: filePath),
+      size: fileSize(atPath: filePath)
+    )
+  }
+
+  private nonisolated static func copyCachedBlob(from sourcePath: String, to destinationPath: String) throws {
+    let parent = (destinationPath as NSString).deletingLastPathComponent
+    try FileManager.default.createDirectory(atPath: parent, withIntermediateDirectories: true)
+    if FileManager.default.fileExists(atPath: destinationPath) {
+      try FileManager.default.removeItem(atPath: destinationPath)
+    }
+    try FileManager.default.copyItem(atPath: sourcePath, toPath: destinationPath)
+  }
+
+  private nonisolated static func fileSize(atPath path: String) throws -> UInt64 {
+    let attrs = try FileManager.default.attributesOfItem(atPath: path)
+    return attrs[.size] as? UInt64 ?? UInt64(attrs[.size] as? Int64 ?? 0)
+  }
+
+  private nonisolated static func sha256File(atPath path: String) throws -> String {
+    let handle = try FileHandle(forReadingFrom: URL(fileURLWithPath: path))
+    defer { try? handle.close() }
+    var hasher = SHA256()
+    while true {
+      let data = try handle.read(upToCount: 4 * 1024 * 1024) ?? Data()
+      guard !data.isEmpty else { break }
+      hasher.update(data: data)
+    }
+    return "sha256:" + hasher.finalize().map { String(format: "%02x", $0) }.joined()
   }
 
   /// Computes total size of a directory's contents

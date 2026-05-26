@@ -177,4 +177,157 @@ struct OrasClientReachabilityTests {
       #expect(output == payload)
     }
   }
+
+  @Test
+  func blobExistsReturnsTrueOnlyWhenDescriptorFetchSucceeds() async throws {
+    try await withTemporaryDirectory(prefix: "oras-blob-exists") { root in
+      let orasPath = (root as NSString).appendingPathComponent("oras")
+      let script = """
+      #!/bin/sh
+      if [ "$1" != "blob" ] || [ "$2" != "fetch" ] || [ "$3" != "--descriptor" ]; then
+        echo "unexpected args: $*" >&2
+        exit 2
+      fi
+      case "$4" in
+        *@sha256:1111111111111111111111111111111111111111111111111111111111111111) exit 0 ;;
+        *) exit 1 ;;
+      esac
+      """
+      try script.write(toFile: orasPath, atomically: true, encoding: .utf8)
+      try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: orasPath)
+
+      let client = OrasClient(config: ImageConfig(
+        imageStorageDir: root,
+        orasPath: orasPath,
+        defaultRegistry: nil,
+        insecureRegistries: []
+      ))
+
+      let existing = try await client.blobExists(
+        repositoryReference: "registry.example.com/repo",
+        digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+      )
+      let missing = try await client.blobExists(
+        repositoryReference: "registry.example.com/repo",
+        digest: "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+      )
+
+      #expect(existing)
+      #expect(missing == false)
+    }
+  }
+
+  @Test
+  func blobExistsPropagatesCancellation() async throws {
+    let client = OrasClient(config: ImageConfig(
+      imageStorageDir: NSTemporaryDirectory(),
+      orasPath: "/usr/bin/false",
+      defaultRegistry: nil,
+      insecureRegistries: []
+    ))
+    let gate = CancellationGate()
+    let task = Task {
+      await gate.wait()
+      _ = try await client.blobExists(
+        repositoryReference: "registry.example.com/repo",
+        digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+      )
+    }
+    task.cancel()
+    await gate.open()
+
+    await #expect(throws: CancellationError.self) {
+      try await task.value
+    }
+  }
+
+  @Test
+  func pushBlobReturnsDescriptorFromOrasOutput() async throws {
+    try await withTemporaryDirectory(prefix: "oras-blob-push") { root in
+      let payload = Data("blob to push".utf8)
+      let digest = "sha256:" + SHA256.hash(data: payload).map { String(format: "%02x", $0) }.joined()
+      let blobPath = "\(root)/blob"
+      let orasPath = "\(root)/oras"
+      try payload.write(to: URL(fileURLWithPath: blobPath))
+      let script = """
+      #!/bin/sh
+      if [ "$1" != "blob" ] || [ "$2" != "push" ]; then
+        echo "unexpected args: $*" >&2
+        exit 2
+      fi
+      printf '{"mediaType":"application/test","digest":"\(digest)","size":\(payload.count)}'
+      """
+      try script.write(toFile: orasPath, atomically: true, encoding: .utf8)
+      try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: orasPath)
+      let client = OrasClient(config: ImageConfig(
+        imageStorageDir: root,
+        orasPath: orasPath,
+        defaultRegistry: nil,
+        insecureRegistries: []
+      ))
+
+      let descriptor = try await client.pushBlob(
+        repositoryReference: "registry.example.com/repo",
+        digest: digest,
+        filePath: blobPath,
+        mediaType: "application/test",
+        expectedSize: UInt64(payload.count)
+      )
+
+      #expect(descriptor == OrasDescriptor(mediaType: "application/test", digest: digest, size: UInt64(payload.count)))
+    }
+  }
+
+  @Test
+  func pushManifestReturnsPushedDigest() async throws {
+    try await withTemporaryDirectory(prefix: "oras-manifest-push") { root in
+      let manifestPath = "\(root)/manifest.json"
+      let orasPath = "\(root)/oras"
+      let manifestDigest = "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+      try Data("{}".utf8).write(to: URL(fileURLWithPath: manifestPath))
+      let script = """
+      #!/bin/sh
+      if [ "$1" != "manifest" ] || [ "$2" != "push" ]; then
+        echo "unexpected args: $*" >&2
+        exit 2
+      fi
+      printf '{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"\(manifestDigest)","size":2}'
+      """
+      try script.write(toFile: orasPath, atomically: true, encoding: .utf8)
+      try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: orasPath)
+      let client = OrasClient(config: ImageConfig(
+        imageStorageDir: root,
+        orasPath: orasPath,
+        defaultRegistry: nil,
+        insecureRegistries: []
+      ))
+
+      let result = try await client.pushManifest(
+        reference: ImageReference.parse("registry.example.com/repo:tag"),
+        manifestPath: manifestPath
+      )
+
+      #expect(result.digest == manifestDigest)
+    }
+  }
+}
+
+private actor CancellationGate {
+  private var isOpen = false
+  private var continuation: CheckedContinuation<Void, Never>?
+
+  func wait() async {
+    if isOpen {
+      return
+    }
+    await withCheckedContinuation { continuation in
+      self.continuation = continuation
+    }
+  }
+
+  func open() {
+    isOpen = true
+    continuation?.resume()
+    continuation = nil
+  }
 }

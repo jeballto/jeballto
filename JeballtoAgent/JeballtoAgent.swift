@@ -29,6 +29,7 @@ import Sparkle
 
   func run() {
     logInfo("=== Jeballto VM Agent Starting ===", category: "Main")
+    signal(SIGPIPE, SIG_IGN)
 
     let app = NSApplication.shared
     app.delegate = self
@@ -227,6 +228,7 @@ import Sparkle
 
   private func setupSignalHandlers() {
     // Handle SIGTERM (kill) and SIGINT (Ctrl+C)
+    signal(SIGPIPE, SIG_IGN)
     signal(SIGTERM, SIG_IGN)
     signal(SIGINT, SIG_IGN)
 

@@ -19,7 +19,7 @@ struct VMImagePackage: Sendable {
   let metadata: [String: String]
 }
 
-struct VMImageBundleConfig: Codable, Sendable {
+struct VMImageBundleConfig: Codable, Equatable, Sendable {
   struct Compression: Codable, Equatable, Sendable {
     let algorithm: String
     let level: Int
@@ -61,6 +61,7 @@ private struct PackChunkRequest: Sendable {
   let chunkSize: UInt64
   let chunksDirectory: String
   let compressionLevel: Int
+  let cachedChunk: VMImagePackedChunk?
   let zstdClient: ZstdClient
   let timeout: TimeInterval?
 }
@@ -133,9 +134,63 @@ struct VMImagePackager {
     stagingRoot: String,
     timeout: TimeInterval? = nil
   ) async throws -> VMImagePackage {
+    let stagingDirectory = "\(stagingRoot)/vm-image-\(UUID().uuidString)"
+    return try await packBundle(
+      bundlePath: bundlePath,
+      stagingDirectory: stagingDirectory,
+      removeStagingDirectoryOnFailure: true,
+      timeout: timeout
+    )
+  }
+
+  func packBundle(
+    bundlePath: String,
+    stagingDirectory: String,
+    timeout: TimeInterval? = nil
+  ) async throws -> VMImagePackage {
+    try await packBundle(
+      bundlePath: bundlePath,
+      stagingDirectory: stagingDirectory,
+      removeStagingDirectoryOnFailure: false,
+      timeout: timeout
+    )
+  }
+
+  func sourceFingerprint(bundlePath: String) throws -> String {
     guard chunkSize > 0 else { throw VMImagePackagerError.invalidConfig("Chunk size must be positive") }
 
-    let stagingDirectory = "\(stagingRoot)/vm-image-\(UUID().uuidString)"
+    var hasher = SHA256()
+    func append(_ value: String) {
+      hasher.update(data: Data(value.utf8))
+      hasher.update(data: Data([0]))
+    }
+
+    append("artifactType=\(jeballtoImageArtifactType)")
+    append("chunkSize=\(chunkSize)")
+    append("compression=zstd")
+    append("compressionLevel=\(compressionLevel)")
+
+    for relativePath in try listRegularFiles(in: bundlePath) {
+      let absolutePath = "\(bundlePath)/\(relativePath)"
+      let attrs = try fileManager.attributesOfItem(atPath: absolutePath)
+      let size = attrs[.size] as? UInt64 ?? UInt64(attrs[.size] as? Int64 ?? 0)
+      let modifiedAt = attrs[.modificationDate] as? Date ?? Date(timeIntervalSince1970: 0)
+      append(relativePath)
+      append(String(size))
+      append(String(modifiedAt.timeIntervalSince1970))
+    }
+
+    return Self.hexDigest(hasher.finalize())
+  }
+
+  private func packBundle(
+    bundlePath: String,
+    stagingDirectory: String,
+    removeStagingDirectoryOnFailure: Bool,
+    timeout: TimeInterval?
+  ) async throws -> VMImagePackage {
+    guard chunkSize > 0 else { throw VMImagePackagerError.invalidConfig("Chunk size must be positive") }
+
     let chunksDirectory = "\(stagingDirectory)/chunks"
     try fileManager.createDirectory(atPath: chunksDirectory, withIntermediateDirectories: true)
 
@@ -145,6 +200,7 @@ struct VMImagePackager {
         throw VMImagePackagerError.invalidBundle("No files found in \(bundlePath)")
       }
 
+      let cachedFilesByPath = try decodeCachedFilesByPath(stagingDirectory: stagingDirectory)
       var packedFiles: [VMImagePackedFile] = []
       var layers: [VMImageLayer] = []
 
@@ -156,6 +212,7 @@ struct VMImagePackager {
           relativePath: relativePath,
           fileSize: fileSize,
           chunksDirectory: chunksDirectory,
+          cachedFile: cachedFilesByPath[relativePath],
           timeout: timeout
         )
         packedFiles.append(packed.file)
@@ -186,7 +243,9 @@ struct VMImagePackager {
         ]
       )
     } catch {
-      try? fileManager.removeItem(atPath: stagingDirectory)
+      if removeStagingDirectoryOnFailure {
+        try? fileManager.removeItem(atPath: stagingDirectory)
+      }
       throw error
     }
   }
@@ -294,6 +353,7 @@ struct VMImagePackager {
     relativePath: String,
     fileSize: UInt64,
     chunksDirectory: String,
+    cachedFile: VMImagePackedFile?,
     timeout: TimeInterval?
   ) async throws -> (file: VMImagePackedFile, layers: [VMImageLayer]) {
     let chunkCount = fileSize == 0 ? 1 : Int((fileSize + chunkSize - 1) / chunkSize)
@@ -303,6 +363,10 @@ struct VMImagePackager {
     let chunkSize = chunkSize
     let compressionLevel = compressionLevel
     let limit = min(effectiveParallelChunks(), chunkCount)
+    var cachedChunksByIndex: [Int: VMImagePackedChunk] = [:]
+    for chunk in cachedFile?.chunks ?? [] where cachedChunksByIndex[chunk.index] == nil {
+      cachedChunksByIndex[chunk.index] = chunk
+    }
 
     try await withThrowingTaskGroup(of: PackedChunkResult.self) { group in
       var nextIndex = 0
@@ -317,6 +381,7 @@ struct VMImagePackager {
           chunkSize: chunkSize,
           chunksDirectory: chunksDirectory,
           compressionLevel: compressionLevel,
+          cachedChunk: cachedChunksByIndex[index],
           zstdClient: zstdClient,
           timeout: timeout
         )
@@ -339,6 +404,7 @@ struct VMImagePackager {
               chunkSize: chunkSize,
               chunksDirectory: chunksDirectory,
               compressionLevel: compressionLevel,
+              cachedChunk: cachedChunksByIndex[index],
               zstdClient: zstdClient,
               timeout: timeout
             )
@@ -358,6 +424,28 @@ struct VMImagePackager {
     let chunks = orderedResults.map(\.chunk)
     let layers = orderedResults.compactMap(\.layer)
     return (VMImagePackedFile(path: relativePath, size: fileSize, chunks: chunks), layers)
+  }
+
+  private func decodeCachedFilesByPath(stagingDirectory: String) throws -> [String: VMImagePackedFile] {
+    let configPath = "\(stagingDirectory)/vm-bundle-config.json"
+    guard fileManager.fileExists(atPath: configPath) else { return [:] }
+
+    do {
+      let config = try decodeConfig(atPath: configPath)
+      guard config.chunkSize == chunkSize,
+            config.compression == .init(algorithm: "zstd", level: compressionLevel) else
+      {
+        return [:]
+      }
+      var filesByPath: [String: VMImagePackedFile] = [:]
+      for file in config.files where filesByPath[file.path] == nil {
+        filesByPath[file.path] = file
+      }
+      return filesByPath
+    } catch {
+      try? fileManager.removeItem(atPath: configPath)
+      return [:]
+    }
   }
 
   private func unpackChunks(
@@ -451,6 +539,15 @@ struct VMImagePackager {
       )
     }
 
+    if let cachedResult = try cachedPackedChunkResult(
+      request: request,
+      scannedChunk: scannedChunk,
+      compressedPath: compressedPath,
+      layerPath: layerPath
+    ) {
+      return cachedResult
+    }
+
     let chunkInfo: ZstdRangeDigest
     do {
       chunkInfo = try await request.zstdClient.compressRange(
@@ -485,6 +582,50 @@ struct VMImagePackager {
         layerPath: layerPath,
         zero: false
       ),
+      layer: VMImageLayer(
+        absolutePath: compressedPath,
+        relativePath: layerPath,
+        mediaType: jeballtoImageChunkMediaType
+      )
+    )
+  }
+
+  private static func cachedPackedChunkResult(
+    request: PackChunkRequest,
+    scannedChunk: ZstdRangeDigest,
+    compressedPath: String,
+    layerPath: String
+  ) throws -> PackedChunkResult? {
+    guard let cachedChunk = request.cachedChunk,
+          cachedChunk.zero == false,
+          cachedChunk.index == request.index,
+          cachedChunk.offset == UInt64(request.index) * request.chunkSize,
+          cachedChunk.uncompressedSize == scannedChunk.size,
+          cachedChunk.uncompressedDigest == scannedChunk.digest,
+          cachedChunk.layerPath == layerPath,
+          let compressedSize = cachedChunk.compressedSize,
+          let compressedDigest = cachedChunk.compressedDigest else
+    {
+      return nil
+    }
+
+    guard FileManager.default.fileExists(atPath: compressedPath) else {
+      return nil
+    }
+    do {
+      let actualSize = try fileSize(atPath: compressedPath)
+      let actualDigest = try sha256File(atPath: compressedPath)
+      guard actualSize == compressedSize, actualDigest == compressedDigest else {
+        try? FileManager.default.removeItem(atPath: compressedPath)
+        return nil
+      }
+    } catch {
+      try? FileManager.default.removeItem(atPath: compressedPath)
+      return nil
+    }
+
+    return PackedChunkResult(
+      chunk: cachedChunk,
       layer: VMImageLayer(
         absolutePath: compressedPath,
         relativePath: layerPath,
