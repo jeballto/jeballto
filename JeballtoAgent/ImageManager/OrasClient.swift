@@ -19,13 +19,13 @@ enum OrasError: Error, LocalizedError {
 }
 
 /// Result of an oras pull operation
-struct OrasPullResult {
+struct OrasPullResult: Sendable {
   let digest: String
   let rawOutput: String
 }
 
 /// Result of an oras push operation
-struct OrasPushResult {
+struct OrasPushResult: Sendable {
   let digest: String
   let rawOutput: String
 }
@@ -164,7 +164,7 @@ struct OrasClient: Sendable {
     for layer in package.layers {
       args.append("\(layer.relativePath):\(layer.mediaType)")
     }
-    if insecure { args.append("--insecure") }
+    args.append(contentsOf: Self.transportSecurityArguments(plainHTTP: insecure))
 
     let result = try await execute(
       arguments: args,
@@ -179,7 +179,7 @@ struct OrasClient: Sendable {
   /// Fetches the raw OCI manifest so callers can verify the Jeballto image format.
   func fetchManifest(reference: ImageReference, insecure: Bool = false) async throws -> OrasManifestInfo {
     var args = ["manifest", "fetch", reference.fullReference]
-    if insecure { args.append("--insecure") }
+    args.append(contentsOf: Self.transportSecurityArguments(plainHTTP: insecure))
 
     let result = try await execute(arguments: args, timeout: Self.shortTimeout)
     let stdout = String(data: result.stdout, encoding: .utf8) ?? ""
@@ -205,7 +205,7 @@ struct OrasClient: Sendable {
 
     let tempOutputPath = "\(outputPath).partial-\(UUID().uuidString)"
     var args = ["blob", "fetch", "--output", "-", blobReference(reference, digest: digest)]
-    if insecure { args.append("--insecure") }
+    args.append(contentsOf: Self.transportSecurityArguments(plainHTTP: insecure))
 
     do {
       try await executeToFile(
@@ -238,11 +238,15 @@ struct OrasClient: Sendable {
     "\(reference.registry)/\(reference.repository)@\(digest)"
   }
 
+  static func transportSecurityArguments(plainHTTP: Bool) -> [String] {
+    plainHTTP ? ["--plain-http"] : []
+  }
+
   /// Authenticates to an OCI registry.
   /// Password is passed via stdin to avoid exposure in process listings.
   func login(registry: String, username: String, password: String, insecure: Bool = false) async throws {
     var args = ["login", registry, "-u", username, "--password-stdin"]
-    if insecure { args.append("--insecure") }
+    args.append(contentsOf: Self.transportSecurityArguments(plainHTTP: insecure))
 
     let orasPath = try resolveOrasPath()
 
@@ -334,7 +338,7 @@ struct OrasClient: Sendable {
   /// Resolves the digest for a reference without downloading
   func resolve(reference: ImageReference, insecure: Bool = false) async throws -> String {
     var args = ["resolve", reference.fullReference]
-    if insecure { args.append("--insecure") }
+    args.append(contentsOf: Self.transportSecurityArguments(plainHTTP: insecure))
 
     let result = try await execute(arguments: args, timeout: Self.shortTimeout)
     let stdout = String(data: result.stdout, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""

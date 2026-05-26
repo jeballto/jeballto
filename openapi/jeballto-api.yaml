@@ -2471,8 +2471,8 @@ components:
               minimum: 0
               maximum: 32
               description: >
-                Maximum number of image chunks to compress or decompress concurrently.
-                Zero uses an automatic value of max(1, min(8, active CPU count - 1)).
+                Maximum number of image chunks to fetch, compress, or decompress concurrently.
+                Zero uses an automatic value of max(1, min(4, active CPU count / 2)).
 
     UpdateConfigRequest:
       type: object
@@ -2544,8 +2544,8 @@ components:
               minimum: 0
               maximum: 32
               description: >
-                Maximum number of image chunks to compress or decompress concurrently.
-                Zero uses an automatic value of max(1, min(8, active CPU count - 1)).
+                Maximum number of image chunks to fetch, compress, or decompress concurrently.
+                Zero uses an automatic value of max(1, min(4, active CPU count / 2)).
 
     SystemResetRequest:
       type: object

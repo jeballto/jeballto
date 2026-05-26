@@ -8,12 +8,13 @@ struct VMImagePackagerTests {
     arguments: [
       (activeProcessorCount: 1, expectedLimit: 1),
       (activeProcessorCount: 2, expectedLimit: 1),
-      (activeProcessorCount: 4, expectedLimit: 3),
-      (activeProcessorCount: 9, expectedLimit: 8),
-      (activeProcessorCount: 16, expectedLimit: 8),
+      (activeProcessorCount: 4, expectedLimit: 2),
+      (activeProcessorCount: 6, expectedLimit: 3),
+      (activeProcessorCount: 9, expectedLimit: 4),
+      (activeProcessorCount: 16, expectedLimit: 4),
     ]
   )
-  func automaticParallelChunkLimitLeavesCpuHeadroomAndCapsAtEight(
+  func automaticParallelChunkLimitUsesHalfCpuCountAndCapsAtFour(
     activeProcessorCount: Int,
     expectedLimit: Int
   ) {

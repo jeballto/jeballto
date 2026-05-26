@@ -53,6 +53,28 @@ private struct PackedChunkResult: Sendable {
   let layer: VMImageLayer?
 }
 
+private struct PackChunkRequest: Sendable {
+  let index: Int
+  let absolutePath: String
+  let relativePath: String
+  let fileSize: UInt64
+  let chunkSize: UInt64
+  let chunksDirectory: String
+  let compressionLevel: Int
+  let zstdClient: ZstdClient
+  let timeout: TimeInterval?
+}
+
+private struct UnpackChunkRequest: Sendable {
+  let packedFile: VMImagePackedFile
+  let chunk: VMImagePackedChunk
+  let layerDirectory: String
+  let outputPath: String
+  let fetchLayer: VMImageLayerFetcher?
+  let zstdClient: ZstdClient
+  let timeout: TimeInterval?
+}
+
 typealias VMImageLayerFetcher = @Sendable (
   _ packedFile: VMImagePackedFile,
   _ chunk: VMImagePackedChunk,
@@ -79,8 +101,11 @@ struct VMImagePackager {
   static let defaultChunkSize: UInt64 = 256 * 1024 * 1024
   static let defaultCompressionLevel = 3
 
-  static func automaticParallelChunkLimit(activeProcessorCount: Int = ProcessInfo.processInfo.activeProcessorCount) -> Int {
-    max(1, min(8, activeProcessorCount - 1))
+  static func automaticParallelChunkLimit(
+    activeProcessorCount: Int = ProcessInfo.processInfo
+      .activeProcessorCount
+  ) -> Int {
+    max(1, min(4, activeProcessorCount / 2))
   }
 
   private let zstdClient: ZstdClient
@@ -284,18 +309,19 @@ struct VMImagePackager {
 
       for _ in 0 ..< limit {
         let index = nextIndex
+        let request = PackChunkRequest(
+          index: index,
+          absolutePath: absolutePath,
+          relativePath: relativePath,
+          fileSize: fileSize,
+          chunkSize: chunkSize,
+          chunksDirectory: chunksDirectory,
+          compressionLevel: compressionLevel,
+          zstdClient: zstdClient,
+          timeout: timeout
+        )
         group.addTask {
-          try await Self.packChunk(
-            index: index,
-            absolutePath: absolutePath,
-            relativePath: relativePath,
-            fileSize: fileSize,
-            chunkSize: chunkSize,
-            chunksDirectory: chunksDirectory,
-            compressionLevel: compressionLevel,
-            zstdClient: zstdClient,
-            timeout: timeout
-          )
+          try await Self.packChunk(request)
         }
         nextIndex += 1
       }
@@ -305,18 +331,19 @@ struct VMImagePackager {
           results.append(result)
           if nextIndex < chunkCount {
             let index = nextIndex
+            let request = PackChunkRequest(
+              index: index,
+              absolutePath: absolutePath,
+              relativePath: relativePath,
+              fileSize: fileSize,
+              chunkSize: chunkSize,
+              chunksDirectory: chunksDirectory,
+              compressionLevel: compressionLevel,
+              zstdClient: zstdClient,
+              timeout: timeout
+            )
             group.addTask {
-              try await Self.packChunk(
-                index: index,
-                absolutePath: absolutePath,
-                relativePath: relativePath,
-                fileSize: fileSize,
-                chunkSize: chunkSize,
-                chunksDirectory: chunksDirectory,
-                compressionLevel: compressionLevel,
-                zstdClient: zstdClient,
-                timeout: timeout
-              )
+              try await Self.packChunk(request)
             }
             nextIndex += 1
           }
@@ -350,17 +377,17 @@ struct VMImagePackager {
 
       for _ in 0 ..< limit {
         let chunk = chunks[nextIndex]
+        let request = UnpackChunkRequest(
+          packedFile: packedFile,
+          chunk: chunk,
+          layerDirectory: layerDirectory,
+          outputPath: outputPath,
+          fetchLayer: fetchLayer,
+          zstdClient: zstdClient,
+          timeout: timeout
+        )
         group.addTask {
-          try await Self.unpackChunk(
-            packedFilePath: packedFile.path,
-            packedFile: packedFile,
-            chunk: chunk,
-            layerDirectory: layerDirectory,
-            outputPath: outputPath,
-            fetchLayer: fetchLayer,
-            zstdClient: zstdClient,
-            timeout: timeout
-          )
+          try await Self.unpackChunk(request)
         }
         nextIndex += 1
       }
@@ -369,17 +396,17 @@ struct VMImagePackager {
         while try await group.next() != nil {
           if nextIndex < chunks.count {
             let chunk = chunks[nextIndex]
+            let request = UnpackChunkRequest(
+              packedFile: packedFile,
+              chunk: chunk,
+              layerDirectory: layerDirectory,
+              outputPath: outputPath,
+              fetchLayer: fetchLayer,
+              zstdClient: zstdClient,
+              timeout: timeout
+            )
             group.addTask {
-              try await Self.unpackChunk(
-                packedFilePath: packedFile.path,
-                packedFile: packedFile,
-                chunk: chunk,
-                layerDirectory: layerDirectory,
-                outputPath: outputPath,
-                fetchLayer: fetchLayer,
-                zstdClient: zstdClient,
-                timeout: timeout
-              )
+              try await Self.unpackChunk(request)
             }
             nextIndex += 1
           }
@@ -398,30 +425,20 @@ struct VMImagePackager {
     return Self.automaticParallelChunkLimit()
   }
 
-  private static func packChunk(
-    index: Int,
-    absolutePath: String,
-    relativePath: String,
-    fileSize: UInt64,
-    chunkSize: UInt64,
-    chunksDirectory: String,
-    compressionLevel: Int,
-    zstdClient: ZstdClient,
-    timeout: TimeInterval?
-  ) async throws -> PackedChunkResult {
+  private static func packChunk(_ request: PackChunkRequest) async throws -> PackedChunkResult {
     try Task.checkCancellation()
 
-    let offset = UInt64(index) * chunkSize
-    let size = fileSize == 0 ? 0 : min(chunkSize, fileSize - offset)
-    let chunkFileName = layerName(for: relativePath, index: index)
+    let offset = UInt64(request.index) * request.chunkSize
+    let size = request.fileSize == 0 ? 0 : min(request.chunkSize, request.fileSize - offset)
+    let chunkFileName = layerName(for: request.relativePath, index: request.index)
     let layerPath = "chunks/\(chunkFileName).zst"
-    let compressedPath = "\(chunksDirectory)/\(chunkFileName).zst"
-    let scannedChunk = try zstdClient.scanRange(inputPath: absolutePath, offset: offset, size: size)
+    let compressedPath = "\(request.chunksDirectory)/\(chunkFileName).zst"
+    let scannedChunk = try request.zstdClient.scanRange(inputPath: request.absolutePath, offset: offset, size: size)
 
     if scannedChunk.isZero {
       return PackedChunkResult(
         chunk: VMImagePackedChunk(
-          index: index,
+          index: request.index,
           offset: offset,
           uncompressedSize: size,
           uncompressedDigest: scannedChunk.digest,
@@ -436,13 +453,13 @@ struct VMImagePackager {
 
     let chunkInfo: ZstdRangeDigest
     do {
-      chunkInfo = try await zstdClient.compressRange(
-        inputPath: absolutePath,
+      chunkInfo = try await request.zstdClient.compressRange(
+        inputPath: request.absolutePath,
         offset: offset,
         size: size,
         outputPath: compressedPath,
-        level: compressionLevel,
-        timeout: timeout
+        level: request.compressionLevel,
+        timeout: request.timeout
       )
     } catch {
       try? FileManager.default.removeItem(atPath: compressedPath)
@@ -451,14 +468,15 @@ struct VMImagePackager {
 
     guard chunkInfo.digest == scannedChunk.digest, chunkInfo.size == scannedChunk.size else {
       try? FileManager.default.removeItem(atPath: compressedPath)
-      throw VMImagePackagerError.digestMismatch("Source changed while packing \(relativePath) chunk \(index)")
+      throw VMImagePackagerError
+        .digestMismatch("Source changed while packing \(request.relativePath) chunk \(request.index)")
     }
 
     let compressedSize = try Self.fileSize(atPath: compressedPath)
     let compressedDigest = try sha256File(atPath: compressedPath)
     return PackedChunkResult(
       chunk: VMImagePackedChunk(
-        index: index,
+        index: request.index,
         offset: offset,
         uncompressedSize: size,
         uncompressedDigest: chunkInfo.digest,
@@ -475,29 +493,23 @@ struct VMImagePackager {
     )
   }
 
-  private static func unpackChunk(
-    packedFilePath: String,
-    packedFile: VMImagePackedFile,
-    chunk: VMImagePackedChunk,
-    layerDirectory: String,
-    outputPath: String,
-    fetchLayer: VMImageLayerFetcher?,
-    zstdClient: ZstdClient,
-    timeout: TimeInterval?
-  ) async throws {
+  private static func unpackChunk(_ request: UnpackChunkRequest) async throws {
     try Task.checkCancellation()
+
+    let packedFile = request.packedFile
+    let chunk = request.chunk
 
     guard let layerPath = chunk.layerPath,
           let compressedDigest = chunk.compressedDigest,
           let compressedSize = chunk.compressedSize else
     {
-      throw VMImagePackagerError.invalidConfig("Missing layer metadata for \(packedFilePath) chunk \(chunk.index)")
+      throw VMImagePackagerError.invalidConfig("Missing layer metadata for \(packedFile.path) chunk \(chunk.index)")
     }
 
     try validateRelativePath(layerPath)
-    let compressedPath = "\(layerDirectory)/\(layerPath)"
+    let compressedPath = "\(request.layerDirectory)/\(layerPath)"
     do {
-      if let fetchLayer {
+      if let fetchLayer = request.fetchLayer {
         let layerParent = (compressedPath as NSString).deletingLastPathComponent
         try FileManager.default.createDirectory(atPath: layerParent, withIntermediateDirectories: true)
         try await fetchLayer(packedFile, chunk, compressedPath)
@@ -520,11 +532,11 @@ struct VMImagePackager {
         throw VMImagePackagerError.digestMismatch("Compressed digest mismatch for \(layerPath)")
       }
 
-      let actualRaw = try await zstdClient.decompressToFileRange(
+      let actualRaw = try await request.zstdClient.decompressToFileRange(
         inputPath: compressedPath,
-        destinationPath: outputPath,
+        destinationPath: request.outputPath,
         offset: chunk.offset,
-        timeout: timeout
+        timeout: request.timeout
       )
       guard actualRaw.size == chunk.uncompressedSize else {
         throw VMImagePackagerError.digestMismatch("Uncompressed size mismatch for \(layerPath)")
@@ -534,7 +546,7 @@ struct VMImagePackager {
       }
       try? FileManager.default.removeItem(atPath: compressedPath)
     } catch {
-      if fetchLayer != nil {
+      if request.fetchLayer != nil {
         try? FileManager.default.removeItem(atPath: compressedPath)
       }
       throw error
@@ -580,10 +592,10 @@ struct VMImagePackager {
   }
 
   private static func sha256Data(_ data: Data) -> String {
-    Self.hexDigest(SHA256.hash(data: data))
+    hexDigest(SHA256.hash(data: data))
   }
 
-  private static func hexDigest<D: Sequence>(_ digest: D) -> String where D.Element == UInt8 {
+  private static func hexDigest(_ digest: some Sequence<UInt8>) -> String {
     "sha256:" + digest.map { String(format: "%02x", $0) }.joined()
   }
 

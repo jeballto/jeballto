@@ -248,8 +248,8 @@ struct ImageConfig: Codable, Sendable {
   /// Path to the `zstd` CLI binary. When `nil`, uses the binary bundled in the app's Resources directory.
   var zstdPath: String?
 
-  /// Maximum number of image chunks to compress or decompress concurrently.
-  /// Zero uses an automatic value based on CPU count, capped at 8.
+  /// Maximum number of image chunks to fetch, compress, or decompress concurrently.
+  /// Zero uses an automatic value based on half the CPU count, capped at 4.
   var maxParallelImageChunks: Int
 
   /// Default OCI registry (optional, used when reference has no registry prefix)

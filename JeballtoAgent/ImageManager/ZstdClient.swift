@@ -18,13 +18,13 @@ enum ZstdError: Error, LocalizedError {
   }
 }
 
-struct ZstdRangeDigest: Equatable {
+struct ZstdRangeDigest: Equatable, Sendable {
   let size: UInt64
   let digest: String
   let isZero: Bool
 }
 
-struct ZstdClient {
+struct ZstdClient: Sendable {
   private let configuredPath: String?
   private static let defaultTimeout: TimeInterval? = nil
   private static let maxOutputSize = 1024 * 1024
@@ -334,7 +334,7 @@ struct ZstdClient {
     }
   }
 
-  private static func hexDigest<D: Sequence>(_ digest: D) -> String where D.Element == UInt8 {
+  private static func hexDigest(_ digest: some Sequence<UInt8>) -> String {
     "sha256:" + digest.map { String(format: "%02x", $0) }.joined()
   }
 

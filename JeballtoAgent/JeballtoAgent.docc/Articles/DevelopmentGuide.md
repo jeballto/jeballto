@@ -178,8 +178,8 @@ First run creates `~/Library/Application Support/Jeballto/config.json` (permissi
 }
 ```
 
-`maxParallelImageChunks` controls concurrent image chunk compression and decompression. `0` means automatic:
-`max(1, min(8, active CPU count - 1))`.
+`maxParallelImageChunks` controls concurrent image chunk fetch, compression, and decompression. `0` means automatic:
+`max(1, min(4, active CPU count / 2))`.
 
 ## Code Style
 

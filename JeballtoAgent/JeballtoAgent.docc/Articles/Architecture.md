@@ -114,7 +114,7 @@ Thin wrapper around the `oras` CLI binary. Key design choices:
 - Timeout protection: no limit for pull/push, 30s for login/logout/resolve
 - Output capped at 5 MB per stream
 - VM images are chunked by `VMImagePackager` and compressed by `zstd` before ORAS uploads each nonzero chunk as a separate layer
-- `maxParallelImageChunks = 0` uses `max(1, min(8, active CPU count - 1))`, leaving one CPU free and capping automatic chunk work at 8
+- `maxParallelImageChunks = 0` uses `max(1, min(4, active CPU count / 2))`, capping automatic chunk fetch, compression, and decompression work at 4
 
 Resolves `oras` binary: checks `config.images.orasPath` first, then `Bundle.main.resourceURL/oras`.
 Resolves `zstd` binary: checks `config.images.zstdPath` first, then `Bundle.main.resourceURL/zstd`.
