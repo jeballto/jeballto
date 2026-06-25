@@ -47,9 +47,9 @@ actor ImageManager {
   }
 
   private let imageStore: ImageStore
-  private let orasClient: OrasClient
+  private var orasClient: OrasClient
   private let eventBus: EventBus
-  private let config: Config
+  private var config: Config
 
   init(imageStore: ImageStore, orasClient: OrasClient, eventBus: EventBus, config: Config) {
     self.imageStore = imageStore
@@ -57,6 +57,15 @@ actor ImageManager {
     self.eventBus = eventBus
     self.config = config
     cleanupStaleImageWorkDirs(imageStorageDir: config.images.imageStorageDir)
+  }
+
+  func updateConfiguration(_ newConfig: Config) {
+    config = newConfig
+    orasClient = OrasClient(config: newConfig.images)
+  }
+
+  func currentImageConfig() -> ImageConfig {
+    config.images
   }
 
   // MARK: - Startup Cleanup

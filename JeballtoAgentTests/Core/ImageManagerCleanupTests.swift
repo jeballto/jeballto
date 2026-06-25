@@ -92,6 +92,34 @@ struct ImageManagerCleanupTests {
   }
 
   @Test
+  func updateConfigurationRefreshesImageRuntimeSettings() async throws {
+    try await withTemporaryDirectory(prefix: "image-manager-config-update") { root in
+      var config = Config.default
+      config.images.imageStorageDir = root
+      config.images.maxParallelImageChunks = 1
+      config.storage.imageIndexPath = "\(root)/images.json"
+      let manager = ImageManager(
+        imageStore: ImageStore(storagePath: root, indexPath: config.storage.imageIndexPath),
+        orasClient: OrasClient(config: config.images),
+        eventBus: EventBus(),
+        config: config
+      )
+
+      var updatedConfig = config
+      updatedConfig.images.maxParallelImageChunks = 7
+      updatedConfig.images.insecureRegistries = ["registry.example.com"]
+      updatedConfig.images.orasPath = "\(root)/oras"
+
+      await manager.updateConfiguration(updatedConfig)
+
+      let imageConfig = await manager.currentImageConfig()
+      #expect(imageConfig.maxParallelImageChunks == 7)
+      #expect(imageConfig.insecureRegistries == ["registry.example.com"])
+      #expect(imageConfig.orasPath == "\(root)/oras")
+    }
+  }
+
+  @Test
   func startupCleanupRemovesSessionScopedImageWorkCache() throws {
     let resumeCache = JeballtoCachePaths.imageWork
       .appendingPathComponent("resume/pulls/sha256-test", isDirectory: true)

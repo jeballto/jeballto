@@ -98,6 +98,180 @@ enum VMImagePackagerError: Error, LocalizedError {
   }
 }
 
+private enum VMImageConfigValidator {
+  private struct ValidationContext {
+    var seenFilePaths: Set<String> = []
+    var seenLayerPaths: Set<String> = []
+  }
+
+  static func validate(_ config: VMImageBundleConfig) throws {
+    var context = ValidationContext()
+    for packedFile in config.files {
+      try validate(packedFile, config: config, context: &context)
+    }
+  }
+
+  static func validateRelativePath(_ path: String) throws {
+    guard !path.isEmpty,
+          !path.hasPrefix("/"),
+          !path.contains("\0"),
+          !path.split(separator: "/").contains("..") else
+    {
+      throw VMImagePackagerError.invalidConfig("Unsafe relative path: \(path)")
+    }
+  }
+
+  private static func validate(
+    _ packedFile: VMImagePackedFile,
+    config: VMImageBundleConfig,
+    context: inout ValidationContext
+  ) throws {
+    try validateRelativePath(packedFile.path)
+    guard context.seenFilePaths.insert(packedFile.path).inserted else {
+      throw VMImagePackagerError.invalidConfig("Duplicate file path: \(packedFile.path)")
+    }
+
+    let expectedChunkCount = expectedChunkCount(fileSize: packedFile.size, chunkSize: config.chunkSize)
+    guard UInt64(packedFile.chunks.count) == expectedChunkCount else {
+      throw VMImagePackagerError.invalidConfig(
+        "Chunk count mismatch for \(packedFile.path): expected \(expectedChunkCount), "
+          + "found \(packedFile.chunks.count)"
+      )
+    }
+
+    let orderedChunks = packedFile.chunks.sorted { lhs, rhs in
+      lhs.index < rhs.index
+    }
+    for (expectedIndex, chunk) in orderedChunks.enumerated() {
+      try validateChunk(
+        chunk,
+        in: packedFile,
+        config: config,
+        expectedIndex: expectedIndex,
+        seenLayerPaths: &context.seenLayerPaths
+      )
+    }
+  }
+
+  private static func expectedChunkCount(fileSize: UInt64, chunkSize: UInt64) -> UInt64 {
+    fileSize == 0 ? 1 : ((fileSize - 1) / chunkSize) + 1
+  }
+
+  private static func validateChunk(
+    _ chunk: VMImagePackedChunk,
+    in packedFile: VMImagePackedFile,
+    config: VMImageBundleConfig,
+    expectedIndex: Int,
+    seenLayerPaths: inout Set<String>
+  ) throws {
+    try validateChunkLayout(chunk, in: packedFile, config: config, expectedIndex: expectedIndex)
+    guard isValidSHA256Digest(chunk.uncompressedDigest) else {
+      throw VMImagePackagerError.invalidConfig(
+        "Invalid uncompressed digest for \(packedFile.path) chunk \(chunk.index)"
+      )
+    }
+
+    if chunk.zero {
+      try validateZeroChunk(chunk, in: packedFile)
+      return
+    }
+
+    try validateNonzeroChunk(chunk, in: packedFile, seenLayerPaths: &seenLayerPaths)
+  }
+
+  private static func validateChunkLayout(
+    _ chunk: VMImagePackedChunk,
+    in packedFile: VMImagePackedFile,
+    config: VMImageBundleConfig,
+    expectedIndex: Int
+  ) throws {
+    guard chunk.index >= 0 else {
+      throw VMImagePackagerError.invalidConfig("Negative chunk index for \(packedFile.path)")
+    }
+    guard chunk.index == expectedIndex else {
+      throw VMImagePackagerError.invalidConfig(
+        "Chunk indexes for \(packedFile.path) must be contiguous starting at 0"
+      )
+    }
+
+    let (expectedOffset, offsetOverflow) = UInt64(expectedIndex)
+      .multipliedReportingOverflow(by: config.chunkSize)
+    guard !offsetOverflow else {
+      throw VMImagePackagerError.invalidConfig(
+        "Chunk offset overflow for \(packedFile.path) chunk \(chunk.index)"
+      )
+    }
+    guard chunk.offset == expectedOffset else {
+      throw VMImagePackagerError.invalidConfig(
+        "Unexpected offset for \(packedFile.path) chunk \(chunk.index): expected \(expectedOffset), "
+          + "found \(chunk.offset)"
+      )
+    }
+
+    let expectedSize = packedFile.size == 0
+      ? 0
+      : min(config.chunkSize, packedFile.size - expectedOffset)
+    guard chunk.uncompressedSize == expectedSize else {
+      throw VMImagePackagerError.invalidConfig(
+        "Unexpected size for \(packedFile.path) chunk \(chunk.index): expected \(expectedSize), "
+          + "found \(chunk.uncompressedSize)"
+      )
+    }
+  }
+
+  private static func validateZeroChunk(_ chunk: VMImagePackedChunk, in packedFile: VMImagePackedFile) throws {
+    guard chunk.compressedSize == nil,
+          chunk.compressedDigest == nil,
+          chunk.layerPath == nil else
+    {
+      throw VMImagePackagerError.invalidConfig(
+        "Zero chunk for \(packedFile.path) chunk \(chunk.index) must not include layer metadata"
+      )
+    }
+  }
+
+  private static func validateNonzeroChunk(
+    _ chunk: VMImagePackedChunk,
+    in packedFile: VMImagePackedFile,
+    seenLayerPaths: inout Set<String>
+  ) throws {
+    guard chunk.uncompressedSize > 0 else {
+      throw VMImagePackagerError.invalidConfig(
+        "Nonzero chunk for \(packedFile.path) chunk \(chunk.index) is empty"
+      )
+    }
+    guard let compressedSize = chunk.compressedSize, compressedSize > 0 else {
+      throw VMImagePackagerError.invalidConfig(
+        "Missing compressed size for \(packedFile.path) chunk \(chunk.index)"
+      )
+    }
+    guard let compressedDigest = chunk.compressedDigest, isValidSHA256Digest(compressedDigest) else {
+      throw VMImagePackagerError.invalidConfig(
+        "Invalid compressed digest for \(packedFile.path) chunk \(chunk.index)"
+      )
+    }
+    guard let layerPath = chunk.layerPath else {
+      throw VMImagePackagerError.invalidConfig("Missing layer path for \(packedFile.path) chunk \(chunk.index)")
+    }
+    try validateRelativePath(layerPath)
+    guard layerPath.hasPrefix("chunks/") else {
+      throw VMImagePackagerError.invalidConfig("Layer path must be under chunks/: \(layerPath)")
+    }
+    guard seenLayerPaths.insert(layerPath).inserted else {
+      throw VMImagePackagerError.invalidConfig("Duplicate layer path: \(layerPath)")
+    }
+  }
+
+  private static func isValidSHA256Digest(_ digest: String) -> Bool {
+    let prefix = "sha256:"
+    let lowercaseHex = Set("0123456789abcdef")
+    guard digest.hasPrefix(prefix), digest.count == prefix.count + 64 else { return false }
+    return digest.dropFirst(prefix.count).allSatisfy { character in
+      lowercaseHex.contains(character)
+    }
+  }
+}
+
 struct VMImagePackager {
   static let defaultChunkSize: UInt64 = 256 * 1024 * 1024
   static let defaultCompressionLevel = 3
@@ -296,6 +470,7 @@ struct VMImagePackager {
     guard config.compression.algorithm == "zstd" else {
       throw VMImagePackagerError.unsupportedCompression(config.compression.algorithm)
     }
+    try VMImageConfigValidator.validate(config)
     return config
   }
 
@@ -315,7 +490,7 @@ struct VMImagePackager {
     }
 
     for packedFile in config.files {
-      try Self.validateRelativePath(packedFile.path)
+      try VMImageConfigValidator.validateRelativePath(packedFile.path)
       let outputPath = "\(tempOutputBundlePath)/\(packedFile.path)"
       let outputFileParent = (outputPath as NSString).deletingLastPathComponent
       try fileManager.createDirectory(atPath: outputFileParent, withIntermediateDirectories: true)
@@ -647,7 +822,7 @@ struct VMImagePackager {
       throw VMImagePackagerError.invalidConfig("Missing layer metadata for \(packedFile.path) chunk \(chunk.index)")
     }
 
-    try validateRelativePath(layerPath)
+    try VMImageConfigValidator.validateRelativePath(layerPath)
     let compressedPath = "\(request.layerDirectory)/\(layerPath)"
     do {
       if let fetchLayer = request.fetchLayer {
@@ -732,10 +907,6 @@ struct VMImagePackager {
     return Self.hexDigest(hasher.finalize())
   }
 
-  private static func sha256Data(_ data: Data) -> String {
-    hexDigest(SHA256.hash(data: data))
-  }
-
   private static func hexDigest(_ digest: some Sequence<UInt8>) -> String {
     "sha256:" + digest.map { String(format: "%02x", $0) }.joined()
   }
@@ -753,14 +924,5 @@ struct VMImagePackager {
       .replacingOccurrences(of: "/", with: "__")
       .replacingOccurrences(of: ":", with: "_")
     return "\(safePath).\(digest).\(String(format: "%06d", index))"
-  }
-
-  private static func validateRelativePath(_ path: String) throws {
-    guard !path.isEmpty,
-          !path.hasPrefix("/"),
-          !path.split(separator: "/").contains("..") else
-    {
-      throw VMImagePackagerError.invalidConfig("Unsafe relative path: \(path)")
-    }
   }
 }

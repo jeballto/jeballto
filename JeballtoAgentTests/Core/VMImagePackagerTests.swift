@@ -104,6 +104,177 @@ struct VMImagePackagerTests {
   }
 
   @Test
+  func unpackRejectsChunkOffsetPastDeclaredFileSize() async throws {
+    try await withTemporaryDirectory(prefix: "vm-image-packager-bad-offset") { root in
+      let source = "\(root)/source.bundle"
+      let unpacked = "\(root)/unpacked.bundle"
+      let corruptConfigPath = "\(root)/corrupt-config.json"
+      try makeFakeBundle(at: source)
+
+      let packager = try makePackager(chunkSize: 1024 * 1024)
+      let package = try await packager.packBundle(bundlePath: source, stagingRoot: root)
+      let config = try decodePackageConfig(package)
+      let fileIndex = try #require(config.files.firstIndex { !$0.chunks.isEmpty })
+      let file = config.files[fileIndex]
+      let chunk = try #require(file.chunks.first)
+      let corruptChunk = VMImagePackedChunk(
+        index: chunk.index,
+        offset: file.size + 1,
+        uncompressedSize: chunk.uncompressedSize,
+        uncompressedDigest: chunk.uncompressedDigest,
+        compressedSize: chunk.compressedSize,
+        compressedDigest: chunk.compressedDigest,
+        layerPath: chunk.layerPath,
+        zero: chunk.zero
+      )
+      let corruptConfig = replacingChunk(in: config, fileIndex: fileIndex, chunkIndex: 0, with: corruptChunk)
+      try writeConfig(corruptConfig, to: corruptConfigPath)
+
+      await #expect(throws: VMImagePackagerError.self) {
+        try await packager.unpackBundle(
+          pulledDirectory: package.stagingDirectory,
+          configPath: corruptConfigPath,
+          outputBundlePath: unpacked
+        )
+      }
+      #expect(FileManager.default.fileExists(atPath: unpacked) == false)
+    }
+  }
+
+  @Test
+  func unpackRejectsOverlappingChunkLayout() async throws {
+    try await withTemporaryDirectory(prefix: "vm-image-packager-overlap") { root in
+      let source = "\(root)/source.bundle"
+      let unpacked = "\(root)/unpacked.bundle"
+      let corruptConfigPath = "\(root)/corrupt-config.json"
+      try makeFakeBundle(at: source)
+
+      let packager = try makePackager(chunkSize: 1024 * 1024)
+      let package = try await packager.packBundle(bundlePath: source, stagingRoot: root)
+      let config = try decodePackageConfig(package)
+      let fileIndex = try #require(config.files.firstIndex { $0.path == "Disk.img" && $0.chunks.count > 1 })
+      let chunks = config.files[fileIndex].chunks
+      let firstChunk = chunks[0]
+      let secondChunk = chunks[1]
+      let corruptChunk = VMImagePackedChunk(
+        index: firstChunk.index,
+        offset: firstChunk.offset,
+        uncompressedSize: secondChunk.uncompressedSize,
+        uncompressedDigest: secondChunk.uncompressedDigest,
+        compressedSize: secondChunk.compressedSize,
+        compressedDigest: secondChunk.compressedDigest,
+        layerPath: secondChunk.layerPath,
+        zero: secondChunk.zero
+      )
+      let corruptConfig = replacingChunk(in: config, fileIndex: fileIndex, chunkIndex: 1, with: corruptChunk)
+      try writeConfig(corruptConfig, to: corruptConfigPath)
+
+      await #expect(throws: VMImagePackagerError.self) {
+        try await packager.unpackBundle(
+          pulledDirectory: package.stagingDirectory,
+          configPath: corruptConfigPath,
+          outputBundlePath: unpacked
+        )
+      }
+      #expect(FileManager.default.fileExists(atPath: unpacked) == false)
+    }
+  }
+
+  @Test
+  func unpackRejectsZeroChunkWithLayerMetadata() async throws {
+    try await withTemporaryDirectory(prefix: "vm-image-packager-zero-layer") { root in
+      let source = "\(root)/source.bundle"
+      let unpacked = "\(root)/unpacked.bundle"
+      let corruptConfigPath = "\(root)/corrupt-config.json"
+      try makeFakeBundle(at: source)
+
+      let packager = try makePackager(chunkSize: 1024 * 1024)
+      let package = try await packager.packBundle(bundlePath: source, stagingRoot: root)
+      let config = try decodePackageConfig(package)
+      let fileIndex = try #require(config.files.firstIndex { $0.path == "Disk.img" })
+      let disk = config.files[fileIndex]
+      let zeroChunkIndex = try #require(disk.chunks.firstIndex { $0.zero })
+      let zeroChunk = disk.chunks[zeroChunkIndex]
+      let layerChunk = try #require(disk.chunks.first { !$0.zero })
+      let corruptChunk = VMImagePackedChunk(
+        index: zeroChunk.index,
+        offset: zeroChunk.offset,
+        uncompressedSize: zeroChunk.uncompressedSize,
+        uncompressedDigest: zeroChunk.uncompressedDigest,
+        compressedSize: layerChunk.compressedSize,
+        compressedDigest: layerChunk.compressedDigest,
+        layerPath: layerChunk.layerPath,
+        zero: true
+      )
+      let corruptConfig = replacingChunk(
+        in: config,
+        fileIndex: fileIndex,
+        chunkIndex: zeroChunkIndex,
+        with: corruptChunk
+      )
+      try writeConfig(corruptConfig, to: corruptConfigPath)
+
+      await #expect(throws: VMImagePackagerError.self) {
+        try await packager.unpackBundle(
+          pulledDirectory: package.stagingDirectory,
+          configPath: corruptConfigPath,
+          outputBundlePath: unpacked
+        )
+      }
+      #expect(FileManager.default.fileExists(atPath: unpacked) == false)
+    }
+  }
+
+  @Test
+  func unpackRejectsDuplicateLayerPaths() async throws {
+    try await withTemporaryDirectory(prefix: "vm-image-packager-duplicate-layer") { root in
+      let source = "\(root)/source.bundle"
+      let unpacked = "\(root)/unpacked.bundle"
+      let corruptConfigPath = "\(root)/corrupt-config.json"
+      try makeFakeBundle(at: source)
+
+      let packager = try makePackager(chunkSize: 1024 * 1024)
+      let package = try await packager.packBundle(bundlePath: source, stagingRoot: root)
+      let config = try decodePackageConfig(package)
+      let fileIndex = try #require(config.files.firstIndex { file in
+        file.chunks.filter { !$0.zero }.count >= 2
+      })
+      let chunks = config.files[fileIndex].chunks
+      let nonzeroIndexes = chunks.indices.filter { !chunks[$0].zero }
+      let firstChunkIndex = try #require(nonzeroIndexes.first)
+      let firstChunk = chunks[firstChunkIndex]
+      let duplicateChunkIndex = try #require(nonzeroIndexes.dropFirst().first)
+      let duplicateChunk = chunks[duplicateChunkIndex]
+      let corruptChunk = VMImagePackedChunk(
+        index: duplicateChunk.index,
+        offset: duplicateChunk.offset,
+        uncompressedSize: duplicateChunk.uncompressedSize,
+        uncompressedDigest: duplicateChunk.uncompressedDigest,
+        compressedSize: duplicateChunk.compressedSize,
+        compressedDigest: duplicateChunk.compressedDigest,
+        layerPath: firstChunk.layerPath,
+        zero: false
+      )
+      let corruptConfig = replacingChunk(
+        in: config,
+        fileIndex: fileIndex,
+        chunkIndex: duplicateChunkIndex,
+        with: corruptChunk
+      )
+      try writeConfig(corruptConfig, to: corruptConfigPath)
+
+      await #expect(throws: VMImagePackagerError.self) {
+        try await packager.unpackBundle(
+          pulledDirectory: package.stagingDirectory,
+          configPath: corruptConfigPath,
+          outputBundlePath: unpacked
+        )
+      }
+      #expect(FileManager.default.fileExists(atPath: unpacked) == false)
+    }
+  }
+
+  @Test
   func unpackDeletesCompressedLayerFilesAfterWriting() async throws {
     try await withTemporaryDirectory(prefix: "vm-image-packager-cleanup") { root in
       let source = "\(root)/source.bundle"
@@ -522,6 +693,30 @@ struct VMImagePackagerTests {
   private func decodePackageConfig(_ package: VMImagePackage) throws -> VMImageBundleConfig {
     let data = try Data(contentsOf: URL(fileURLWithPath: package.configPath))
     return try JSONDecoder().decode(VMImageBundleConfig.self, from: data)
+  }
+
+  private func writeConfig(_ config: VMImageBundleConfig, to path: String) throws {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys]
+    try encoder.encode(config).write(to: URL(fileURLWithPath: path))
+  }
+
+  private func replacingChunk(
+    in config: VMImageBundleConfig,
+    fileIndex: Int,
+    chunkIndex: Int,
+    with chunk: VMImagePackedChunk
+  ) -> VMImageBundleConfig {
+    var files = config.files
+    var chunks = files[fileIndex].chunks
+    chunks[chunkIndex] = chunk
+    files[fileIndex] = VMImagePackedFile(path: files[fileIndex].path, size: files[fileIndex].size, chunks: chunks)
+    return VMImageBundleConfig(
+      artifactType: config.artifactType,
+      chunkSize: config.chunkSize,
+      compression: config.compression,
+      files: files
+    )
   }
 
   private func modificationDate(atPath path: String) throws -> Date {

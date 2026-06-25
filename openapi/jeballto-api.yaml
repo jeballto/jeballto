@@ -1183,6 +1183,12 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '499':
+          description: Image pull was cancelled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -1222,6 +1228,12 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           description: VM is not in a stopped state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '499':
+          description: Image push was cancelled
           content:
             application/json:
               schema:
@@ -2679,7 +2691,9 @@ components:
                 - INVALID_STATE
                 - IMAGE_NOT_FOUND
                 - IMAGE_PULL_FAILED
+                - IMAGE_PULL_CANCELLED
                 - IMAGE_PUSH_FAILED
+                - IMAGE_PUSH_CANCELLED
                 - INVALID_REFERENCE
                 - REGISTRY_AUTH_FAILED
                 - REGISTRY_LOGOUT_FAILED

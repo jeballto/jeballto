@@ -16,7 +16,7 @@ enum ConfigError: Error, LocalizedError {
 }
 
 /// Application configuration
-struct Config: Codable {
+struct Config: Codable, Sendable {
   /// API server configuration
   var api: APIConfig
 
@@ -85,7 +85,7 @@ struct Config: Codable {
 }
 
 /// API server configuration
-struct APIConfig: Codable {
+struct APIConfig: Codable, Sendable {
   /// API server port
   var port: Int
 
@@ -118,7 +118,7 @@ struct APIConfig: Codable {
 }
 
 /// Storage configuration
-struct StorageConfig: Codable {
+struct StorageConfig: Codable, Sendable {
   /// Base directory for VM storage
   var vmStorageDir: String
 
@@ -145,7 +145,7 @@ struct StorageConfig: Codable {
 }
 
 /// Logging configuration
-struct LoggingConfig: Codable {
+struct LoggingConfig: Codable, Sendable {
   /// Log level (debug, info, warning, error)
   var level: String
 
@@ -206,7 +206,7 @@ struct LoggingConfig: Codable {
 }
 
 /// Networking configuration
-struct NetworkingConfig: Codable {
+struct NetworkingConfig: Codable, Sendable {
   /// Starting port for SSH forwarding
   var sshPortRangeStart: Int
 

@@ -425,6 +425,7 @@ extension APIServer {
       return HTTPResponse.error("CONFIG_UPDATE_FAILED", message: error.localizedDescription, statusCode: 500)
     }
 
+    await imageManager.updateConfiguration(newConfig)
     applyLoggingRuntimeUpdates(updateRequest.logging)
 
     logInfo("Configuration updated via API", category: "APIServer")
