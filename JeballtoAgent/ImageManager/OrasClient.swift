@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 
 /// Errors from oras CLI operations
@@ -512,14 +513,7 @@ struct OrasClient: Sendable {
 
     let outputParent = (outputPath as NSString).deletingLastPathComponent
     try FileManager.default.createDirectory(atPath: outputParent, withIntermediateDirectories: true)
-    if FileManager.default.fileExists(atPath: outputPath) {
-      try FileManager.default.removeItem(atPath: outputPath)
-    }
-    guard FileManager.default.createFile(atPath: outputPath, contents: nil) else {
-      throw OrasError.invalidOutput("Failed to create output file at \(outputPath)")
-    }
-
-    let outputHandle = try FileHandle(forWritingTo: URL(fileURLWithPath: outputPath))
+    let outputHandle = try Self.openOutputFile(atPath: outputPath)
     defer { try? outputHandle.close() }
 
     let orasTmpDir = JeballtoCachePaths.imageWork
@@ -588,6 +582,15 @@ struct OrasClient: Sendable {
     case .timeout(let command):
       .timeout(command)
     }
+  }
+
+  private static func openOutputFile(atPath path: String) throws -> FileHandle {
+    let descriptor = open(path, O_CREAT | O_TRUNC | O_WRONLY, S_IRUSR | S_IWUSR)
+    guard descriptor >= 0 else {
+      let message = String(cString: strerror(errno))
+      throw OrasError.invalidOutput("Failed to open output file at \(path): \(message)")
+    }
+    return FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
   }
 
   // MARK: - Output Parsing

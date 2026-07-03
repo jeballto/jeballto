@@ -103,6 +103,14 @@ struct RequestValidationTests {
   }
 
   @Test
+  func pullImageRequestDecodesAsyncFlag() throws {
+    let data = Data(#"{"reference":"registry.example.com/vm/macos:latest","async":true}"#.utf8)
+    let request = try JSONDecoder().decode(PullImageRequest.self, from: data)
+
+    #expect(request.shouldRunAsync)
+  }
+
+  @Test
   func pushImageRequestValidationAndSourceParsing() {
     let id = UUID().uuidString
     let vmSource = "vm:\(id)"
@@ -130,6 +138,17 @@ struct RequestValidationTests {
   }
 
   @Test
+  func pushImageRequestDecodesAsyncFlag() throws {
+    let id = UUID().uuidString
+    let data = Data(
+      #"{"reference":"registry.example.com/vm/macos:latest","source":"image:\#(id)","async":true}"#.utf8
+    )
+    let request = try JSONDecoder().decode(PushImageRequest.self, from: data)
+
+    #expect(request.shouldRunAsync)
+  }
+
+  @Test
   func registryRequestValidation() {
     let loginValid = RegistryLoginRequest(registry: "registry.example.com:5000", username: "u", password: "p")
     let loginInvalidHost = RegistryLoginRequest(registry: "bad host", username: "u", password: "p")
@@ -147,22 +166,29 @@ struct RequestValidationTests {
     let validJSON = """
     {"images":{
       "maxParallelImageBlobTransfers":16,
+      "maxParallelImageCompressions":4,
       "maxParallelImageDecompressions":2,
       "maxParallelImageDiskWrites":1
     }}
     """
-    let zeroJSON = #"{"images":{"maxParallelImageBlobTransfers":0}}"#
+    let zeroJSONs = [
+      #"{"images":{"maxParallelImageBlobTransfers":0}}"#,
+      #"{"images":{"maxParallelImageCompressions":0}}"#,
+    ]
     let tooHighJSONs = [
       #"{"images":{"maxParallelImageBlobTransfers":65}}"#,
+      #"{"images":{"maxParallelImageCompressions":33}}"#,
       #"{"images":{"maxParallelImageDecompressions":9}}"#,
       #"{"images":{"maxParallelImageDiskWrites":5}}"#,
     ]
 
     let valid = try JSONDecoder().decode(UpdateConfigRequest.self, from: Data(validJSON.utf8))
-    let zero = try JSONDecoder().decode(UpdateConfigRequest.self, from: Data(zeroJSON.utf8))
 
     #expect(valid.validate().valid)
-    #expect(zero.validate().valid == false)
+    for zeroJSON in zeroJSONs {
+      let zero = try JSONDecoder().decode(UpdateConfigRequest.self, from: Data(zeroJSON.utf8))
+      #expect(zero.validate().valid == false)
+    }
     for tooHighJSON in tooHighJSONs {
       let tooHigh = try JSONDecoder().decode(UpdateConfigRequest.self, from: Data(tooHighJSON.utf8))
       #expect(tooHigh.validate().valid == false)
@@ -173,12 +199,14 @@ struct RequestValidationTests {
   func configResponseIncludesImageParallelismSettings() {
     var config = Config.default
     config.images.maxParallelImageBlobTransfers = 16
+    config.images.maxParallelImageCompressions = 4
     config.images.maxParallelImageDecompressions = 2
     config.images.maxParallelImageDiskWrites = 1
 
     let response = ConfigResponse(from: config)
 
     #expect(response.images.maxParallelImageBlobTransfers == 16)
+    #expect(response.images.maxParallelImageCompressions == 4)
     #expect(response.images.maxParallelImageDecompressions == 2)
     #expect(response.images.maxParallelImageDiskWrites == 1)
   }

@@ -31,6 +31,7 @@ struct ConfigTests {
       config.api.port = 19090
       config.logging.level = "debug"
       config.images.maxParallelImageBlobTransfers = 12
+      config.images.maxParallelImageCompressions = 4
       config.images.maxParallelImageDecompressions = 3
       config.images.maxParallelImageDiskWrites = 2
 
@@ -40,6 +41,7 @@ struct ConfigTests {
       #expect(loaded.api.port == 19090)
       #expect(loaded.logging.level == "debug")
       #expect(loaded.images.maxParallelImageBlobTransfers == 12)
+      #expect(loaded.images.maxParallelImageCompressions == 4)
       #expect(loaded.images.maxParallelImageDecompressions == 3)
       #expect(loaded.images.maxParallelImageDiskWrites == 2)
     }
@@ -89,6 +91,7 @@ struct ConfigTests {
     let config = try JSONDecoder().decode(Config.self, from: Data(json.utf8))
 
     #expect(config.images.maxParallelImageBlobTransfers == 16)
+    #expect(config.images.maxParallelImageCompressions == 4)
     #expect(config.images.maxParallelImageDecompressions == 2)
     #expect(config.images.maxParallelImageDiskWrites == 1)
   }
@@ -96,6 +99,8 @@ struct ConfigTests {
   @Test(arguments: [
     #""maxParallelImageBlobTransfers": 0"#,
     #""maxParallelImageBlobTransfers": 65"#,
+    #""maxParallelImageCompressions": 0"#,
+    #""maxParallelImageCompressions": 33"#,
     #""maxParallelImageDecompressions": 0"#,
     #""maxParallelImageDecompressions": 9"#,
     #""maxParallelImageDiskWrites": 0"#,

@@ -2,6 +2,8 @@ import CryptoKit
 import Darwin
 import Foundation
 
+// swiftlint:disable file_length
+
 let jeballtoImageArtifactType = "application/vnd.jeballto.vm.bundle"
 let jeballtoImageConfigMediaType = "application/vnd.jeballto.vm.bundle.config+json"
 let jeballtoImageChunkMediaType = "application/vnd.jeballto.vm.bundle.chunk+zstd"
@@ -83,6 +85,15 @@ typealias VMImageLayerFetcher = @Sendable (
   _ chunk: VMImagePackedChunk,
   _ destinationPath: String
 ) async throws -> Void
+
+struct VMImagePackProgressUpdate: Sendable {
+  let chunksCompletedDelta: Int?
+  let chunksTotal: Int?
+  let bytesCompletedDelta: UInt64?
+  let bytesTotal: UInt64?
+}
+
+typealias VMImagePackProgressSink = @Sendable (VMImagePackProgressUpdate) async -> Void
 
 enum VMImagePackagerError: Error, LocalizedError {
   case invalidBundle(String)
@@ -345,27 +356,31 @@ struct VMImagePackager {
   func packBundle(
     bundlePath: String,
     stagingRoot: String,
-    timeout: TimeInterval? = nil
+    timeout: TimeInterval? = nil,
+    progressSink: VMImagePackProgressSink? = nil
   ) async throws -> VMImagePackage {
     let stagingDirectory = "\(stagingRoot)/vm-image-\(UUID().uuidString)"
     return try await packBundle(
       bundlePath: bundlePath,
       stagingDirectory: stagingDirectory,
       removeStagingDirectoryOnFailure: true,
-      timeout: timeout
+      timeout: timeout,
+      progressSink: progressSink
     )
   }
 
   func packBundle(
     bundlePath: String,
     stagingDirectory: String,
-    timeout: TimeInterval? = nil
+    timeout: TimeInterval? = nil,
+    progressSink: VMImagePackProgressSink? = nil
   ) async throws -> VMImagePackage {
     try await packBundle(
       bundlePath: bundlePath,
       stagingDirectory: stagingDirectory,
       removeStagingDirectoryOnFailure: false,
-      timeout: timeout
+      timeout: timeout,
+      progressSink: progressSink
     )
   }
 
@@ -400,7 +415,8 @@ struct VMImagePackager {
     bundlePath: String,
     stagingDirectory: String,
     removeStagingDirectoryOnFailure: Bool,
-    timeout: TimeInterval?
+    timeout: TimeInterval?,
+    progressSink: VMImagePackProgressSink?
   ) async throws -> VMImagePackage {
     guard chunkSize > 0 else { throw VMImagePackagerError.invalidConfig("Chunk size must be positive") }
 
@@ -412,21 +428,40 @@ struct VMImagePackager {
       guard !relativeFiles.isEmpty else {
         throw VMImagePackagerError.invalidBundle("No files found in \(bundlePath)")
       }
+      let files = try relativeFiles.map { relativePath in
+        let absolutePath = "\(bundlePath)/\(relativePath)"
+        return try (relativePath: relativePath, fileSize: Self.fileSize(atPath: absolutePath, fileManager: fileManager))
+      }
+      let totalChunks = files.reduce(0) { total, file in
+        total + chunkCount(forFileSize: file.fileSize)
+      }
+      let totalBytes = files.reduce(UInt64(0)) { total, file in
+        total + file.fileSize
+      }
+      await progressSink?(
+        VMImagePackProgressUpdate(
+          chunksCompletedDelta: nil,
+          chunksTotal: totalChunks,
+          bytesCompletedDelta: nil,
+          bytesTotal: totalBytes
+        )
+      )
 
       let cachedFilesByPath = try decodeCachedFilesByPath(stagingDirectory: stagingDirectory)
       var packedFiles: [VMImagePackedFile] = []
       var layers: [VMImageLayer] = []
 
-      for relativePath in relativeFiles {
+      for file in files {
+        let relativePath = file.relativePath
         let absolutePath = "\(bundlePath)/\(relativePath)"
-        let fileSize = try Self.fileSize(atPath: absolutePath, fileManager: fileManager)
         let packed = try await packFile(
           absolutePath: absolutePath,
           relativePath: relativePath,
-          fileSize: fileSize,
+          fileSize: file.fileSize,
           chunksDirectory: chunksDirectory,
           cachedFile: cachedFilesByPath[relativePath],
-          timeout: timeout
+          timeout: timeout,
+          progressSink: progressSink
         )
         packedFiles.append(packed.file)
         layers.append(contentsOf: packed.layers)
@@ -568,9 +603,10 @@ struct VMImagePackager {
     fileSize: UInt64,
     chunksDirectory: String,
     cachedFile: VMImagePackedFile?,
-    timeout: TimeInterval?
+    timeout: TimeInterval?,
+    progressSink: VMImagePackProgressSink?
   ) async throws -> (file: VMImagePackedFile, layers: [VMImageLayer]) {
-    let chunkCount = fileSize == 0 ? 1 : Int((fileSize + chunkSize - 1) / chunkSize)
+    let chunkCount = chunkCount(forFileSize: fileSize)
     var results: [PackedChunkResult] = []
     results.reserveCapacity(chunkCount)
     let zstdClient = zstdClient
@@ -608,6 +644,14 @@ struct VMImagePackager {
       do {
         while let result = try await group.next() {
           results.append(result)
+          await progressSink?(
+            VMImagePackProgressUpdate(
+              chunksCompletedDelta: 1,
+              chunksTotal: nil,
+              bytesCompletedDelta: result.chunk.uncompressedSize,
+              bytesTotal: nil
+            )
+          )
           if nextIndex < chunkCount {
             let index = nextIndex
             let request = PackChunkRequest(
@@ -638,6 +682,10 @@ struct VMImagePackager {
     let chunks = orderedResults.map(\.chunk)
     let layers = orderedResults.compactMap(\.layer)
     return (VMImagePackedFile(path: relativePath, size: fileSize, chunks: chunks), layers)
+  }
+
+  private func chunkCount(forFileSize fileSize: UInt64) -> Int {
+    fileSize == 0 ? 1 : Int((fileSize + chunkSize - 1) / chunkSize)
   }
 
   private func decodeCachedFilesByPath(stagingDirectory: String) throws -> [String: VMImagePackedFile] {

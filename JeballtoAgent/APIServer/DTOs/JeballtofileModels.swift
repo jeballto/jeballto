@@ -11,7 +11,7 @@ struct JeballtofileRequest: Codable {
 
   func validate() -> (valid: Bool, error: String?) {
     guard VMNameValidator.validate(name) else {
-      return (false, "Invalid VM name. Must be 1-100 characters, alphanumeric, hyphens, and underscores only")
+      return (false, "Invalid VM name. Must be 1-100 characters, alphanumeric, hyphens, underscores, spaces, and dots")
     }
 
     if steps.isEmpty {

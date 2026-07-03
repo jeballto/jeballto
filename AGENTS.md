@@ -67,7 +67,7 @@ JeballtoAgent.docc/Articles/      - DocC docs (Architecture, APIReference, Jebal
 
 ```
 GET  /v1/health                                   - health check
-GET  /v1/system/info                              - system info + uptime
+POST /v1/system/reset                             - reset local state
 GET  /v1/vms                                      - list VMs (limit, offset)
 POST /v1/vms                                      - create VM
 GET  /v1/vms/{id}                                 - get VM
@@ -78,15 +78,23 @@ POST /v1/vms/{id}/start|stop|pause|resume|clone   - lifecycle
 POST /v1/vms/{id}/install                         - start macOS install (auto-downloads IPSW)
 GET  /v1/vms/{id}/install/status                  - install progress
 POST /v1/vms/{id}/execute                         - SSH command execution
-POST /v1/vms/{id}/keystroke                       - GUI keystroke injection
+POST /v1/vms/{id}/keystrokes                      - GUI keystroke injection
 GET  /v1/vms/{id}/screenshot                      - GUI screenshot
 GET  /v1/images                                   - list local OCI images
 POST /v1/images/pull                              - pull OCI image (via oras)
+GET  /v1/images/pull/{id}/status                  - async pull progress
+DELETE /v1/images/pull/{id}                       - cancel async pull
 POST /v1/images/push                              - push VM as OCI image
+GET  /v1/images/push/{id}/status                  - async push progress
+DELETE /v1/images/push/{id}                       - cancel async push
 DELETE /v1/images/{id}                            - delete image
-POST /v1/registries/auth                          - configure registry credentials
-POST /v1/vms/{id}/jeballtofile                    - run blueprint
-GET  /v1/vms/{id}/jeballtofile/executions/{eid}   - blueprint execution status
+POST /v1/registries/login                         - configure registry credentials
+POST /v1/registries/logout                        - remove registry credentials
+POST /v1/jeballtofiles                            - run blueprint
+GET  /v1/jeballtofiles                            - list blueprint executions
+GET  /v1/jeballtofiles/{id}                       - blueprint execution status
+POST /v1/jeballtofiles/{id}/cancel                - cancel blueprint execution
+DELETE /v1/jeballtofiles/{id}                     - delete blueprint execution
 GET  /v1/config                                   - get config
 PATCH /v1/config                                  - update config
 GET  /v1/auth/verify                              - verify auth token
@@ -101,6 +109,7 @@ GET  /v1/auth/verify                              - verify auth token
 - `VMNetworkResponse`: macAddress, sshPort, vncPort, natIP
 - `HealthResponse`: status, version, vmsTotal, vmsRunning, uptime
 - `InstallStatusResponse`: vmId, status, progress, phaseProgress, message, phase, bytesDownloaded, bytesTotal, downloadSpeed
+- `ImageOperationStatusResponse`: operationId, type, reference, source, status, stage, progress, stageProgress, averageSpeedMBps, chunksCompleted, chunksTotal, bytesCompleted, bytesTotal, startedAt, updatedAt, completedAt, digest, image, error
 - `ErrorResponse`: error.code, error.message, error.details
 
 ### EventBus event types (VMEvent enum)
@@ -130,7 +139,7 @@ Jeballtofiles: `jeballtofileStarted`, `jeballtofileStepStarted`, `jeballtofileSt
 - storage: vmStorageDir, databasePath=vms.json, imageIndexPath=images.json
 - logging: level="info", enableFileLogging=true, retentionDays=7, maxTotalSize="2GB", timezone=nil (IANA identifier, nil=system TZ)
 - networking: sshPortRange=2222-2223, autoEnableSSHForwarding=true, vncPortRange=5901-5902
-- images: imageStorageDir, orasPath (nil=bundled binary), defaultRegistry (nil), insecureRegistries=[]
+- images: imageStorageDir, orasPath (nil=bundled binary), maxParallelImageBlobTransfers=16, maxParallelImageCompressions=4, maxParallelImageDecompressions=2, maxParallelImageDiskWrites=1, defaultRegistry (nil), insecureRegistries=[]
 
 ### Key paths
 
@@ -145,7 +154,7 @@ Via `oras` CLI (not Docker). VMs stored as OCI artifacts (.bundle dirs). `ImageR
 
 ### Jeballtofiles (blueprints)
 
-Declarative JSON/YAML. Step types: create, install, wait, execute (SSH), keystroke. `JeballtofileExecutor` runs sequentially, publishes step events, supports cancellation. Cancellation marks the current step and execution as `cancelled` and publishes `JEBALLTOFILE_CANCELLED`.
+Declarative JSON/YAML. Step types: create, install, wait, execute (SSH), keystrokes. `JeballtofileExecutor` runs sequentially, publishes step events, supports cancellation. Cancellation marks the current step and execution as `cancelled` and publishes `JEBALLTOFILE_CANCELLED`.
 
 ### SSH execution
 

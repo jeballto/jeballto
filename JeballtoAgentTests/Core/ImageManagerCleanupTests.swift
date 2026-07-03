@@ -97,6 +97,7 @@ struct ImageManagerCleanupTests {
       var config = Config.default
       config.images.imageStorageDir = root
       config.images.maxParallelImageBlobTransfers = 1
+      config.images.maxParallelImageCompressions = 1
       config.images.maxParallelImageDecompressions = 1
       config.images.maxParallelImageDiskWrites = 1
       config.storage.imageIndexPath = "\(root)/images.json"
@@ -109,6 +110,7 @@ struct ImageManagerCleanupTests {
 
       var updatedConfig = config
       updatedConfig.images.maxParallelImageBlobTransfers = 7
+      updatedConfig.images.maxParallelImageCompressions = 4
       updatedConfig.images.maxParallelImageDecompressions = 4
       updatedConfig.images.maxParallelImageDiskWrites = 2
       updatedConfig.images.insecureRegistries = ["registry.example.com"]
@@ -118,6 +120,7 @@ struct ImageManagerCleanupTests {
 
       let imageConfig = await manager.currentImageConfig()
       #expect(imageConfig.maxParallelImageBlobTransfers == 7)
+      #expect(imageConfig.maxParallelImageCompressions == 4)
       #expect(imageConfig.maxParallelImageDecompressions == 4)
       #expect(imageConfig.maxParallelImageDiskWrites == 2)
       #expect(imageConfig.insecureRegistries == ["registry.example.com"])
@@ -156,14 +159,19 @@ struct ImageManagerCleanupTests {
 
   @Test
   func imageOperationDeadlineCancelsWholeOperation() async {
-    let startedAt = Date()
+    let recorder = CancellationRecorder()
 
     do {
       _ = try await ImageManager.withImageOperationDeadline(
         timeout: 0.05,
         operationName: "test image operation"
       ) {
-        try await Task.sleep(nanoseconds: 5_000_000_000)
+        do {
+          try await Task.sleep(nanoseconds: 5_000_000_000)
+        } catch is CancellationError {
+          await recorder.markCancelled()
+          throw CancellationError()
+        }
         return true
       }
       Issue.record("Expected image operation deadline to throw")
@@ -177,7 +185,7 @@ struct ImageManagerCleanupTests {
       Issue.record("Expected OrasError.timeout, got \(error)")
     }
 
-    #expect(Date().timeIntervalSince(startedAt) < 1)
+    #expect(await recorder.wasCancelled())
   }
 
   @Test
@@ -387,5 +395,17 @@ private actor OperationCacheRecorder {
 
   func maxActiveSameKeyWork() -> Int {
     maxActiveSameKeyWorkValue
+  }
+}
+
+private actor CancellationRecorder {
+  private var cancelled = false
+
+  func markCancelled() {
+    cancelled = true
+  }
+
+  func wasCancelled() -> Bool {
+    cancelled
   }
 }

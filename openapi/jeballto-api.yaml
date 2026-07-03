@@ -128,7 +128,9 @@ paths:
       summary: Wipe all VMs
       description: >
         Delete all VMs and clear the database. Requires confirm=true query
-        parameter as a safety guard. Each VM is force-stopped before deletion.
+        parameter as a safety guard. Active asynchronous image operations are
+        cancelled before VM deletion starts. Each VM is force-stopped before
+        deletion.
       operationId: wipeAllVMs
       parameters:
         - name: confirm
@@ -1077,7 +1079,8 @@ paths:
       summary: Wipe all images
       description: >
         Delete all locally stored OCI images. Requires confirm=true query
-        parameter as a safety guard.
+        parameter as a safety guard. Active asynchronous image operations are
+        cancelled before image deletion starts.
       operationId: wipeAllImages
       parameters:
         - name: confirm
@@ -1139,7 +1142,8 @@ paths:
       tags:
         - images
       summary: Delete image
-      description: Delete a locally stored OCI image and its files
+      description: Delete a locally stored OCI image and its files. Returns 409
+        if the image is the source of an active push operation.
       operationId: deleteImage
       parameters:
         - $ref: '#/components/parameters/imageId'
@@ -1152,6 +1156,12 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          description: Image is in use
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -1162,9 +1172,11 @@ paths:
       summary: Pull image
       description: >
         Pull an OCI image from a registry. If the image already exists locally,
-        returns the existing record without re-pulling. Synchronous - blocks
-        until pull completes. By default there is no timeout (unlimited).
-        Use the optional `timeout` field to set a limit in seconds.
+        returns the existing record without re-pulling. By default this blocks
+        until pull completes. Set `async` to true to start the pull in the
+        background and poll `/images/pull/{operationId}/status`.
+        By default there is no timeout (unlimited). Use the optional `timeout`
+        field to set a limit in seconds.
       operationId: pullImage
       requestBody:
         required: true
@@ -1175,6 +1187,12 @@ paths:
       responses:
         '200':
           description: Image pulled (or already local)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImagePullResponse'
+        '202':
+          description: Image pull started asynchronously
           content:
             application/json:
               schema:
@@ -1198,6 +1216,62 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /images/pull/{operationId}:
+    delete:
+      tags:
+        - images
+      summary: Cancel image pull
+      description: Cancel a running asynchronous image pull operation.
+      operationId: cancelImagePull
+      parameters:
+        - $ref: '#/components/parameters/imageOperationId'
+      responses:
+        '200':
+          description: Image pull cancellation requested
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImageOperationStatusResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Image pull operation is not running
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /images/pull/{operationId}/status:
+    get:
+      tags:
+        - images
+      summary: Get image pull status
+      description: Get progress for an asynchronous image pull operation.
+      operationId: getImagePullStatus
+      parameters:
+        - $ref: '#/components/parameters/imageOperationId'
+      responses:
+        '200':
+          description: Image pull operation status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImageOperationStatusResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
   /images/push:
     post:
       tags:
@@ -1210,8 +1284,10 @@ paths:
         A connectivity check is performed before compression begins to fail fast
         if the registry is unreachable.
         The bundle is split into zstd-compressed chunks during transfer.
-        By default there is no timeout (unlimited). Use the optional
-        `timeout` field to set a limit in seconds.
+        By default this blocks until push completes. Set `async` to true to
+        start the push in the background and poll
+        `/images/push/{operationId}/status`. By default there is no timeout
+        (unlimited). Use the optional `timeout` field to set a limit in seconds.
       operationId: pushImage
       requestBody:
         required: true
@@ -1222,6 +1298,12 @@ paths:
       responses:
         '200':
           description: Image pushed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImagePushResponse'
+        '202':
+          description: Image push started asynchronously
           content:
             application/json:
               schema:
@@ -1258,6 +1340,62 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+
+  /images/push/{operationId}:
+    delete:
+      tags:
+        - images
+      summary: Cancel image push
+      description: Cancel a running asynchronous image push operation.
+      operationId: cancelImagePush
+      parameters:
+        - $ref: '#/components/parameters/imageOperationId'
+      responses:
+        '200':
+          description: Image push cancellation requested
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImageOperationStatusResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Image push operation is not running
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /images/push/{operationId}/status:
+    get:
+      tags:
+        - images
+      summary: Get image push status
+      description: Get progress for an asynchronous image push operation.
+      operationId: getImagePushStatus
+      parameters:
+        - $ref: '#/components/parameters/imageOperationId'
+      responses:
+        '200':
+          description: Image push operation status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImageOperationStatusResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
 
   /registries/login:
     post:
@@ -1479,7 +1617,8 @@ paths:
         Reset the agent to a clean state. Soft mode deletes all VMs, images, and
         the IPSW cache but keeps configuration and logs. Hard mode deletes everything
         the application stores and terminates the process so the next startup is
-        completely fresh. Requires confirm=true as a safety guard.
+        completely fresh. Active asynchronous image operations are cancelled
+        before reset cleanup starts. Requires confirm=true as a safety guard.
       operationId: systemReset
       parameters:
         - name: confirm
@@ -1560,6 +1699,14 @@ components:
       name: id
       in: path
       description: Image identifier (UUID)
+      required: true
+      schema:
+        type: string
+        format: uuid
+    imageOperationId:
+      name: operationId
+      in: path
+      description: Image operation identifier (UUID)
       required: true
       schema:
         type: string
@@ -2225,6 +2372,13 @@ components:
             Timeout in seconds for the pull operation. If omitted or null,
             the operation runs without a time limit (unlimited).
           example: 3600
+        async:
+          type: boolean
+          nullable: true
+          default: false
+          description: >
+            When true, return immediately with an operation ID and run the pull
+            in the background.
 
     PushImageRequest:
       type: object
@@ -2250,6 +2404,13 @@ components:
             Timeout in seconds for the push operation. If omitted or null,
             the operation runs without a time limit (unlimited).
           example: 7200
+        async:
+          type: boolean
+          nullable: true
+          default: false
+          description: >
+            When true, return immediately with an operation ID and run the push
+            in the background.
 
     RegistryLoginRequest:
       type: object
@@ -2367,6 +2528,15 @@ components:
           type: string
           nullable: true
           description: Status message
+        operationId:
+          type: string
+          format: uuid
+          nullable: true
+          description: Async operation ID, present when `async` is true
+        statusUrl:
+          type: string
+          nullable: true
+          description: Relative URL for polling async operation status
 
     ImagePushResponse:
       type: object
@@ -2391,6 +2561,156 @@ components:
           type: string
           nullable: true
           description: Status message
+        operationId:
+          type: string
+          format: uuid
+          nullable: true
+          description: Async operation ID, present when `async` is true
+        statusUrl:
+          type: string
+          nullable: true
+          description: Relative URL for polling async operation status
+
+    ImageOperationStatusResponse:
+      type: object
+      required:
+        - operationId
+        - type
+        - reference
+        - status
+        - chunksCompleted
+        - bytesCompleted
+        - startedAt
+        - updatedAt
+      properties:
+        operationId:
+          type: string
+          format: uuid
+          description: Async image operation identifier
+        type:
+          type: string
+          enum:
+            - pull
+            - push
+          description: Image operation type
+        reference:
+          type: string
+          description: OCI image reference
+        source:
+          type: string
+          nullable: true
+          description: Push source, if this is a push operation
+        status:
+          type: string
+          enum:
+            - started
+            - running
+            - cancelling
+            - completed
+            - failed
+            - cancelled
+          description: Current operation status. `cancelling` means cancellation was requested and cleanup is still running.
+        stage:
+          type: string
+          enum:
+            - compressing
+            - uploading
+          nullable: true
+          description: >
+            Current push stage, when a push has started compression or upload
+            work. Pull operations do not report a single stage because blob
+            fetches, decompression, disk writes, and validation can overlap.
+        progress:
+          type: number
+          format: double
+          nullable: true
+          minimum: 0
+          maximum: 1
+          description: >
+            Overall progress from 0.0 to 1.0, rounded to two decimal places,
+            when known. Pull progress is based on completed compressed OCI
+            artifact bytes. Push compression and upload each account for half
+            of the overall progress.
+        stageProgress:
+          type: number
+          format: double
+          nullable: true
+          minimum: 0
+          maximum: 1
+          description: >
+            Current push stage progress from 0.0 to 1.0, rounded to two
+            decimal places, when known. Pull operations leave this null.
+        averageSpeedMBps:
+          type: number
+          format: double
+          nullable: true
+          minimum: 0
+          description: >
+            Average artifact-flow speed in MB/s, rounded to two decimal places,
+            when known. This is not system network throughput. Pull has no
+            exclusive stages, so this is full-flow speed: completed compressed
+            OCI artifact bytes over the pull operation timeline. Push has
+            sequential stages, so this is per-stage speed: uncompressed VM
+            bundle bytes while compressing, then compressed OCI blob bytes while
+            uploading.
+        chunksCompleted:
+          type: integer
+          minimum: 0
+          description: >
+            Number of completed chunk units. Pull counts completed compressed
+            chunk blobs. Push counts local chunks while compressing, then
+            compressed OCI blobs while uploading.
+        chunksTotal:
+          type: integer
+          nullable: true
+          minimum: 0
+          description: >
+            Total chunk units expected, when known. Pull uses the number of
+            chunk layers in the manifest. Push uses the current stage total.
+        bytesCompleted:
+          type: integer
+          format: int64
+          minimum: 0
+          description: >
+            Bytes completed for the operation or current push stage. Pull
+            counts completed compressed OCI artifact bytes, including the config
+            blob. Push counts uncompressed VM bundle bytes while compressing,
+            then compressed OCI blob bytes while uploading.
+        bytesTotal:
+          type: integer
+          format: int64
+          nullable: true
+          minimum: 0
+          description: >
+            Total bytes expected for the operation or current push stage, when
+            known. Pull uses compressed OCI artifact bytes. Push uses the
+            current stage total.
+        startedAt:
+          type: string
+          format: date-time
+          description: Operation start time
+        updatedAt:
+          type: string
+          format: date-time
+          description: Last status update time
+        completedAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: Completion, failure, or cancellation time
+        digest:
+          type: string
+          nullable: true
+          description: Image digest once available
+        image:
+          allOf:
+            - $ref: '#/components/schemas/ImageResponse'
+          nullable: true
+          description: Completed image record, when available
+        error:
+          type: string
+          nullable: true
+          description: Failure or cancellation message
 
     ConfigResponse:
       type: object
@@ -2480,6 +2800,7 @@ components:
           required:
             - insecureRegistries
             - maxParallelImageBlobTransfers
+            - maxParallelImageCompressions
             - maxParallelImageDecompressions
             - maxParallelImageDiskWrites
           properties:
@@ -2499,6 +2820,13 @@ components:
               description: >
                 Maximum number of OCI image blob transfers to run concurrently.
                 This controls ORAS blob fetch and push processes. Default is 16.
+            maxParallelImageCompressions:
+              type: integer
+              minimum: 1
+              maximum: 32
+              description: >
+                Maximum number of image chunks to compress concurrently while pushing.
+                Default is 4.
             maxParallelImageDecompressions:
               type: integer
               minimum: 1
@@ -2586,6 +2914,13 @@ components:
               description: >
                 Maximum number of OCI image blob transfers to run concurrently.
                 This controls ORAS blob fetch and push processes. Default is 16.
+            maxParallelImageCompressions:
+              type: integer
+              minimum: 1
+              maximum: 32
+              description: >
+                Maximum number of image chunks to compress concurrently while pushing.
+                Default is 4.
             maxParallelImageDecompressions:
               type: integer
               minimum: 1

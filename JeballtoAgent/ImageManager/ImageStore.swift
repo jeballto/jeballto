@@ -1,7 +1,7 @@
 import Foundation
 
 /// A locally stored OCI image record
-struct ImageRecord: Codable, Identifiable, Equatable {
+struct ImageRecord: Codable, Identifiable, Equatable, Sendable {
   let id: UUID
   var reference: String
   var digest: String?
@@ -33,7 +33,7 @@ struct ImageRecord: Codable, Identifiable, Equatable {
 }
 
 /// Top-level image index structure
-struct ImageIndex: Codable {
+struct ImageIndex: Codable, Sendable {
   var version: Int
   var images: [UUID: ImageRecord]
 

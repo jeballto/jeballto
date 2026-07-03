@@ -13,6 +13,7 @@ enum ImageManagerError: Error, LocalizedError {
   case invalidReference(String)
   case registryUnreachable(String)
   case timeout(String)
+  case imageInUse(String)
 
   var errorDescription: String? {
     switch self {
@@ -24,6 +25,7 @@ enum ImageManagerError: Error, LocalizedError {
     case .invalidReference(let msg): "Invalid image reference: \(msg)"
     case .registryUnreachable(let msg): "Registry unreachable: \(msg)"
     case .timeout(let msg): "Image operation timed out: \(msg)"
+    case .imageInUse(let msg): "Image is in use: \(msg)"
     }
   }
 }
@@ -35,6 +37,10 @@ actor ImageManager {
   private struct PushBlobCandidate: Sendable {
     let descriptor: OrasDescriptor
     let filePath: String
+  }
+
+  private struct PushBlobUploadResult: Sendable {
+    let descriptor: OrasDescriptor
   }
 
   private struct PushUploadState: Codable, Sendable {
@@ -54,8 +60,11 @@ actor ImageManager {
   private var orasClient: OrasClient
   private let eventBus: EventBus
   private var config: Config
+  private var imageExportReservations: [UUID: Set<UUID>] = [:]
+  private var deletingImageIds: Set<UUID> = []
   private let operationCache = ImageOperationCache()
   private let blobCache = ImageBlobCache()
+  private let operationTracker = ImageOperationTracker()
 
   init(imageStore: ImageStore, orasClient: OrasClient, eventBus: EventBus, config: Config) {
     self.imageStore = imageStore
@@ -205,6 +214,60 @@ actor ImageManager {
     return record
   }
 
+  // MARK: - Async operation status
+
+  func startImageOperation(
+    kind: ImageOperationKind,
+    reference: String,
+    source: String? = nil
+  ) async -> ImageOperationStatus {
+    await operationTracker.start(kind: kind, reference: reference, source: source)
+  }
+
+  func progressSink(for operationId: UUID) async -> ImageOperationProgressSink {
+    let tracker = operationTracker
+    return { update in
+      await tracker.update(operationId, update)
+    }
+  }
+
+  func completeImageOperation(_ operationId: UUID, record: ImageRecord) async {
+    await operationTracker.complete(operationId, record: record)
+  }
+
+  func failImageOperation(_ operationId: UUID, error: Error) async {
+    await operationTracker.fail(operationId, error: error)
+  }
+
+  @discardableResult
+  func cancelImageOperation(_ operationId: UUID) async -> Bool {
+    await operationTracker.cancel(operationId)
+  }
+
+  func getImageOperationStatus(_ operationId: UUID) async -> ImageOperationStatus? {
+    await operationTracker.get(operationId)
+  }
+
+  func claimImageExport(_ id: UUID) throws -> UUID {
+    guard !deletingImageIds.contains(id) else {
+      throw ImageManagerError.imageInUse("Image \(id.uuidString) is being deleted")
+    }
+
+    let token = UUID()
+    imageExportReservations[id, default: []].insert(token)
+    return token
+  }
+
+  func releaseImageExport(_ id: UUID, token: UUID) {
+    guard var tokens = imageExportReservations[id] else { return }
+    tokens.remove(token)
+    if tokens.isEmpty {
+      imageExportReservations.removeValue(forKey: id)
+    } else {
+      imageExportReservations[id] = tokens
+    }
+  }
+
   // MARK: - Pull
 
   /// Pulls an OCI artifact from a registry and stores it in the local image store.
@@ -213,7 +276,11 @@ actor ImageManager {
   /// into a `.bundle` directory named after the image UUID.
   /// If the image already exists locally (same reference), returns the existing record immediately
   /// without network access - this is intentional for CI/CD idempotency.
-  func pullImage(reference: String, timeout: TimeInterval? = nil) async throws -> ImageRecord {
+  func pullImage(
+    reference: String,
+    timeout: TimeInterval? = nil,
+    progressSink: ImageOperationProgressSink? = nil
+  ) async throws -> ImageRecord {
     let parsed: ImageReference
     do {
       parsed = try ImageReference.parse(reference)
@@ -252,7 +319,8 @@ actor ImageManager {
           parsed: parsed,
           imageId: imageId,
           localDir: localDir,
-          timeout: timeout
+          timeout: timeout,
+          progressSink: progressSink
         )
       }
     } catch is CancellationError {
@@ -287,7 +355,8 @@ actor ImageManager {
   func pushImageFromVM(
     reference: String,
     vmBundlePath: String,
-    timeout: TimeInterval? = nil
+    timeout: TimeInterval? = nil,
+    progressSink: ImageOperationProgressSink? = nil
   ) async throws -> ImageRecord {
     let parsed: ImageReference
     do {
@@ -307,7 +376,8 @@ actor ImageManager {
         try await self.performPushImageFromVM(
           parsed: parsed,
           vmBundlePath: vmBundlePath,
-          timeout: timeout
+          timeout: timeout,
+          progressSink: progressSink
         )
       }
     } catch is CancellationError {
@@ -327,7 +397,24 @@ actor ImageManager {
   }
 
   /// Re-pushes an existing local image to a (possibly different) registry reference
-  func pushImage(reference: String, imageId: UUID, timeout: TimeInterval? = nil) async throws -> ImageRecord {
+  func pushImage(
+    reference: String,
+    imageId: UUID,
+    timeout: TimeInterval? = nil,
+    progressSink: ImageOperationProgressSink? = nil,
+    claimSource: Bool = true
+  ) async throws -> ImageRecord {
+    let exportToken: UUID? = if claimSource {
+      try claimImageExport(imageId)
+    } else {
+      nil
+    }
+    defer {
+      if let exportToken {
+        releaseImageExport(imageId, token: exportToken)
+      }
+    }
+
     guard let existing = await imageStore.getImage(id: imageId) else {
       throw ImageManagerError.imageNotFoundById(imageId)
     }
@@ -351,7 +438,8 @@ actor ImageManager {
           parsed: parsed,
           sourceImageId: imageId,
           existing: existing,
-          timeout: timeout
+          timeout: timeout,
+          progressSink: progressSink
         )
       }
     } catch is CancellationError {
@@ -373,6 +461,21 @@ actor ImageManager {
   // MARK: - Delete
 
   func deleteImage(id: UUID) async throws {
+    if let reservations = imageExportReservations[id], !reservations.isEmpty {
+      throw ImageManagerError.imageInUse("Image \(id.uuidString) is being pushed")
+    }
+    guard deletingImageIds.insert(id).inserted else {
+      throw ImageManagerError.imageInUse("Image \(id.uuidString) is already being deleted")
+    }
+    defer {
+      deletingImageIds.remove(id)
+    }
+
+    let pushSource = "image:\(id.uuidString)"
+    if await operationTracker.hasActiveOperation(source: pushSource) {
+      throw ImageManagerError.imageInUse("Image \(id.uuidString) has an active push operation")
+    }
+
     guard let record = await imageStore.getImage(id: id) else {
       throw ImageManagerError.imageNotFoundById(id)
     }
@@ -437,7 +540,8 @@ actor ImageManager {
     parsed: ImageReference,
     imageId: UUID,
     localDir: String,
-    timeout: TimeInterval?
+    timeout: TimeInterval?,
+    progressSink: ImageOperationProgressSink?
   ) async throws -> ImageRecord {
     try FileManager.default.createDirectory(atPath: localDir, withIntermediateDirectories: true)
 
@@ -452,12 +556,22 @@ actor ImageManager {
       )
       throw error
     }
+    let totalBytes = (manifest.configDescriptor?.size ?? 0) + manifest.layers.reduce(UInt64(0)) { total, layer in
+      total + layer.size
+    }
+    await progressSink?(
+      ImageOperationProgressUpdate(
+        chunksTotal: manifest.layers.count,
+        bytesTotal: totalBytes
+      )
+    )
     let pullResult = try await pullImageArtifact(
       parsed,
       manifest: manifest,
       localDir: localDir,
       insecure: insecure,
-      timeout: timeout
+      timeout: timeout,
+      progressSink: progressSink
     )
     try Self.validateRunnableVMBundle(atPath: localDir)
 
@@ -489,7 +603,8 @@ actor ImageManager {
   private func performPushImageFromVM(
     parsed: ImageReference,
     vmBundlePath: String,
-    timeout: TimeInterval?
+    timeout: TimeInterval?,
+    progressSink: ImageOperationProgressSink?
   ) async throws -> ImageRecord {
     let insecure = parsed.isInsecureAllowed(insecureRegistries: config.images.insecureRegistries)
     do {
@@ -503,7 +618,8 @@ actor ImageManager {
       reference: parsed,
       bundlePath: vmBundlePath,
       insecure: insecure,
-      timeout: timeout
+      timeout: timeout,
+      progressSink: progressSink
     )
 
     let imageId = UUID()
@@ -535,7 +651,8 @@ actor ImageManager {
     parsed: ImageReference,
     sourceImageId: UUID,
     existing: ImageRecord,
-    timeout: TimeInterval?
+    timeout: TimeInterval?,
+    progressSink: ImageOperationProgressSink?
   ) async throws -> ImageRecord {
     let insecure = parsed.isInsecureAllowed(insecureRegistries: config.images.insecureRegistries)
     do {
@@ -549,7 +666,8 @@ actor ImageManager {
       reference: parsed,
       bundlePath: existing.localPath,
       insecure: insecure,
-      timeout: timeout
+      timeout: timeout,
+      progressSink: progressSink
     )
 
     let newId = UUID()
@@ -582,22 +700,39 @@ actor ImageManager {
     reference: ImageReference,
     bundlePath: String,
     insecure: Bool,
-    timeout: TimeInterval?
+    timeout: TimeInterval?,
+    progressSink: ImageOperationProgressSink?
   ) async throws -> OrasPushResult {
     let packager = VMImagePackager(
       zstdClient: ZstdClient(config: config.images),
-      maxParallelChunks: VMImagePackager.automaticParallelChunkLimit()
+      maxParallelChunks: config.images.maxParallelImageCompressions
     )
     let sourceFingerprint = try packager.sourceFingerprint(bundlePath: bundlePath)
     return try await withOperationCacheAccess(for: "push:\(sourceFingerprint)") {
       let pushDir = Self.pushOperationDirectory(sourceFingerprint: sourceFingerprint)
       let packageDir = "\(pushDir)/package"
       try FileManager.default.createDirectory(atPath: packageDir, withIntermediateDirectories: true)
+      let compressionProgressSink: VMImagePackProgressSink? = if let progressSink {
+        { @Sendable update in
+          await progressSink(
+            ImageOperationProgressUpdate(
+              stage: .compressing,
+              chunksCompletedDelta: update.chunksCompletedDelta,
+              chunksTotal: update.chunksTotal,
+              bytesCompletedDelta: update.bytesCompletedDelta,
+              bytesTotal: update.bytesTotal
+            )
+          )
+        }
+      } else {
+        nil
+      }
 
       let package = try await packager.packBundle(
         bundlePath: bundlePath,
         stagingDirectory: packageDir,
-        timeout: timeout
+        timeout: timeout,
+        progressSink: compressionProgressSink
       )
 
       let pushResult = try await pushImagePackage(
@@ -605,7 +740,8 @@ actor ImageManager {
         package: package,
         insecure: insecure,
         operationDirectory: pushDir,
-        timeout: timeout
+        timeout: timeout,
+        progressSink: progressSink
       )
       try? FileManager.default.removeItem(atPath: pushDir)
       return pushResult
@@ -617,7 +753,8 @@ actor ImageManager {
     manifest: OrasManifestInfo,
     localDir: String,
     insecure: Bool,
-    timeout: TimeInterval?
+    timeout: TimeInterval?,
+    progressSink: ImageOperationProgressSink?
   ) async throws -> OrasPullResult {
     let resolvedDigest: String = if let digest = reference.digest {
       digest
@@ -631,7 +768,8 @@ actor ImageManager {
         localDir: localDir,
         resolvedDigest: resolvedDigest,
         insecure: insecure,
-        timeout: timeout
+        timeout: timeout,
+        progressSink: progressSink
       )
     }
   }
@@ -642,7 +780,8 @@ actor ImageManager {
     localDir: String,
     resolvedDigest: String,
     insecure: Bool,
-    timeout: TimeInterval?
+    timeout: TimeInterval?,
+    progressSink: ImageOperationProgressSink?
   ) async throws -> OrasPullResult {
     let pullDir = Self.pullOperationDirectory(manifestDigest: resolvedDigest)
     let blobCacheDir = "\(pullDir)/blobs"
@@ -669,6 +808,11 @@ actor ImageManager {
       orasClient: orasClient,
       blobCache: blobCache,
       timeout: timeout
+    )
+    await progressSink?(
+      ImageOperationProgressUpdate(
+        bytesCompletedDelta: configDescriptor.size
+      )
     )
     try Self.copyCachedBlob(from: configCachePath, to: configPath)
 
@@ -708,12 +852,17 @@ actor ImageManager {
         blobCache: blobCache,
         timeout: timeout
       )
+      await progressSink?(
+        ImageOperationProgressUpdate(
+          chunksCompletedDelta: 1,
+          bytesCompletedDelta: compressedSize
+        )
+      )
       try Self.copyCachedBlob(from: cachedBlobPath, to: destinationPath)
     }
 
     let packager = VMImagePackager(
       zstdClient: ZstdClient(config: config.images),
-      maxParallelChunks: VMImagePackager.automaticParallelChunkLimit(),
       maxParallelUnpackChunks: config.images.maxParallelImageBlobTransfers,
       maxParallelDecompressions: config.images.maxParallelImageDecompressions,
       maxParallelDiskWrites: config.images.maxParallelImageDiskWrites
@@ -760,7 +909,8 @@ actor ImageManager {
     package: VMImagePackage,
     insecure: Bool,
     operationDirectory: String,
-    timeout: TimeInterval?
+    timeout: TimeInterval?,
+    progressSink: ImageOperationProgressSink?
   ) async throws -> OrasPushResult {
     let repositoryReference = OrasClient.repositoryReference(reference)
     let configDescriptor = try Self.descriptor(
@@ -775,6 +925,20 @@ actor ImageManager {
     }
     let configCandidate = PushBlobCandidate(descriptor: configDescriptor, filePath: package.configPath)
     let candidates = Self.uniqueBlobCandidates([configCandidate] + layerCandidates)
+    let bytesTotal = candidates.reduce(UInt64(0)) { total, candidate in
+      total + candidate.descriptor.size
+    }
+    await progressSink?(
+      ImageOperationProgressUpdate(
+        stage: .uploading,
+        progress: 0.5,
+        stageProgress: 0,
+        setChunksCompleted: 0,
+        chunksTotal: candidates.count,
+        setBytesCompleted: 0,
+        bytesTotal: bytesTotal
+      )
+    )
     let statePath = Self.pushUploadStatePath(
       operationDirectory: operationDirectory,
       repositoryReference: repositoryReference
@@ -787,7 +951,8 @@ actor ImageManager {
       insecure: insecure,
       statePath: statePath,
       state: &state,
-      timeout: timeout
+      timeout: timeout,
+      progressSink: progressSink
     )
 
     let manifestPath = "\(operationDirectory)/manifest.json"
@@ -810,7 +975,8 @@ actor ImageManager {
     insecure: Bool,
     statePath: String,
     state: inout PushUploadState,
-    timeout: TimeInterval?
+    timeout: TimeInterval?,
+    progressSink: ImageOperationProgressSink?
   ) async throws {
     guard candidates.isEmpty == false else { return }
 
@@ -818,7 +984,7 @@ actor ImageManager {
     let orasClient = orasClient
     let initialUploadedDigests = state.uploadedDigests
 
-    try await withThrowingTaskGroup(of: String.self) { group in
+    try await withThrowingTaskGroup(of: PushBlobUploadResult.self) { group in
       var nextIndex = 0
 
       for _ in 0 ..< limit {
@@ -837,9 +1003,16 @@ actor ImageManager {
       }
 
       do {
-        while let uploadedDigest = try await group.next() {
-          state.uploadedDigests.insert(uploadedDigest)
+        while let uploadResult = try await group.next() {
+          state.uploadedDigests.insert(uploadResult.descriptor.digest)
           try Self.savePushUploadState(state, path: statePath)
+          await progressSink?(
+            ImageOperationProgressUpdate(
+              stage: .uploading,
+              chunksCompletedDelta: 1,
+              bytesCompletedDelta: uploadResult.descriptor.size
+            )
+          )
           if nextIndex < candidates.count {
             let candidate = candidates[nextIndex]
             group.addTask {
@@ -869,7 +1042,7 @@ actor ImageManager {
     alreadyUploaded: Bool,
     orasClient: OrasClient,
     timeout: TimeInterval?
-  ) async throws -> String {
+  ) async throws -> PushBlobUploadResult {
     if alreadyUploaded,
        try await orasClient.blobPresence(
          repositoryReference: repositoryReference,
@@ -877,7 +1050,7 @@ actor ImageManager {
          insecure: insecure
        ) == .exists
     {
-      return candidate.descriptor.digest
+      return PushBlobUploadResult(descriptor: candidate.descriptor)
     }
 
     if try await orasClient.blobPresence(
@@ -885,7 +1058,7 @@ actor ImageManager {
       digest: candidate.descriptor.digest,
       insecure: insecure
     ) == .exists {
-      return candidate.descriptor.digest
+      return PushBlobUploadResult(descriptor: candidate.descriptor)
     }
 
     _ = try await orasClient.pushBlob(
@@ -897,7 +1070,7 @@ actor ImageManager {
       insecure: insecure,
       timeout: timeout
     )
-    return candidate.descriptor.digest
+    return PushBlobUploadResult(descriptor: candidate.descriptor)
   }
 
   private nonisolated static func fetchBlobIntoCache(

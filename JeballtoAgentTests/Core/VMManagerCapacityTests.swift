@@ -42,6 +42,39 @@ struct VMManagerCapacityTests {
     }
   }
 
+  @Test
+  func imageExportReservationBlocksBundleMutationsUntilReleased() async throws {
+    try await withTemporaryDirectory { root in
+      let (vmManager, _) = makeManager(root: root)
+      let definition = try await vmManager.createVM(name: "exporting", resources: .default)
+
+      let exportToken = try await vmManager.claimImageExport(definition.id)
+      await #expect(throws: VMManagerError.self) {
+        try await vmManager.startVM(definition.id)
+      }
+      await #expect(throws: VMManagerError.self) {
+        try await vmManager.updateVM(
+          definition.id,
+          name: nil,
+          cpuCount: 2,
+          memorySize: nil,
+          diskSize: nil
+        )
+      }
+      await #expect(throws: VMManagerError.self) {
+        try await vmManager.deleteVM(definition.id)
+      }
+
+      await vmManager.releaseImageExport(definition.id, token: UUID())
+      await #expect(throws: VMManagerError.self) {
+        try await vmManager.deleteVM(definition.id)
+      }
+
+      await vmManager.releaseImageExport(definition.id, token: exportToken)
+      try await vmManager.deleteVM(definition.id)
+    }
+  }
+
   private func makeManager(root: String) -> (VMManager, PersistenceStore) {
     let config = makeTestConfig(root: root)
     let persistenceStore = PersistenceStore(databasePath: config.storage.databasePath)

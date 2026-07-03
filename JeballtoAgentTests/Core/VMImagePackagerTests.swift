@@ -42,6 +42,34 @@ struct VMImagePackagerTests {
   }
 
   @Test
+  func packBundleReportsCompressionProgressForEachChunk() async throws {
+    try await withTemporaryDirectory(prefix: "vm-image-packager-progress") { root in
+      let source = "\(root)/source.bundle"
+      try makeFakeBundle(at: source)
+
+      let recorder = PackProgressRecorder()
+      let packager = try makePackager(chunkSize: 1024 * 1024, maxParallelChunks: 2)
+      _ = try await packager.packBundle(
+        bundlePath: source,
+        stagingRoot: root,
+        progressSink: { update in
+          await recorder.append(update)
+        }
+      )
+
+      let updates = await recorder.all()
+      let totalUpdate = try #require(updates.first)
+      let chunkUpdates = updates.dropFirst()
+
+      #expect(totalUpdate.chunksTotal == 6)
+      #expect(totalUpdate.bytesTotal == 3_145_746)
+      #expect(chunkUpdates.count == 6)
+      #expect(chunkUpdates.reduce(0) { $0 + ($1.chunksCompletedDelta ?? 0) } == 6)
+      #expect(chunkUpdates.reduce(UInt64(0)) { $0 + ($1.bytesCompletedDelta ?? 0) } == 3_145_746)
+    }
+  }
+
+  @Test
   func versionedImageConfigIsRejected() async throws {
     try await withTemporaryDirectory(prefix: "vm-image-packager-config") { root in
       let configPath = "\(root)/vm-bundle-config.json"
@@ -832,5 +860,17 @@ struct VMImagePackagerTests {
       throw VMImagePackagerError.invalidBundle("\(path) failed: \(errorText)")
     }
     return stdout
+  }
+}
+
+private actor PackProgressRecorder {
+  private var updates: [VMImagePackProgressUpdate] = []
+
+  func append(_ update: VMImagePackProgressUpdate) {
+    updates.append(update)
+  }
+
+  func all() -> [VMImagePackProgressUpdate] {
+    updates
   }
 }

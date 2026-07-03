@@ -8,6 +8,10 @@ struct APIServerValidationPathTests {
     try JSONDecoder().decode(ErrorResponse.self, from: #require(response.body))
   }
 
+  private func decodedImageOperationStatus(_ response: HTTPResponse) throws -> ImageOperationStatusResponse {
+    try JSONDecoder().decode(ImageOperationStatusResponse.self, from: #require(response.body))
+  }
+
   @Test
   func handlersReturn400ForInvalidIdentifiersOrMissingBody() async throws {
     try await withTemporaryDirectory { root in
@@ -398,6 +402,151 @@ struct APIServerValidationPathTests {
 
       #expect(response.statusCode == 404)
       #expect(decoded.error.code == "IMAGE_NOT_FOUND")
+    }
+  }
+
+  @Test
+  func asyncPullReturnsOperationIDAndStatusRoute() async throws {
+    try await withTemporaryDirectory { root in
+      let server = makeTestAPIServer(root: root)
+      let body = Data(#"{"reference":"registry.example.com/repo:tag","async":true}"#.utf8)
+
+      let response = await server.handlePullImage(
+        HTTPRequest(method: "POST", path: "/v1/images/pull", headers: [:], body: body, queryParameters: [:])
+      )
+      let decoded = try JSONDecoder().decode(ImagePullResponse.self, from: #require(response.body))
+      let operationId = try #require(decoded.operationId)
+
+      #expect(response.statusCode == 202)
+      #expect(decoded.status == "started")
+      #expect(decoded.statusUrl == "/v1/images/pull/\(operationId)/status")
+
+      let statusResponse = await server.handleGetImagePullStatus(
+        HTTPRequest(
+          method: "GET",
+          path: "/v1/images/pull/\(operationId)/status",
+          headers: [:],
+          body: nil,
+          queryParameters: [:]
+        )
+      )
+      let status = try decodedImageOperationStatus(statusResponse)
+
+      #expect(statusResponse.statusCode == 200)
+      #expect(status.type == "pull")
+      #expect(status.operationId == operationId)
+
+      if ["started", "running"].contains(status.status) {
+        _ = await server.handleCancelImagePull(
+          HTTPRequest(
+            method: "DELETE",
+            path: "/v1/images/pull/\(operationId)",
+            headers: [:],
+            body: nil,
+            queryParameters: [:]
+          )
+        )
+      }
+    }
+  }
+
+  @Test
+  func imageOperationStatusRejectsWrongKindAndTerminalCancellation() async throws {
+    try await withTemporaryDirectory { root in
+      let server = makeTestAPIServer(root: root)
+      let operation = await server.imageManager.startImageOperation(
+        kind: .pull,
+        reference: "registry.example.com/repo:tag"
+      )
+
+      let wrongKindResponse = await server.handleGetImagePushStatus(
+        HTTPRequest(
+          method: "GET",
+          path: "/v1/images/push/\(operation.id.uuidString)/status",
+          headers: [:],
+          body: nil,
+          queryParameters: [:]
+        )
+      )
+      let cancelResponse = await server.handleCancelImagePull(
+        HTTPRequest(
+          method: "DELETE",
+          path: "/v1/images/pull/\(operation.id.uuidString)",
+          headers: [:],
+          body: nil,
+          queryParameters: [:]
+        )
+      )
+      let secondCancelResponse = await server.handleCancelImagePull(
+        HTTPRequest(
+          method: "DELETE",
+          path: "/v1/images/pull/\(operation.id.uuidString)",
+          headers: [:],
+          body: nil,
+          queryParameters: [:]
+        )
+      )
+
+      let wrongKindError = try decodedError(wrongKindResponse)
+      let cancelStatus = try decodedImageOperationStatus(cancelResponse)
+      let secondCancelError = try decodedError(secondCancelResponse)
+
+      #expect(wrongKindResponse.statusCode == 404)
+      #expect(wrongKindError.error.code == "IMAGE_OPERATION_NOT_FOUND")
+      #expect(cancelResponse.statusCode == 200)
+      #expect(cancelStatus.status == "cancelled")
+      #expect(secondCancelResponse.statusCode == 409)
+      #expect(secondCancelError.error.code == "IMAGE_OPERATION_NOT_RUNNING")
+    }
+  }
+
+  @Test
+  func asyncPushFromVMReturnsOperationIDAndCanBeCancelled() async throws {
+    try await withTemporaryDirectory { root in
+      let server = makeTestAPIServer(root: root)
+      let definition = try await server.vmManager.createVM(name: "push-vm", resources: .default)
+      let body = Data(
+        #"{"source":"vm:\#(definition.id.uuidString)","reference":"registry.example.com/repo:tag","async":true}"#.utf8
+      )
+
+      let response = await server.handlePushImage(
+        HTTPRequest(method: "POST", path: "/v1/images/push", headers: [:], body: body, queryParameters: [:])
+      )
+      let decoded = try JSONDecoder().decode(ImagePushResponse.self, from: #require(response.body))
+      let operationId = try #require(decoded.operationId)
+
+      #expect(response.statusCode == 202)
+      #expect(decoded.status == "started")
+      #expect(decoded.statusUrl == "/v1/images/push/\(operationId)/status")
+
+      let cancelResponse = await server.handleCancelImagePush(
+        HTTPRequest(
+          method: "DELETE",
+          path: "/v1/images/push/\(operationId)",
+          headers: [:],
+          body: nil,
+          queryParameters: [:]
+        )
+      )
+      let cancelStatus = try decodedImageOperationStatus(cancelResponse)
+
+      #expect(cancelResponse.statusCode == 200)
+      #expect(["cancelling", "cancelled"].contains(cancelStatus.status))
+
+      let operationUUID = try #require(UUID(uuidString: operationId))
+      var finalStatus: ImageOperationStatus?
+      for _ in 0 ..< 100 {
+        if let status = await server.imageManager.getImageOperationStatus(operationUUID), status.state.isTerminal {
+          finalStatus = status
+          break
+        }
+        try? await Task.sleep(nanoseconds: 10_000_000)
+      }
+
+      let terminalStatus = try #require(finalStatus)
+      #expect(terminalStatus.state.isTerminal)
+      #expect(terminalStatus.state != .completed)
+      try await server.vmManager.deleteVM(definition.id)
     }
   }
 }

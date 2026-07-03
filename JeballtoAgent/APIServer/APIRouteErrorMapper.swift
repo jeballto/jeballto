@@ -65,6 +65,8 @@ enum APIRouteErrorMapper {
       return HTTPResponse.error(defaultCode, message: error.localizedDescription, statusCode: 503)
     case .timeout:
       return HTTPResponse.error(defaultCode, message: error.localizedDescription, statusCode: 504)
+    case .imageInUse:
+      return HTTPResponse.error("IMAGE_IN_USE", message: error.localizedDescription, statusCode: 409)
     }
   }
 

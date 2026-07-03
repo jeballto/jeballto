@@ -45,6 +45,9 @@ actor VMManager {
   /// VM IDs that have claimed one Apple Virtualization slot while transitioning into an active state.
   private var capacityReservations: Set<UUID> = []
 
+  /// VM IDs currently being exported as OCI images.
+  private var imageExportReservations: [UUID: UUID] = [:]
+
   /// Tracks which VMs have had their SSH daemon confirmed ready this boot cycle
   private var sshReadyVMs: Set<UUID> = []
 
@@ -517,6 +520,7 @@ actor VMManager {
 
     let state = instance.currentState
     if hasResourceChanges {
+      try ensureNoImageExportReservation(for: vmId, operation: "update resources for")
       guard state == .stopped || state == .created else {
         throw VMManagerError.invalidState(
           "VM must be stopped or created to update resources (current: \(state.rawValue))"
@@ -619,6 +623,7 @@ actor VMManager {
   func startVM(_ vmId: UUID) async throws {
     let instance = try getVMInstance(vmId)
 
+    try ensureNoImageExportReservation(for: vmId, operation: "start")
     let initialState = instance.currentState
     let reserved = try reserveCapacityIfNeeded(for: vmId, currentState: initialState, operation: "start")
     defer { if reserved { releaseCapacityReservation(for: vmId) } }
@@ -1261,6 +1266,7 @@ actor VMManager {
     logInfo("Deleting VM \(vmId) (force: \(force))", category: "VMManager")
 
     let instance = try getVMInstance(vmId)
+    try ensureNoImageExportReservation(for: vmId, operation: "delete")
 
     if force {
       if let guiManager, await guiManager.isGUIOpen(vmId: vmId) {
@@ -1416,6 +1422,36 @@ actor VMManager {
 
   private func releaseCapacityReservation(for vmId: UUID) {
     capacityReservations.remove(vmId)
+  }
+
+  @discardableResult
+  func claimImageExport(_ vmId: UUID) throws -> UUID {
+    let instance = try getVMInstance(vmId)
+    let state = instance.currentState
+    guard state == .stopped || state == .created else {
+      throw VMManagerError.invalidState(
+        "VM must be stopped or created before image export (current: \(state.rawValue))"
+      )
+    }
+    guard imageExportReservations[vmId] == nil else {
+      throw VMManagerError.invalidState("VM image export already in progress")
+    }
+
+    let token = UUID()
+    imageExportReservations[vmId] = token
+    return token
+  }
+
+  func releaseImageExport(_ vmId: UUID, token: UUID) {
+    if imageExportReservations[vmId] == token {
+      imageExportReservations.removeValue(forKey: vmId)
+    }
+  }
+
+  private func ensureNoImageExportReservation(for vmId: UUID, operation: String) throws {
+    guard imageExportReservations[vmId] == nil else {
+      throw VMManagerError.invalidState("Cannot \(operation) VM while image export is in progress")
+    }
   }
 
   // MARK: - State Queries

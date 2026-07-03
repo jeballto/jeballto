@@ -24,6 +24,7 @@ class APIServer {
   /// Active install per VM: a unique token (stamped by claim) plus the Task. The token lets a
   /// completing task check that it is still the current claim before removing its entry.
   private var _installationTasks: [UUID: (token: UUID, task: Task<Void, Never>)] = [:]
+  private var _imageOperationTasks: [UUID: Task<Void, Never>] = [:]
   private var _jeballtofileExecutors: [UUID: JeballtofileExecutor] = [:]
 
   /// Thread-safe access to config
@@ -227,8 +228,24 @@ class APIServer {
       return await self?.handlePullImage(request) ?? Self.serverUnavailableError
     }
 
+    httpServer.get("/v1/images/pull/{id}/status") { [weak self] request in
+      return await self?.handleGetImagePullStatus(request) ?? Self.serverUnavailableError
+    }
+
+    httpServer.delete("/v1/images/pull/{id}") { [weak self] request in
+      return await self?.handleCancelImagePull(request) ?? Self.serverUnavailableError
+    }
+
     httpServer.post("/v1/images/push") { [weak self] request in
       return await self?.handlePushImage(request) ?? Self.serverUnavailableError
+    }
+
+    httpServer.get("/v1/images/push/{id}/status") { [weak self] request in
+      return await self?.handleGetImagePushStatus(request) ?? Self.serverUnavailableError
+    }
+
+    httpServer.delete("/v1/images/push/{id}") { [weak self] request in
+      return await self?.handleCancelImagePush(request) ?? Self.serverUnavailableError
     }
 
     httpServer.post("/v1/registries/login") { [weak self] request in
@@ -337,6 +354,66 @@ class APIServer {
     stateLock.lock()
     defer { stateLock.unlock() }
     _jeballtofileExecutors[executionId] = executor
+  }
+
+  /// Starts and stores the background task for an async image operation while holding the state lock.
+  @discardableResult
+  func startImageOperationTask(_ operationId: UUID, start: () -> Task<Void, Never>) -> Task<Void, Never> {
+    stateLock.lock()
+    defer { stateLock.unlock() }
+    let task = start()
+    _imageOperationTasks[operationId] = task
+    return task
+  }
+
+  /// Removes the stored background task after completion.
+  func releaseImageOperationTask(_ operationId: UUID) {
+    stateLock.lock()
+    defer { stateLock.unlock() }
+    _imageOperationTasks.removeValue(forKey: operationId)
+  }
+
+  @discardableResult
+  func cancelImageOperationTask(_ operationId: UUID) -> Bool {
+    stateLock.lock()
+    defer { stateLock.unlock() }
+    guard let task = _imageOperationTasks.removeValue(forKey: operationId) else { return false }
+    task.cancel()
+    return true
+  }
+
+  @discardableResult
+  func cancelAllImageOperationTasks() async -> Int {
+    let tasks = drainImageOperationTasks()
+
+    for task in tasks.values {
+      task.cancel()
+    }
+    for operationId in tasks.keys {
+      await imageManager.cancelImageOperation(operationId)
+    }
+    for task in tasks.values {
+      await task.value
+    }
+    return tasks.count
+  }
+
+  private func drainImageOperationTasks() -> [UUID: Task<Void, Never>] {
+    stateLock.lock()
+    defer { stateLock.unlock() }
+    let tasks = _imageOperationTasks
+    _imageOperationTasks.removeAll()
+    return tasks
+  }
+
+  func finishImageOperationTask(_ operationId: UUID, result: Result<ImageRecord, Error>) async {
+    switch result {
+    case .success(let record):
+      await imageManager.completeImageOperation(operationId, record: record)
+    case .failure(let error):
+      await imageManager.failImageOperation(operationId, error: error)
+    }
+    releaseImageOperationTask(operationId)
   }
 
   /// Atomically removes a Jeballtofile executor.
