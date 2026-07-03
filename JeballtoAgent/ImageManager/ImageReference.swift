@@ -20,7 +20,7 @@ enum ImageReferenceError: Error, LocalizedError {
 }
 
 /// Parsed OCI image reference (e.g. registry.example.com/repo/name:tag or @sha256:...)
-struct ImageReference: Equatable {
+struct ImageReference: Equatable, Sendable {
   let registry: String
   let repository: String
   let tag: String?

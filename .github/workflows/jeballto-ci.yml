@@ -69,6 +69,9 @@ jobs:
       - name: Task oras:download
         run: task oras:download
 
+      - name: Task zstd:download
+        run: task zstd:download
+
       - name: Task test
         run: task test
 
@@ -92,6 +95,9 @@ jobs:
 
       - name: Task oras:download
         run: task oras:download
+
+      - name: Task zstd:download
+        run: task zstd:download
 
       - name: Task build
         run: task build

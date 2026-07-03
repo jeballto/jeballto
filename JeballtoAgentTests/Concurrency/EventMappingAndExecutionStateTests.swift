@@ -8,7 +8,7 @@ struct EventMappingAndExecutionStateTests {
   func vmEventTypeAndVmIdAreExposed() {
     let vmId = UUID()
     let stateChanged = VMEvent.stateChanged(vmId: vmId, from: .created, to: .running)
-    let imageEvent = VMEvent.imagePullStarted(reference: "registry/repo:v1")
+    let imageEvent = VMEvent.imagePullStarted(reference: "registry/repo:latest")
 
     #expect(stateChanged.eventType == "STATE_CHANGED")
     #expect(stateChanged.vmId == vmId)
@@ -38,7 +38,7 @@ struct EventMappingAndExecutionStateTests {
     let imageFailed = EventResponse(
       from: RecordedEvent(
         timestamp: Date(timeIntervalSince1970: 20),
-        event: .imagePushFailed(reference: "registry/repo:v1", error: "denied")
+        event: .imagePushFailed(reference: "registry/repo:latest", error: "denied")
       )
     )
     let stepFailed = EventResponse(
@@ -60,7 +60,7 @@ struct EventMappingAndExecutionStateTests {
       )
     )
 
-    #expect(imageFailed.data?["reference"] == "registry/repo:v1")
+    #expect(imageFailed.data?["reference"] == "registry/repo:latest")
     #expect(imageFailed.data?["error"] == "denied")
     #expect(stepFailed.data?["executionId"] == executionID.uuidString)
     #expect(stepFailed.data?["step"] == "2")

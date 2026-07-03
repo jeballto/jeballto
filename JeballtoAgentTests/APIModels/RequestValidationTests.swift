@@ -93,9 +93,9 @@ struct RequestValidationTests {
 
   @Test
   func pullImageRequestValidation() {
-    let valid = PullImageRequest(reference: "registry.example.com/vm/macos:v1", timeout: 10)
+    let valid = PullImageRequest(reference: "registry.example.com/vm/macos:latest", timeout: 10)
     let invalidRef = PullImageRequest(reference: "not valid", timeout: 10)
-    let invalidTimeout = PullImageRequest(reference: "registry.example.com/vm/macos:v1", timeout: 0)
+    let invalidTimeout = PullImageRequest(reference: "registry.example.com/vm/macos:latest", timeout: 0)
 
     #expect(valid.validate().valid)
     #expect(invalidRef.validate().valid == false)
@@ -108,14 +108,14 @@ struct RequestValidationTests {
     let vmSource = "vm:\(id)"
     let imageSource = "image:\(id)"
 
-    let vmRequest = PushImageRequest(reference: "registry.example.com/vm/macos:v1", source: vmSource, timeout: 10)
+    let vmRequest = PushImageRequest(reference: "registry.example.com/vm/macos:latest", source: vmSource, timeout: 10)
     let imageRequest = PushImageRequest(
-      reference: "registry.example.com/vm/macos:v1",
+      reference: "registry.example.com/vm/macos:latest",
       source: imageSource,
       timeout: nil
     )
     let invalidSource = PushImageRequest(
-      reference: "registry.example.com/vm/macos:v1",
+      reference: "registry.example.com/vm/macos:latest",
       source: "bad:\(id)",
       timeout: nil
     )
@@ -140,6 +140,47 @@ struct RequestValidationTests {
     #expect(loginInvalidHost.validate().valid == false)
     #expect(logoutValid.validate().valid)
     #expect(logoutInvalid.validate().valid == false)
+  }
+
+  @Test
+  func updateConfigImageParallelismValidation() throws {
+    let validJSON = """
+    {"images":{
+      "maxParallelImageBlobTransfers":16,
+      "maxParallelImageDecompressions":2,
+      "maxParallelImageDiskWrites":1
+    }}
+    """
+    let zeroJSON = #"{"images":{"maxParallelImageBlobTransfers":0}}"#
+    let tooHighJSONs = [
+      #"{"images":{"maxParallelImageBlobTransfers":65}}"#,
+      #"{"images":{"maxParallelImageDecompressions":9}}"#,
+      #"{"images":{"maxParallelImageDiskWrites":5}}"#,
+    ]
+
+    let valid = try JSONDecoder().decode(UpdateConfigRequest.self, from: Data(validJSON.utf8))
+    let zero = try JSONDecoder().decode(UpdateConfigRequest.self, from: Data(zeroJSON.utf8))
+
+    #expect(valid.validate().valid)
+    #expect(zero.validate().valid == false)
+    for tooHighJSON in tooHighJSONs {
+      let tooHigh = try JSONDecoder().decode(UpdateConfigRequest.self, from: Data(tooHighJSON.utf8))
+      #expect(tooHigh.validate().valid == false)
+    }
+  }
+
+  @Test
+  func configResponseIncludesImageParallelismSettings() {
+    var config = Config.default
+    config.images.maxParallelImageBlobTransfers = 16
+    config.images.maxParallelImageDecompressions = 2
+    config.images.maxParallelImageDiskWrites = 1
+
+    let response = ConfigResponse(from: config)
+
+    #expect(response.images.maxParallelImageBlobTransfers == 16)
+    #expect(response.images.maxParallelImageDecompressions == 2)
+    #expect(response.images.maxParallelImageDiskWrites == 1)
   }
 
   @Test
@@ -533,7 +574,7 @@ struct RequestValidationTests {
   @Test
   func createVMRequestRejectsResourcesWithImage() {
     let resources = VMResourcesDTO(cpuCount: 4, memorySize: nil, diskSize: nil)
-    let request = CreateVMRequest(name: "from-image", resources: resources, image: "registry.example.com/vms/m:v1")
+    let request = CreateVMRequest(name: "from-image", resources: resources, image: "registry.example.com/vms/m:latest")
 
     let validation = request.validate()
     #expect(validation.valid == false)
@@ -542,7 +583,7 @@ struct RequestValidationTests {
 
   @Test
   func createVMRequestAcceptsImageWithoutResources() {
-    let request = CreateVMRequest(name: "from-image", resources: nil, image: "registry.example.com/vms/m:v1")
+    let request = CreateVMRequest(name: "from-image", resources: nil, image: "registry.example.com/vms/m:latest")
     #expect(request.validate().valid)
   }
 

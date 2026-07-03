@@ -16,7 +16,7 @@ enum ConfigError: Error, LocalizedError {
 }
 
 /// Application configuration
-struct Config: Codable {
+struct Config: Codable, Sendable {
   /// API server configuration
   var api: APIConfig
 
@@ -85,7 +85,7 @@ struct Config: Codable {
 }
 
 /// API server configuration
-struct APIConfig: Codable {
+struct APIConfig: Codable, Sendable {
   /// API server port
   var port: Int
 
@@ -118,7 +118,7 @@ struct APIConfig: Codable {
 }
 
 /// Storage configuration
-struct StorageConfig: Codable {
+struct StorageConfig: Codable, Sendable {
   /// Base directory for VM storage
   var vmStorageDir: String
 
@@ -145,7 +145,7 @@ struct StorageConfig: Codable {
 }
 
 /// Logging configuration
-struct LoggingConfig: Codable {
+struct LoggingConfig: Codable, Sendable {
   /// Log level (debug, info, warning, error)
   var level: String
 
@@ -206,7 +206,7 @@ struct LoggingConfig: Codable {
 }
 
 /// Networking configuration
-struct NetworkingConfig: Codable {
+struct NetworkingConfig: Codable, Sendable {
   /// Starting port for SSH forwarding
   var sshPortRangeStart: Int
 
@@ -238,12 +238,31 @@ struct NetworkingConfig: Codable {
 }
 
 /// OCI image management configuration
-struct ImageConfig: Codable {
+struct ImageConfig: Codable, Sendable {
+  static let defaultMaxParallelImageBlobTransfers = 16
+  static let defaultMaxParallelImageDecompressions = 2
+  static let defaultMaxParallelImageDiskWrites = 1
+  static let maximumParallelImageBlobTransfers = 64
+  static let maximumParallelImageDecompressions = 8
+  static let maximumParallelImageDiskWrites = 4
+
   /// Base directory for local image storage
   var imageStorageDir: String
 
   /// Path to the `oras` CLI binary. When `nil`, uses the binary bundled in the app's Resources directory.
   var orasPath: String?
+
+  /// Path to the `zstd` CLI binary. When `nil`, uses the binary bundled in the app's Resources directory.
+  var zstdPath: String?
+
+  /// Maximum number of OCI image blob transfers to run concurrently.
+  var maxParallelImageBlobTransfers: Int
+
+  /// Maximum number of image chunks to decompress concurrently while pulling.
+  var maxParallelImageDecompressions: Int
+
+  /// Maximum number of image chunk writes to perform concurrently while pulling.
+  var maxParallelImageDiskWrites: Int
 
   /// Default OCI registry (optional, used when reference has no registry prefix)
   var defaultRegistry: String?
@@ -254,13 +273,70 @@ struct ImageConfig: Codable {
   init(
     imageStorageDir: String? = nil,
     orasPath: String? = nil,
+    zstdPath: String? = nil,
+    maxParallelImageBlobTransfers: Int = Self.defaultMaxParallelImageBlobTransfers,
+    maxParallelImageDecompressions: Int = Self.defaultMaxParallelImageDecompressions,
+    maxParallelImageDiskWrites: Int = Self.defaultMaxParallelImageDiskWrites,
     defaultRegistry: String? = nil,
     insecureRegistries: [String] = []
   ) {
     let defaultBase = "\(NSHomeDirectory())/Library/Application Support/Jeballto"
     self.imageStorageDir = imageStorageDir ?? "\(defaultBase)/Images"
     self.orasPath = orasPath
+    self.zstdPath = zstdPath
+    self.maxParallelImageBlobTransfers = maxParallelImageBlobTransfers
+    self.maxParallelImageDecompressions = maxParallelImageDecompressions
+    self.maxParallelImageDiskWrites = maxParallelImageDiskWrites
     self.defaultRegistry = defaultRegistry
     self.insecureRegistries = insecureRegistries
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    let defaultBase = "\(NSHomeDirectory())/Library/Application Support/Jeballto"
+    imageStorageDir = try container.decodeIfPresent(String.self, forKey: .imageStorageDir) ?? "\(defaultBase)/Images"
+    orasPath = try container.decodeIfPresent(String.self, forKey: .orasPath)
+    zstdPath = try container.decodeIfPresent(String.self, forKey: .zstdPath)
+    maxParallelImageBlobTransfers = try container.decodeIfPresent(
+      Int.self,
+      forKey: .maxParallelImageBlobTransfers
+    ) ?? Self.defaultMaxParallelImageBlobTransfers
+    maxParallelImageDecompressions = try container.decodeIfPresent(
+      Int.self,
+      forKey: .maxParallelImageDecompressions
+    ) ?? Self.defaultMaxParallelImageDecompressions
+    maxParallelImageDiskWrites = try container.decodeIfPresent(
+      Int.self,
+      forKey: .maxParallelImageDiskWrites
+    ) ?? Self.defaultMaxParallelImageDiskWrites
+    try Self.validateParallelism(
+      maxParallelImageBlobTransfers: maxParallelImageBlobTransfers,
+      maxParallelImageDecompressions: maxParallelImageDecompressions,
+      maxParallelImageDiskWrites: maxParallelImageDiskWrites
+    )
+    defaultRegistry = try container.decodeIfPresent(String.self, forKey: .defaultRegistry)
+    insecureRegistries = try container.decodeIfPresent([String].self, forKey: .insecureRegistries) ?? []
+  }
+
+  private static func validateParallelism(
+    maxParallelImageBlobTransfers: Int,
+    maxParallelImageDecompressions: Int,
+    maxParallelImageDiskWrites: Int
+  ) throws {
+    guard (1 ... maximumParallelImageBlobTransfers).contains(maxParallelImageBlobTransfers) else {
+      throw ConfigError.invalidFormat(
+        "images.maxParallelImageBlobTransfers must be between 1 and \(maximumParallelImageBlobTransfers)"
+      )
+    }
+    guard (1 ... maximumParallelImageDecompressions).contains(maxParallelImageDecompressions) else {
+      throw ConfigError.invalidFormat(
+        "images.maxParallelImageDecompressions must be between 1 and \(maximumParallelImageDecompressions)"
+      )
+    }
+    guard (1 ... maximumParallelImageDiskWrites).contains(maxParallelImageDiskWrites) else {
+      throw ConfigError.invalidFormat(
+        "images.maxParallelImageDiskWrites must be between 1 and \(maximumParallelImageDiskWrites)"
+      )
+    }
   }
 }

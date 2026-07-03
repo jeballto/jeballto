@@ -90,6 +90,7 @@ task openapi:stamp    # sync version field in jeballto-api.yaml
 | `xcbeautify` | `task setup` | Required - formats xcodebuild output |
 | `check-jsonschema` | `task setup` | Required - OpenAPI schema validation |
 | `oras` | `task setup` | Required - bundled into the app at build time |
+| `zstd` | `task setup` | Required - bundled into the app at build time |
 | `mmdc` | `task setup` (needs npm) | Optional - diagram SVG generation |
 
 ### Xcode build phase integration
@@ -99,7 +100,7 @@ Xcode build phases delegate to task automatically during `Product - Build` or `x
 - `task xcode:set-build-number` - stamps CFBundleVersion with timestamp
 - `task xcode:diagrams` - generates SVGs (non-fatal if mmdc missing)
 - `task xcode:copy-openapi` - stamps and copies OpenAPI schema
-- `task xcode:copy-oras` - copies oras binary to app bundle
+- `task xcode:copy-tools` - copies oras and zstd binaries to app bundle
 
 Do not run `xcode:*` tasks manually.
 
@@ -169,11 +170,58 @@ First run creates `~/Library/Application Support/Jeballto/config.json` (permissi
   "images": {
     "imageStorageDir": "~/Library/Application Support/Jeballto/Images",
     "orasPath": null,
+    "zstdPath": null,
+    "maxParallelImageBlobTransfers": 16,
+    "maxParallelImageDecompressions": 2,
+    "maxParallelImageDiskWrites": 1,
     "defaultRegistry": null,
     "insecureRegistries": []
   }
 }
 ```
+
+## Image Push And Pull Flow
+
+Jeballto stores VM bundles as OCI artifacts. `oras` handles registry transfer, `zstd` handles chunk
+compression, and `VMImagePackager` owns the bundle-to-layer mapping. Zero-filled chunks are represented
+as metadata and are not uploaded as blob layers.
+
+Push flow:
+
+1. `ImageManager` checks that the registry is reachable before expensive packaging starts.
+2. `VMImagePackager` scans bundle files, splits them into fixed-size chunks, skips zero chunks, and
+   compresses nonzero chunks with `zstd`.
+3. Packaging reuses verified session work when the same source chunk is already compressed for the
+   current agent session.
+4. `ImageManager` uploads the config blob and nonzero chunk blobs with ORAS, skipping blobs that the
+   registry already has.
+5. The OCI manifest is pushed last, after every referenced blob exists in the registry.
+
+Pull flow:
+
+1. `ImageManager` resolves the reference to a manifest digest and creates a session operation directory.
+2. The config blob is fetched or reused from the session blob cache, then validated by size and digest.
+3. `VMImagePackager` creates the destination bundle layout and schedules nonzero chunk work.
+4. Each chunk task fetches its compressed blob on demand with ORAS, validates the compressed size and
+   digest, enters the decompression limiter, streams `zstd` output into the destination bundle file,
+   and validates the uncompressed size and digest.
+5. The image is registered only after all files are reconstructed and validated.
+
+Parallelism is split by stage:
+
+| Setting | Default | Range | Used by |
+|---|---:|---:|---|
+| `maxParallelImageBlobTransfers` | 16 | 1-64 | ORAS blob fetches during pull and ORAS blob pushes during push |
+| `maxParallelImageDecompressions` | 2 | 1-8 | Concurrent `zstd` decompression processes during pull |
+| `maxParallelImageDiskWrites` | 1 | 1-4 | Concurrent output writes while pull decompression streams into bundle files |
+
+Push compression uses the packager's automatic chunk work limit, `max(1, min(4, active CPU count / 2))`.
+The decompression and disk-write limits apply only to pull, because push never reconstructs bundle files
+from compressed layers.
+
+OCI pull and push operation cache is session-scoped under `~/Library/Caches/Jeballto/ImageWork/`. Agent
+startup removes the whole ImageWork directory, and each successful transfer deletes its own operation
+cache. Failed or cancelled transfers keep verified blobs and packaged chunks only until the agent exits.
 
 ## Code Style
 

@@ -9,6 +9,7 @@ vars:
   DOCC_BUNDLE: "{{.ROOT_DIR}}/JeballtoAgent/JeballtoAgent.docc"
   DIAGRAMS_DIR: "{{.DOCC_BUNDLE}}/Diagrams"
   ORAS_BINARY: "{{.ROOT_DIR}}/Resources/oras"
+  ZSTD_BINARY: "{{.ROOT_DIR}}/Resources/zstd"
   OPENAPI_SRC: "{{.ROOT_DIR}}/openapi/jeballto-api.yaml"
   DOCS_INDEX_TEMPLATE: "{{.ROOT_DIR}}/scripts/docs-index.html"
   DERIVED_DATA: "{{.ROOT_DIR}}/.build/DerivedData"
@@ -28,6 +29,7 @@ vars:
   TEST_ARGS: '-destination "{{.DESTINATION}}" -only-testing:JeballtoAgentTests'
   # Versions
   ORAS_VERSION: "1.3.0"
+  ZSTD_VERSION: "1.5.7"
   APP_VERSION:
     sh: grep -m1 'MARKETING_VERSION' "{{.PROJECT}}/project.pbxproj" | sed 's/.*= \(.*\);/\1/' | tr -d ' '
 
@@ -66,6 +68,11 @@ tasks:
         else
           line oras "not downloaded (task oras:download)"
         fi
+        if [[ -x "{{.ZSTD_BINARY}}" ]]; then
+          line zstd "$("{{.ZSTD_BINARY}}" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+        else
+          line zstd "not installed (task zstd:download)"
+        fi
 
   check:
     desc: Verify all required and optional tools are installed
@@ -100,6 +107,12 @@ tasks:
           printf "  [MISSING] oras               <- task oras:download\n"
           missing=1
         fi
+        if [[ -x "{{.ZSTD_BINARY}}" ]]; then
+          printf "  [ok]      zstd\n"
+        else
+          printf "  [MISSING] zstd               <- task zstd:download\n"
+          missing=1
+        fi
         echo ""
         if [[ $missing -eq 0 ]]; then
           echo "All required tools present."
@@ -116,6 +129,7 @@ tasks:
       - task: setup:brew
       - task: setup:npm
       - task: oras:download
+      - task: zstd:download
       - echo ""
       - echo "Setup complete. Run 'task check' to verify."
 
@@ -188,7 +202,7 @@ tasks:
 
   docs:build:
     desc: Build DocC archive
-    deps: [oras:download]
+    deps: [oras:download, zstd:download]
     cmds:
       - mkdir -p "{{.DOCS_OUTPUT}}"
       - |
@@ -297,6 +311,37 @@ tasks:
       - rm -f "{{.ORAS_BINARY}}"
       - 'echo "Removed {{.ORAS_BINARY}}"'
 
+  # ─── zstd ───────────────────────────────────────────────────────────────────
+
+  zstd:download:
+    desc: Install zstd binary to Resources/
+    status:
+      - test -x "{{.ZSTD_BINARY}}" && "{{.ZSTD_BINARY}}" --version >/dev/null 2>&1
+    cmds:
+      - bash "{{.ROOT_DIR}}/scripts/download-zstd.sh" "{{.ZSTD_VERSION}}"
+
+  zstd:verify:
+    desc: Verify zstd binary version matches the configured version
+    preconditions:
+      - sh: test -x "{{.ZSTD_BINARY}}"
+        msg: "zstd binary not found. Run: task zstd:download"
+    cmds:
+      - |
+        actual=$("{{.ZSTD_BINARY}}" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        if [[ "$actual" == "{{.ZSTD_VERSION}}" ]]; then
+          echo "zstd version ok: $actual"
+        else
+          echo "error: expected {{.ZSTD_VERSION}}, got $actual"
+          exit 1
+        fi
+
+  zstd:clean:
+    desc: Remove the bundled zstd binary
+    prompt: "Delete {{.ZSTD_BINARY}}?"
+    cmds:
+      - rm -f "{{.ZSTD_BINARY}}"
+      - 'echo "Removed {{.ZSTD_BINARY}}"'
+
   # ─── OpenAPI ──────────────────────────────────────────────────────────────────
 
   openapi:validate:
@@ -347,11 +392,12 @@ tasks:
 
   clean:all:
     desc: Remove all generated artifacts including SVGs and oras binary
-    prompt: "Delete .build/, generated SVGs, and the oras binary?"
+    prompt: "Delete .build/, generated SVGs, and bundled CLI binaries?"
     cmds:
       - task: clean
       - rm -f "{{.DOCC_BUNDLE}}/Resources"/*.svg
       - task: oras:clean
+      - task: zstd:clean
 
   # ─── Xcode build phase helpers ────────────────────────────────────────────────
   # These tasks are called by Xcode build phases. Do not run them manually.
@@ -377,6 +423,14 @@ tasks:
     preconditions:
       - sh: test -f "{{.ORAS_BINARY}}"
         msg: "oras binary not found at {{.ORAS_BINARY}}. Run: task oras:download"
+    cmds:
+      - true
+
+  _xcode:require-zstd-binary:
+    internal: true
+    preconditions:
+      - sh: test -f "{{.ZSTD_BINARY}}"
+        msg: "zstd binary not found at {{.ZSTD_BINARY}}. Run: task zstd:download"
     cmds:
       - true
 
@@ -418,15 +472,19 @@ tasks:
         cp "{{.OPENAPI_SRC}}" "$SCHEMA_DST"
         echo "Copied OpenAPI schema to app bundle"
 
-  xcode:copy-oras:
-    desc: "[Xcode] Copy oras binary into the app bundle"
+  xcode:copy-tools:
+    desc: "[Xcode] Copy bundled CLI tools into the app bundle"
     deps:
       - task: _xcode:require-app-bundle-env
       - task: _xcode:require-oras-binary
+      - task: _xcode:require-zstd-binary
     cmds:
       - |
         ORAS_DST="${BUILT_PRODUCTS_DIR}/${PRODUCT_NAME}.app/Contents/Resources/oras"
+        ZSTD_DST="${BUILT_PRODUCTS_DIR}/${PRODUCT_NAME}.app/Contents/Resources/zstd"
         mkdir -p "$(dirname "$ORAS_DST")"
         cp "{{.ORAS_BINARY}}" "$ORAS_DST"
+        cp "{{.ZSTD_BINARY}}" "$ZSTD_DST"
         chmod +x "$ORAS_DST"
-        echo "Copied oras to app bundle"
+        chmod +x "$ZSTD_DST"
+        echo "Copied oras and zstd to app bundle"

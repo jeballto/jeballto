@@ -238,9 +238,7 @@ class VMInstaller: NSObject, @unchecked Sendable { // swiftlint:disable:this typ
   /// Downloads IPSW file from remote URL to local cache
   private func downloadIPSW(from remoteURL: URL) async throws -> URL {
     // Create cache directory
-    let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent(
-      "Jeballto/IPSWCache"
-    )
+    let cacheDir = JeballtoCachePaths.ipswCache
 
     try FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
 

@@ -1183,6 +1183,18 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '499':
+          description: Image pull was cancelled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '504':
+          description: Image pull timed out
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -1197,7 +1209,7 @@ paths:
         The VM must be stopped before pushing to ensure a consistent disk image.
         A connectivity check is performed before compression begins to fail fast
         if the registry is unreachable.
-        The bundle is automatically compressed (gzip) during transfer.
+        The bundle is split into zstd-compressed chunks during transfer.
         By default there is no timeout (unlimited). Use the optional
         `timeout` field to set a limit in seconds.
       operationId: pushImage
@@ -1226,10 +1238,22 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '499':
+          description: Image push was cancelled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '500':
           $ref: '#/components/responses/InternalError'
         '503':
           description: Registry is unreachable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '504':
+          description: Image push timed out
           content:
             application/json:
               schema:
@@ -1453,7 +1477,7 @@ paths:
       summary: Reset system
       description: >
         Reset the agent to a clean state. Soft mode deletes all VMs, images, and
-        IPSW cache but keeps configuration and logs. Hard mode deletes everything
+        the IPSW cache but keeps configuration and logs. Hard mode deletes everything
         the application stores and terminates the process so the next startup is
         completely fresh. Requires confirm=true as a safety guard.
       operationId: systemReset
@@ -1563,11 +1587,11 @@ components:
           type: string
           nullable: true
           description: >
-            OCI image reference (e.g. registry.example.com/vms/macos:v1).
+            OCI image reference (e.g. registry.example.com/vms/macos:latest).
             When provided, the image is pulled if not already local and the
             VM is created from it. The VM will be in STOPPED state (already installed).
             Cannot be combined with `resources`.
-          example: registry.example.com/vms/macos:v1
+          example: registry.example.com/vms/macos:latest
         ephemeral:
           type: boolean
           default: false
@@ -2192,7 +2216,7 @@ components:
         reference:
           type: string
           description: OCI image reference
-          example: registry.example.com/vms/macos:v1
+          example: registry.example.com/vms/macos:latest
         timeout:
           type: integer
           nullable: true
@@ -2211,7 +2235,7 @@ components:
         reference:
           type: string
           description: OCI image reference to push to
-          example: registry.example.com/vms/macos:v2
+          example: registry.example.com/vms/macos:latest
         source:
           type: string
           description: >
@@ -2455,6 +2479,9 @@ components:
           type: object
           required:
             - insecureRegistries
+            - maxParallelImageBlobTransfers
+            - maxParallelImageDecompressions
+            - maxParallelImageDiskWrites
           properties:
             defaultRegistry:
               type: string
@@ -2465,6 +2492,27 @@ components:
               items:
                 type: string
               description: Registries that use HTTP instead of HTTPS
+            maxParallelImageBlobTransfers:
+              type: integer
+              minimum: 1
+              maximum: 64
+              description: >
+                Maximum number of OCI image blob transfers to run concurrently.
+                This controls ORAS blob fetch and push processes. Default is 16.
+            maxParallelImageDecompressions:
+              type: integer
+              minimum: 1
+              maximum: 8
+              description: >
+                Maximum number of image chunks to decompress concurrently while pulling.
+                Default is 2.
+            maxParallelImageDiskWrites:
+              type: integer
+              minimum: 1
+              maximum: 4
+              description: >
+                Maximum number of image chunk writes to perform concurrently while pulling.
+                Default is 1.
 
     UpdateConfigRequest:
       type: object
@@ -2531,6 +2579,27 @@ components:
               items:
                 type: string
               description: Registries that use HTTP instead of HTTPS
+            maxParallelImageBlobTransfers:
+              type: integer
+              minimum: 1
+              maximum: 64
+              description: >
+                Maximum number of OCI image blob transfers to run concurrently.
+                This controls ORAS blob fetch and push processes. Default is 16.
+            maxParallelImageDecompressions:
+              type: integer
+              minimum: 1
+              maximum: 8
+              description: >
+                Maximum number of image chunks to decompress concurrently while pulling.
+                Default is 2.
+            maxParallelImageDiskWrites:
+              type: integer
+              minimum: 1
+              maximum: 4
+              description: >
+                Maximum number of image chunk writes to perform concurrently while pulling.
+                Default is 1.
 
     SystemResetRequest:
       type: object
@@ -2543,7 +2612,7 @@ components:
             - soft
             - hard
           description: >
-            Reset mode. "soft" deletes all VMs, images, and IPSW cache.
+            Reset mode. "soft" deletes all VMs, images, and the IPSW cache.
             "hard" deletes everything and terminates the application.
 
     SystemResetResponse:
@@ -2664,7 +2733,9 @@ components:
                 - INVALID_STATE
                 - IMAGE_NOT_FOUND
                 - IMAGE_PULL_FAILED
+                - IMAGE_PULL_CANCELLED
                 - IMAGE_PUSH_FAILED
+                - IMAGE_PUSH_CANCELLED
                 - INVALID_REFERENCE
                 - REGISTRY_AUTH_FAILED
                 - REGISTRY_LOGOUT_FAILED

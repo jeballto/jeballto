@@ -118,7 +118,7 @@ struct APIRouteErrorMapperTests {
   @Test
   func imageNotFoundWithoutOverrideFallsBackTo500() throws {
     let response = APIRouteErrorMapper.imageManager(
-      .imageNotFound("registry/repo:v1"),
+      .imageNotFound("registry/repo:latest"),
       defaultCode: "DELETE_FAILED"
     )
     let decoded = try decodedError(response)
@@ -137,6 +137,18 @@ struct APIRouteErrorMapperTests {
 
     #expect(response.statusCode == 503)
     #expect(decoded.error.code == "IMAGE_PUSH_FAILED")
+  }
+
+  @Test
+  func imageTimeoutMapsTo504() throws {
+    let response = APIRouteErrorMapper.imageManager(
+      .timeout("image pull registry.example.com/vm:latest"),
+      defaultCode: "IMAGE_PULL_FAILED"
+    )
+    let decoded = try decodedError(response)
+
+    #expect(response.statusCode == 504)
+    #expect(decoded.error.code == "IMAGE_PULL_FAILED")
   }
 
   @Test

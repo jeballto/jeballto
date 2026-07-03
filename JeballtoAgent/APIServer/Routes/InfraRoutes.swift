@@ -415,28 +415,7 @@ extension APIServer {
       return HTTPResponse.error("INVALID_REQUEST", message: validation.error ?? "Invalid request", statusCode: 400)
     }
 
-    // Build a copy so we only swap in-memory state after successful persist
-    var newConfig = config
-
-    if let logging = updateRequest.logging {
-      if let level = logging.level { newConfig.logging.level = level }
-      if let retentionDays = logging.retentionDays { newConfig.logging.retentionDays = retentionDays }
-      if let maxTotalSize = logging.maxTotalSize { newConfig.logging.maxTotalSize = maxTotalSize }
-      if let tz = logging.timezone { newConfig.logging.timezone = tz }
-    }
-
-    if let networking = updateRequest.networking {
-      if let start = networking.sshPortRangeStart { newConfig.networking.sshPortRangeStart = start }
-      if let end = networking.sshPortRangeEnd { newConfig.networking.sshPortRangeEnd = end }
-      if let auto = networking.autoEnableSSHForwarding { newConfig.networking.autoEnableSSHForwarding = auto }
-      if let start = networking.vncPortRangeStart { newConfig.networking.vncPortRangeStart = start }
-      if let end = networking.vncPortRangeEnd { newConfig.networking.vncPortRangeEnd = end }
-    }
-
-    if let images = updateRequest.images {
-      if let registry = images.defaultRegistry { newConfig.images.defaultRegistry = registry }
-      if let insecure = images.insecureRegistries { newConfig.images.insecureRegistries = insecure }
-    }
+    let newConfig = updatedConfig(from: updateRequest)
 
     // Persist to disk first - only update in-memory state on success
     do {
@@ -446,23 +425,66 @@ extension APIServer {
       return HTTPResponse.error("CONFIG_UPDATE_FAILED", message: error.localizedDescription, statusCode: 500)
     }
 
-    // Apply runtime effects after successful persist
-    if let logging = updateRequest.logging {
-      if let level = logging.level, let logLevel = LogLevel(rawValue: level.uppercased()) {
-        Logger.shared.logLevel = logLevel
-      }
-      if let retentionDays = logging.retentionDays {
-        Logger.shared.retentionDays = retentionDays
-      }
-      if let maxTotalSize = logging.maxTotalSize, let bytes = LoggingConfig.parseSize(maxTotalSize) {
-        Logger.shared.maxTotalSizeBytes = bytes
-      }
-      if let tzId = logging.timezone, let tz = TimeZone(identifier: tzId) {
-        Logger.shared.timezone = tz
-      }
-    }
+    await imageManager.updateConfiguration(newConfig)
+    applyLoggingRuntimeUpdates(updateRequest.logging)
 
     logInfo("Configuration updated via API", category: "APIServer")
     return HTTPResponse.json(ConfigResponse(from: config))
+  }
+
+  private func updatedConfig(from updateRequest: UpdateConfigRequest) -> Config {
+    var newConfig = config
+    applyLoggingUpdate(updateRequest.logging, to: &newConfig)
+    applyNetworkingUpdate(updateRequest.networking, to: &newConfig)
+    applyImageUpdate(updateRequest.images, to: &newConfig)
+    return newConfig
+  }
+
+  private func applyLoggingUpdate(_ logging: LoggingConfigUpdate?, to config: inout Config) {
+    guard let logging else { return }
+    if let level = logging.level { config.logging.level = level }
+    if let retentionDays = logging.retentionDays { config.logging.retentionDays = retentionDays }
+    if let maxTotalSize = logging.maxTotalSize { config.logging.maxTotalSize = maxTotalSize }
+    if let tz = logging.timezone { config.logging.timezone = tz }
+  }
+
+  private func applyNetworkingUpdate(_ networking: NetworkingConfigUpdate?, to config: inout Config) {
+    guard let networking else { return }
+    if let start = networking.sshPortRangeStart { config.networking.sshPortRangeStart = start }
+    if let end = networking.sshPortRangeEnd { config.networking.sshPortRangeEnd = end }
+    if let auto = networking.autoEnableSSHForwarding { config.networking.autoEnableSSHForwarding = auto }
+    if let start = networking.vncPortRangeStart { config.networking.vncPortRangeStart = start }
+    if let end = networking.vncPortRangeEnd { config.networking.vncPortRangeEnd = end }
+  }
+
+  private func applyImageUpdate(_ images: ImageConfigUpdate?, to config: inout Config) {
+    guard let images else { return }
+    if let registry = images.defaultRegistry { config.images.defaultRegistry = registry }
+    if let insecure = images.insecureRegistries { config.images.insecureRegistries = insecure }
+    if let maxParallelImageBlobTransfers = images.maxParallelImageBlobTransfers {
+      config.images.maxParallelImageBlobTransfers = maxParallelImageBlobTransfers
+    }
+    if let maxParallelImageDecompressions = images.maxParallelImageDecompressions {
+      config.images.maxParallelImageDecompressions = maxParallelImageDecompressions
+    }
+    if let maxParallelImageDiskWrites = images.maxParallelImageDiskWrites {
+      config.images.maxParallelImageDiskWrites = maxParallelImageDiskWrites
+    }
+  }
+
+  private func applyLoggingRuntimeUpdates(_ logging: LoggingConfigUpdate?) {
+    guard let logging else { return }
+    if let level = logging.level, let logLevel = LogLevel(rawValue: level.uppercased()) {
+      Logger.shared.logLevel = logLevel
+    }
+    if let retentionDays = logging.retentionDays {
+      Logger.shared.retentionDays = retentionDays
+    }
+    if let maxTotalSize = logging.maxTotalSize, let bytes = LoggingConfig.parseSize(maxTotalSize) {
+      Logger.shared.maxTotalSizeBytes = bytes
+    }
+    if let tzId = logging.timezone, let tz = TimeZone(identifier: tzId) {
+      Logger.shared.timezone = tz
+    }
   }
 }

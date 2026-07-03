@@ -87,7 +87,7 @@ Installation needs ~100 GB free (download + disk image). Check with `df -h`.
 
 Download the IPSW manually and use the local file path option.
 
-**Reclaiming disk space used by IPSW downloads**
+**Reclaiming disk space used by downloads**
 
 IPSWs are cached at `~/Library/Caches/Jeballto/IPSWCache/` (typically 12-18 GB each) and reused across installs. Clear with `POST /v1/system/reset`, or remove the directory manually while the agent is stopped.
 
@@ -142,12 +142,13 @@ curl -X POST http://127.0.0.1:8011/v1/vms/$VM_ID/gui -H "Authorization: Bearer $
 
 **"oras binary not found"**
 
-The `oras` CLI is required for image operations. Either bundle it in the app's Resources directory, or set the path in config.json:
+The `oras` and `zstd` CLIs are required for image operations. Either bundle them in the app's Resources directory, or set paths in config.json:
 
 ```json
 {
   "images": {
-    "orasPath": "/usr/local/bin/oras"
+    "orasPath": "/usr/local/bin/oras",
+    "zstdPath": "/usr/local/bin/zstd"
   }
 }
 ```
@@ -183,7 +184,7 @@ References must include a registry. Format: `registry/repo:tag`
 
 ```
 OK: ghcr.io/myorg/vm:latest
-OK: localhost:5000/vms/dev:v1
+OK: localhost:5000/vms/dev:latest
 NOT OK: myorg/vm:latest          (missing registry)
 NOT OK: vm:latest                (missing registry and repo)
 ```
