@@ -63,6 +63,8 @@ enum APIRouteErrorMapper {
       return HTTPResponse.error(defaultCode, message: error.localizedDescription, statusCode: 500)
     case .registryUnreachable:
       return HTTPResponse.error(defaultCode, message: error.localizedDescription, statusCode: 503)
+    case .timeout:
+      return HTTPResponse.error(defaultCode, message: error.localizedDescription, statusCode: 504)
     }
   }
 

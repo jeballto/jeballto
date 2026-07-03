@@ -140,6 +140,18 @@ struct APIRouteErrorMapperTests {
   }
 
   @Test
+  func imageTimeoutMapsTo504() throws {
+    let response = APIRouteErrorMapper.imageManager(
+      .timeout("image pull registry.example.com/vm:latest"),
+      defaultCode: "IMAGE_PULL_FAILED"
+    )
+    let decoded = try decodedError(response)
+
+    #expect(response.statusCode == 504)
+    #expect(decoded.error.code == "IMAGE_PULL_FAILED")
+  }
+
+  @Test
   func invalidImageReferenceMapsTo400() throws {
     let response = APIRouteErrorMapper.imageManager(
       .invalidReference("bad reference"),

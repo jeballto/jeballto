@@ -3,6 +3,7 @@ import Testing
 @testable import JeballtoAgent
 
 @Suite(.tags(.core))
+// swiftlint:disable:next type_body_length
 struct VMImagePackagerTests {
   @Test(
     arguments: [
@@ -100,6 +101,50 @@ struct VMImagePackagerTests {
 
       #expect(disk.chunks.contains { $0.zero && $0.layerPath == nil })
       #expect(package.layers.count == disk.chunks.filter { !$0.zero }.count + 3)
+    }
+  }
+
+  @Test
+  func unpackRejectsZeroChunkWithForgedDigest() async throws {
+    try await withTemporaryDirectory(prefix: "vm-image-packager-zero-digest") { root in
+      let source = "\(root)/source.bundle"
+      let unpacked = "\(root)/unpacked.bundle"
+      let corruptConfigPath = "\(root)/corrupt-config.json"
+      try makeFakeBundle(at: source)
+
+      let packager = try makePackager(chunkSize: 1024 * 1024)
+      let package = try await packager.packBundle(bundlePath: source, stagingRoot: root)
+      let config = try decodePackageConfig(package)
+      let fileIndex = try #require(config.files.firstIndex { $0.path == "Disk.img" })
+      let disk = config.files[fileIndex]
+      let zeroChunkIndex = try #require(disk.chunks.firstIndex { $0.zero })
+      let zeroChunk = disk.chunks[zeroChunkIndex]
+      let corruptChunk = VMImagePackedChunk(
+        index: zeroChunk.index,
+        offset: zeroChunk.offset,
+        uncompressedSize: zeroChunk.uncompressedSize,
+        uncompressedDigest: "sha256:\(String(repeating: "1", count: 64))",
+        compressedSize: nil,
+        compressedDigest: nil,
+        layerPath: nil,
+        zero: true
+      )
+      let corruptConfig = replacingChunk(
+        in: config,
+        fileIndex: fileIndex,
+        chunkIndex: zeroChunkIndex,
+        with: corruptChunk
+      )
+      try writeConfig(corruptConfig, to: corruptConfigPath)
+
+      await #expect(throws: VMImagePackagerError.self) {
+        try await packager.unpackBundle(
+          pulledDirectory: package.stagingDirectory,
+          configPath: corruptConfigPath,
+          outputBundlePath: unpacked
+        )
+      }
+      #expect(FileManager.default.fileExists(atPath: unpacked) == false)
     }
   }
 

@@ -24,25 +24,29 @@ struct ConfigTests {
   }
 
   @Test
-  func configRoundTripsThroughDisk() async throws {
-    try await withTemporaryDirectory(prefix: "config") { root in
+  func configRoundTripsThroughDisk() throws {
+    try withTemporaryDirectory(prefix: "config") { root in
       let path = "\(root)/config.json"
       var config = Config.default
       config.api.port = 19090
       config.logging.level = "debug"
-      config.images.maxParallelImageChunks = 3
+      config.images.maxParallelImageBlobTransfers = 12
+      config.images.maxParallelImageDecompressions = 3
+      config.images.maxParallelImageDiskWrites = 2
 
       try config.save(to: path)
       let loaded = try Config.load(from: path)
 
       #expect(loaded.api.port == 19090)
       #expect(loaded.logging.level == "debug")
-      #expect(loaded.images.maxParallelImageChunks == 3)
+      #expect(loaded.images.maxParallelImageBlobTransfers == 12)
+      #expect(loaded.images.maxParallelImageDecompressions == 3)
+      #expect(loaded.images.maxParallelImageDiskWrites == 2)
     }
   }
 
   @Test
-  func imageConfigDecodesMissingParallelChunksAsAuto() throws {
+  func imageConfigDecodesMissingParallelismAsDefaults() throws {
     let json = """
     {
       "api": {
@@ -84,19 +88,28 @@ struct ConfigTests {
 
     let config = try JSONDecoder().decode(Config.self, from: Data(json.utf8))
 
-    #expect(config.images.maxParallelImageChunks == 0)
+    #expect(config.images.maxParallelImageBlobTransfers == 16)
+    #expect(config.images.maxParallelImageDecompressions == 2)
+    #expect(config.images.maxParallelImageDiskWrites == 1)
   }
 
-  @Test(arguments: [-1, 33])
-  func imageConfigRejectsParallelChunksOutsideApiRange(value: Int) {
+  @Test(arguments: [
+    #""maxParallelImageBlobTransfers": 0"#,
+    #""maxParallelImageBlobTransfers": 65"#,
+    #""maxParallelImageDecompressions": 0"#,
+    #""maxParallelImageDecompressions": 9"#,
+    #""maxParallelImageDiskWrites": 0"#,
+    #""maxParallelImageDiskWrites": 5"#,
+  ])
+  func imageConfigRejectsParallelismOutsideRange(parallelismJSON: String) {
     let json = """
     {
       "imageStorageDir": "/tmp/images",
       "orasPath": null,
       "zstdPath": null,
-      "maxParallelImageChunks": \(value),
       "defaultRegistry": null,
-      "insecureRegistries": []
+      "insecureRegistries": [],
+      \(parallelismJSON)
     }
     """
 
@@ -106,8 +119,8 @@ struct ConfigTests {
   }
 
   @Test
-  func loggingConfigRoundTripsTimezone() async throws {
-    try await withTemporaryDirectory(prefix: "config") { root in
+  func loggingConfigRoundTripsTimezone() throws {
+    try withTemporaryDirectory(prefix: "config") { root in
       let path = "\(root)/config.json"
       var config = Config.default
       config.logging.timezone = "UTC"
@@ -120,8 +133,8 @@ struct ConfigTests {
   }
 
   @Test
-  func loggingConfigNilTimezoneRoundTrips() async throws {
-    try await withTemporaryDirectory(prefix: "config") { root in
+  func loggingConfigNilTimezoneRoundTrips() throws {
+    try withTemporaryDirectory(prefix: "config") { root in
       let path = "\(root)/config.json"
       var config = Config.default
       config.logging.timezone = nil

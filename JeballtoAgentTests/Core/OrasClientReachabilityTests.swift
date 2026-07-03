@@ -179,7 +179,7 @@ struct OrasClientReachabilityTests {
   }
 
   @Test
-  func blobExistsReturnsTrueOnlyWhenDescriptorFetchSucceeds() async throws {
+  func blobPresenceDistinguishesExistingAndMissingBlobs() async throws {
     try await withTemporaryDirectory(prefix: "oras-blob-exists") { root in
       let orasPath = (root as NSString).appendingPathComponent("oras")
       let script = """
@@ -190,7 +190,7 @@ struct OrasClientReachabilityTests {
       fi
       case "$4" in
         *@sha256:1111111111111111111111111111111111111111111111111111111111111111) exit 0 ;;
-        *) exit 1 ;;
+        *) echo "not found" >&2; exit 1 ;;
       esac
       """
       try script.write(toFile: orasPath, atomically: true, encoding: .utf8)
@@ -203,22 +203,50 @@ struct OrasClientReachabilityTests {
         insecureRegistries: []
       ))
 
-      let existing = try await client.blobExists(
+      let existing = try await client.blobPresence(
         repositoryReference: "registry.example.com/repo",
         digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
       )
-      let missing = try await client.blobExists(
+      let missing = try await client.blobPresence(
         repositoryReference: "registry.example.com/repo",
         digest: "sha256:2222222222222222222222222222222222222222222222222222222222222222"
       )
 
-      #expect(existing)
-      #expect(missing == false)
+      #expect(existing == .exists)
+      #expect(missing == .missing)
     }
   }
 
   @Test
-  func blobExistsPropagatesCancellation() async throws {
+  func blobPresenceThrowsForNonMissingRegistryFailures() async throws {
+    try await withTemporaryDirectory(prefix: "oras-blob-auth-failure") { root in
+      let orasPath = (root as NSString).appendingPathComponent("oras")
+      let script = """
+      #!/bin/sh
+      echo "unauthorized" >&2
+      exit 1
+      """
+      try script.write(toFile: orasPath, atomically: true, encoding: .utf8)
+      try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: orasPath)
+
+      let client = OrasClient(config: ImageConfig(
+        imageStorageDir: root,
+        orasPath: orasPath,
+        defaultRegistry: nil,
+        insecureRegistries: []
+      ))
+
+      await #expect(throws: OrasError.self) {
+        _ = try await client.blobPresence(
+          repositoryReference: "registry.example.com/repo",
+          digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+        )
+      }
+    }
+  }
+
+  @Test
+  func blobPresencePropagatesCancellation() async throws {
     let client = OrasClient(config: ImageConfig(
       imageStorageDir: NSTemporaryDirectory(),
       orasPath: "/usr/bin/false",
@@ -228,7 +256,7 @@ struct OrasClientReachabilityTests {
     let gate = CancellationGate()
     let task = Task {
       await gate.wait()
-      _ = try await client.blobExists(
+      _ = try await client.blobPresence(
         repositoryReference: "registry.example.com/repo",
         digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
       )

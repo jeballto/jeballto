@@ -202,7 +202,7 @@ tasks:
 
   docs:build:
     desc: Build DocC archive
-    deps: [oras:download]
+    deps: [oras:download, zstd:download]
     cmds:
       - mkdir -p "{{.DOCS_OUTPUT}}"
       - |

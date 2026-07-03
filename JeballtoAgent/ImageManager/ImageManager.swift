@@ -1,6 +1,8 @@
 import CryptoKit
 import Foundation
 
+// swiftlint:disable file_length
+
 /// Errors from image management operations
 enum ImageManagerError: Error, LocalizedError {
   case imageNotFound(String)
@@ -10,6 +12,7 @@ enum ImageManagerError: Error, LocalizedError {
   case deleteFailed(String)
   case invalidReference(String)
   case registryUnreachable(String)
+  case timeout(String)
 
   var errorDescription: String? {
     switch self {
@@ -20,12 +23,13 @@ enum ImageManagerError: Error, LocalizedError {
     case .deleteFailed(let msg): "Image delete failed: \(msg)"
     case .invalidReference(let msg): "Invalid image reference: \(msg)"
     case .registryUnreachable(let msg): "Registry unreachable: \(msg)"
+    case .timeout(let msg): "Image operation timed out: \(msg)"
     }
   }
 }
 
-/// Central orchestrator for OCI image operations.
-/// Pushes VM bundle directories as chunked Jeballto OCI artifacts while preserving the public REST API.
+// Central orchestrator for OCI image operations.
+// Pushes VM bundle directories as chunked Jeballto OCI artifacts while preserving the public REST API.
 // swiftlint:disable:next type_body_length
 actor ImageManager {
   private struct PushBlobCandidate: Sendable {
@@ -50,6 +54,8 @@ actor ImageManager {
   private var orasClient: OrasClient
   private let eventBus: EventBus
   private var config: Config
+  private let operationCache = ImageOperationCache()
+  private let blobCache = ImageBlobCache()
 
   init(imageStore: ImageStore, orasClient: OrasClient, eventBus: EventBus, config: Config) {
     self.imageStore = imageStore
@@ -66,6 +72,46 @@ actor ImageManager {
 
   func currentImageConfig() -> ImageConfig {
     config.images
+  }
+
+  nonisolated static func withImageOperationDeadline<T: Sendable>(
+    timeout: TimeInterval?,
+    operationName: String,
+    operation: @Sendable @escaping () async throws -> T
+  ) async throws -> T {
+    guard let timeout else {
+      return try await operation()
+    }
+    guard timeout > 0 else {
+      throw OrasError.timeout(operationName)
+    }
+
+    return try await withThrowingTaskGroup(of: T.self) { group in
+      group.addTask {
+        try await operation()
+      }
+      group.addTask {
+        try await Task.sleep(nanoseconds: timeoutNanoseconds(timeout))
+        throw OrasError.timeout(operationName)
+      }
+
+      do {
+        guard let result = try await group.next() else {
+          throw OrasError.invalidOutput("Image operation \(operationName) ended without a result")
+        }
+        group.cancelAll()
+        return result
+      } catch {
+        group.cancelAll()
+        throw error
+      }
+    }
+  }
+
+  private nonisolated static func timeoutNanoseconds(_ timeout: TimeInterval) -> UInt64 {
+    let maxSeconds = TimeInterval(UInt64.max) / 1_000_000_000
+    let clamped = min(timeout, maxSeconds)
+    return UInt64(clamped * 1_000_000_000)
   }
 
   // MARK: - Startup Cleanup
@@ -198,50 +244,27 @@ actor ImageManager {
     let localDir = "\(config.images.imageStorageDir)/\(imageId.uuidString).bundle"
 
     do {
-      try FileManager.default.createDirectory(atPath: localDir, withIntermediateDirectories: true)
-
-      let insecure = parsed.isInsecureAllowed(insecureRegistries: config.images.insecureRegistries)
-      let manifest = try await orasClient.fetchManifest(reference: parsed, insecure: insecure)
-      do {
-        try manifest.validateJeballtoImage(reference: parsed.fullReference)
-      } catch {
-        logError(
-          "Unsupported Jeballto image format for \(parsed.fullReference): \(manifest.formatSummary)",
-          category: "ImageManager"
+      return try await Self.withImageOperationDeadline(
+        timeout: timeout,
+        operationName: "image pull \(parsed.fullReference)"
+      ) {
+        try await self.performPullImage(
+          parsed: parsed,
+          imageId: imageId,
+          localDir: localDir,
+          timeout: timeout
         )
-        throw error
       }
-      let pullResult = try await pullImageArtifact(
-        parsed,
-        manifest: manifest,
-        localDir: localDir,
-        insecure: insecure,
-        timeout: timeout
-      )
-      try Self.validateRunnableVMBundle(atPath: localDir)
-
-      let size = directorySize(atPath: localDir)
-
-      let record = ImageRecord(
-        id: imageId,
-        reference: parsed.fullReference,
-        digest: pullResult.digest,
-        localPath: localDir,
-        size: size,
-        pulledAt: Date()
-      )
-
-      try await imageStore.addImage(record)
-
-      eventBus.publish(.imagePulled(reference: parsed.fullReference))
-      logInfo("Image pulled: \(parsed.fullReference) -> \(localDir)", category: "ImageManager")
-
-      return record
     } catch is CancellationError {
       try? FileManager.default.removeItem(atPath: localDir)
       logInfo("Image pull cancelled: \(parsed.fullReference)", category: "ImageManager")
       throw CancellationError()
     } catch {
+      if let timeoutMessage = Self.timeoutMessage(from: error) {
+        try? FileManager.default.removeItem(atPath: localDir)
+        eventBus.publish(.imagePullFailed(reference: parsed.fullReference, error: error.localizedDescription))
+        throw ImageManagerError.timeout(timeoutMessage)
+      }
       // Clean up on failure
       try? FileManager.default.removeItem(atPath: localDir)
       eventBus.publish(.imagePullFailed(reference: parsed.fullReference, error: error.localizedDescription))
@@ -277,45 +300,16 @@ actor ImageManager {
     eventBus.publish(.imagePushStarted(reference: parsed.fullReference))
 
     do {
-      let insecure = parsed.isInsecureAllowed(insecureRegistries: config.images.insecureRegistries)
-      do {
-        try await orasClient.checkRegistryReachable(registryHost: parsed.registry, insecure: insecure)
-      } catch {
-        throw ImageManagerError.registryUnreachable(
-          "Cannot reach registry \(parsed.registry): \(error.localizedDescription)"
+      return try await Self.withImageOperationDeadline(
+        timeout: timeout,
+        operationName: "image push \(parsed.fullReference)"
+      ) {
+        try await self.performPushImageFromVM(
+          parsed: parsed,
+          vmBundlePath: vmBundlePath,
+          timeout: timeout
         )
       }
-      let pushResult = try await pushImageBundle(
-        reference: parsed,
-        bundlePath: vmBundlePath,
-        insecure: insecure,
-        timeout: timeout
-      )
-
-      // Register locally so it can be re-pulled or re-pushed
-      let imageId = UUID()
-      let record = ImageRecord(
-        id: imageId,
-        reference: parsed.fullReference,
-        digest: pushResult.digest,
-        localPath: vmBundlePath,
-        size: directorySize(atPath: vmBundlePath),
-        pushedAt: Date(),
-        metadata: [
-          "sourceType": "vm",
-          "imageFormat": "chunked-zstd",
-          "artifactType": jeballtoImageArtifactType,
-          "compression": "zstd",
-          "chunkSize": String(VMImagePackager.defaultChunkSize),
-        ]
-      )
-
-      try await imageStore.addImage(record)
-
-      eventBus.publish(.imagePushed(reference: parsed.fullReference))
-      logInfo("Image pushed: \(parsed.fullReference) (digest: \(pushResult.digest))", category: "ImageManager")
-
-      return record
     } catch is CancellationError {
       logInfo("Image push cancelled: \(parsed.fullReference)", category: "ImageManager")
       throw CancellationError()
@@ -323,6 +317,10 @@ actor ImageManager {
       eventBus.publish(.imagePushFailed(reference: parsed.fullReference, error: error.localizedDescription))
       throw error
     } catch {
+      if let timeoutMessage = Self.timeoutMessage(from: error) {
+        eventBus.publish(.imagePushFailed(reference: parsed.fullReference, error: error.localizedDescription))
+        throw ImageManagerError.timeout(timeoutMessage)
+      }
       eventBus.publish(.imagePushFailed(reference: parsed.fullReference, error: error.localizedDescription))
       throw ImageManagerError.pushFailed(error.localizedDescription)
     }
@@ -345,46 +343,17 @@ actor ImageManager {
     eventBus.publish(.imagePushStarted(reference: parsed.fullReference))
 
     do {
-      let insecure = parsed.isInsecureAllowed(insecureRegistries: config.images.insecureRegistries)
-      do {
-        try await orasClient.checkRegistryReachable(registryHost: parsed.registry, insecure: insecure)
-      } catch {
-        throw ImageManagerError.registryUnreachable(
-          "Cannot reach registry \(parsed.registry): \(error.localizedDescription)"
+      return try await Self.withImageOperationDeadline(
+        timeout: timeout,
+        operationName: "image push \(parsed.fullReference)"
+      ) {
+        try await self.performPushImage(
+          parsed: parsed,
+          sourceImageId: imageId,
+          existing: existing,
+          timeout: timeout
         )
       }
-      let pushResult = try await pushImageBundle(
-        reference: parsed,
-        bundlePath: existing.localPath,
-        insecure: insecure,
-        timeout: timeout
-      )
-
-      // Create a new record for the new reference
-      let newId = UUID()
-      let record = ImageRecord(
-        id: newId,
-        reference: parsed.fullReference,
-        digest: pushResult.digest,
-        localPath: existing.localPath,
-        size: existing.size,
-        pulledAt: existing.pulledAt,
-        pushedAt: Date(),
-        metadata: [
-          "sourceImageId": imageId.uuidString,
-          "imageFormat": "chunked-zstd",
-          "artifactType": jeballtoImageArtifactType,
-          "compression": "zstd",
-          "chunkSize": String(VMImagePackager.defaultChunkSize),
-        ]
-      )
-
-      try await imageStore.addImage(record)
-
-      eventBus.publish(.imagePushed(reference: parsed.fullReference))
-      logInfo("Image re-pushed: \(parsed.fullReference) (digest: \(pushResult.digest))", category: "ImageManager")
-
-      return record
     } catch is CancellationError {
       logInfo("Image push cancelled: \(parsed.fullReference)", category: "ImageManager")
       throw CancellationError()
@@ -392,6 +361,10 @@ actor ImageManager {
       eventBus.publish(.imagePushFailed(reference: parsed.fullReference, error: error.localizedDescription))
       throw error
     } catch {
+      if let timeoutMessage = Self.timeoutMessage(from: error) {
+        eventBus.publish(.imagePushFailed(reference: parsed.fullReference, error: error.localizedDescription))
+        throw ImageManagerError.timeout(timeoutMessage)
+      }
       eventBus.publish(.imagePushFailed(reference: parsed.fullReference, error: error.localizedDescription))
       throw ImageManagerError.pushFailed(error.localizedDescription)
     }
@@ -460,6 +433,151 @@ actor ImageManager {
 
   // MARK: - Helpers
 
+  private func performPullImage(
+    parsed: ImageReference,
+    imageId: UUID,
+    localDir: String,
+    timeout: TimeInterval?
+  ) async throws -> ImageRecord {
+    try FileManager.default.createDirectory(atPath: localDir, withIntermediateDirectories: true)
+
+    let insecure = parsed.isInsecureAllowed(insecureRegistries: config.images.insecureRegistries)
+    let manifest = try await orasClient.fetchManifest(reference: parsed, insecure: insecure)
+    do {
+      try manifest.validateJeballtoImage(reference: parsed.fullReference)
+    } catch {
+      logError(
+        "Unsupported Jeballto image format for \(parsed.fullReference): \(manifest.formatSummary)",
+        category: "ImageManager"
+      )
+      throw error
+    }
+    let pullResult = try await pullImageArtifact(
+      parsed,
+      manifest: manifest,
+      localDir: localDir,
+      insecure: insecure,
+      timeout: timeout
+    )
+    try Self.validateRunnableVMBundle(atPath: localDir)
+
+    let size = directorySize(atPath: localDir)
+
+    let record = ImageRecord(
+      id: imageId,
+      reference: parsed.fullReference,
+      digest: pullResult.digest,
+      localPath: localDir,
+      size: size,
+      pulledAt: Date()
+    )
+
+    let storedRecord = try await imageStore.addImageIfReferenceAbsent(record)
+    if storedRecord.id != record.id {
+      try? FileManager.default.removeItem(atPath: localDir)
+      eventBus.publish(.imagePulled(reference: parsed.fullReference))
+      logInfo("Image became local while pulling: \(parsed.fullReference)", category: "ImageManager")
+      return storedRecord
+    }
+
+    eventBus.publish(.imagePulled(reference: parsed.fullReference))
+    logInfo("Image pulled: \(parsed.fullReference) -> \(localDir)", category: "ImageManager")
+
+    return record
+  }
+
+  private func performPushImageFromVM(
+    parsed: ImageReference,
+    vmBundlePath: String,
+    timeout: TimeInterval?
+  ) async throws -> ImageRecord {
+    let insecure = parsed.isInsecureAllowed(insecureRegistries: config.images.insecureRegistries)
+    do {
+      try await orasClient.checkRegistryReachable(registryHost: parsed.registry, insecure: insecure)
+    } catch {
+      throw ImageManagerError.registryUnreachable(
+        "Cannot reach registry \(parsed.registry): \(error.localizedDescription)"
+      )
+    }
+    let pushResult = try await pushImageBundle(
+      reference: parsed,
+      bundlePath: vmBundlePath,
+      insecure: insecure,
+      timeout: timeout
+    )
+
+    let imageId = UUID()
+    let record = ImageRecord(
+      id: imageId,
+      reference: parsed.fullReference,
+      digest: pushResult.digest,
+      localPath: vmBundlePath,
+      size: directorySize(atPath: vmBundlePath),
+      pushedAt: Date(),
+      metadata: [
+        "sourceType": "vm",
+        "imageFormat": "chunked-zstd",
+        "artifactType": jeballtoImageArtifactType,
+        "compression": "zstd",
+        "chunkSize": String(VMImagePackager.defaultChunkSize),
+      ]
+    )
+
+    try await imageStore.addImage(record)
+
+    eventBus.publish(.imagePushed(reference: parsed.fullReference))
+    logInfo("Image pushed: \(parsed.fullReference) (digest: \(pushResult.digest))", category: "ImageManager")
+
+    return record
+  }
+
+  private func performPushImage(
+    parsed: ImageReference,
+    sourceImageId: UUID,
+    existing: ImageRecord,
+    timeout: TimeInterval?
+  ) async throws -> ImageRecord {
+    let insecure = parsed.isInsecureAllowed(insecureRegistries: config.images.insecureRegistries)
+    do {
+      try await orasClient.checkRegistryReachable(registryHost: parsed.registry, insecure: insecure)
+    } catch {
+      throw ImageManagerError.registryUnreachable(
+        "Cannot reach registry \(parsed.registry): \(error.localizedDescription)"
+      )
+    }
+    let pushResult = try await pushImageBundle(
+      reference: parsed,
+      bundlePath: existing.localPath,
+      insecure: insecure,
+      timeout: timeout
+    )
+
+    let newId = UUID()
+    let record = ImageRecord(
+      id: newId,
+      reference: parsed.fullReference,
+      digest: pushResult.digest,
+      localPath: existing.localPath,
+      size: existing.size,
+      pulledAt: existing.pulledAt,
+      pushedAt: Date(),
+      metadata: [
+        "sourceImageId": sourceImageId.uuidString,
+        "imageFormat": "chunked-zstd",
+        "artifactType": jeballtoImageArtifactType,
+        "compression": "zstd",
+        "chunkSize": String(VMImagePackager.defaultChunkSize),
+      ]
+    )
+
+    try await imageStore.addImage(record)
+
+    eventBus.publish(.imagePushed(reference: parsed.fullReference))
+    logInfo("Image re-pushed: \(parsed.fullReference) (digest: \(pushResult.digest))", category: "ImageManager")
+
+    return record
+  }
+
   private func pushImageBundle(
     reference: ImageReference,
     bundlePath: String,
@@ -468,28 +586,30 @@ actor ImageManager {
   ) async throws -> OrasPushResult {
     let packager = VMImagePackager(
       zstdClient: ZstdClient(config: config.images),
-      maxParallelChunks: config.images.maxParallelImageChunks
+      maxParallelChunks: VMImagePackager.automaticParallelChunkLimit()
     )
     let sourceFingerprint = try packager.sourceFingerprint(bundlePath: bundlePath)
-    let pushDir = Self.resumePushDirectory(sourceFingerprint: sourceFingerprint)
-    let packageDir = "\(pushDir)/package"
-    try FileManager.default.createDirectory(atPath: packageDir, withIntermediateDirectories: true)
+    return try await withOperationCacheAccess(for: "push:\(sourceFingerprint)") {
+      let pushDir = Self.pushOperationDirectory(sourceFingerprint: sourceFingerprint)
+      let packageDir = "\(pushDir)/package"
+      try FileManager.default.createDirectory(atPath: packageDir, withIntermediateDirectories: true)
 
-    let package = try await packager.packBundle(
-      bundlePath: bundlePath,
-      stagingDirectory: packageDir,
-      timeout: timeout
-    )
+      let package = try await packager.packBundle(
+        bundlePath: bundlePath,
+        stagingDirectory: packageDir,
+        timeout: timeout
+      )
 
-    let pushResult = try await pushImagePackage(
-      reference: reference,
-      package: package,
-      insecure: insecure,
-      operationDirectory: pushDir,
-      timeout: timeout
-    )
-    try? FileManager.default.removeItem(atPath: pushDir)
-    return pushResult
+      let pushResult = try await pushImagePackage(
+        reference: reference,
+        package: package,
+        insecure: insecure,
+        operationDirectory: pushDir,
+        timeout: timeout
+      )
+      try? FileManager.default.removeItem(atPath: pushDir)
+      return pushResult
+    }
   }
 
   private func pullImageArtifact(
@@ -504,7 +624,27 @@ actor ImageManager {
     } else {
       try await orasClient.resolve(reference: reference, insecure: insecure)
     }
-    let pullDir = Self.resumePullDirectory(manifestDigest: resolvedDigest)
+    return try await withOperationCacheAccess(for: "pull:\(resolvedDigest)") {
+      try await pullResolvedImageArtifact(
+        reference,
+        manifest: manifest,
+        localDir: localDir,
+        resolvedDigest: resolvedDigest,
+        insecure: insecure,
+        timeout: timeout
+      )
+    }
+  }
+
+  private func pullResolvedImageArtifact(
+    _ reference: ImageReference,
+    manifest: OrasManifestInfo,
+    localDir: String,
+    resolvedDigest: String,
+    insecure: Bool,
+    timeout: TimeInterval?
+  ) async throws -> OrasPullResult {
+    let pullDir = Self.pullOperationDirectory(manifestDigest: resolvedDigest)
     let blobCacheDir = "\(pullDir)/blobs"
     let configPath = "\(pullDir)/config/vm-bundle-config.json"
     let layerDirectory = "\(pullDir)/layers"
@@ -527,6 +667,7 @@ actor ImageManager {
       cachePath: configCachePath,
       insecure: insecure,
       orasClient: orasClient,
+      blobCache: blobCache,
       timeout: timeout
     )
     try Self.copyCachedBlob(from: configCachePath, to: configPath)
@@ -538,6 +679,7 @@ actor ImageManager {
     let descriptorsByDigest = layerDescriptorsByDigest
     let blobCacheDirectory = blobCacheDir
     let orasClient = orasClient
+    let blobCache = blobCache
     let fetchLayer: VMImageLayerFetcher = { packedFile, chunk, destinationPath in
       guard let compressedDigest = chunk.compressedDigest,
             let compressedSize = chunk.compressedSize,
@@ -563,6 +705,7 @@ actor ImageManager {
         cachePath: cachedBlobPath,
         insecure: insecure,
         orasClient: orasClient,
+        blobCache: blobCache,
         timeout: timeout
       )
       try Self.copyCachedBlob(from: cachedBlobPath, to: destinationPath)
@@ -570,7 +713,10 @@ actor ImageManager {
 
     let packager = VMImagePackager(
       zstdClient: ZstdClient(config: config.images),
-      maxParallelChunks: config.images.maxParallelImageChunks
+      maxParallelChunks: VMImagePackager.automaticParallelChunkLimit(),
+      maxParallelUnpackChunks: config.images.maxParallelImageBlobTransfers,
+      maxParallelDecompressions: config.images.maxParallelImageDecompressions,
+      maxParallelDiskWrites: config.images.maxParallelImageDiskWrites
     )
     try await packager.unpackBundle(
       configPath: configPath,
@@ -583,6 +729,13 @@ actor ImageManager {
     return OrasPullResult(digest: resolvedDigest, rawOutput: manifest.rawManifest)
   }
 
+  private func withOperationCacheAccess<T>(
+    for key: String,
+    operation: @Sendable () async throws -> T
+  ) async throws -> T {
+    try await operationCache.withExclusiveAccess(for: key, operation: operation)
+  }
+
   private nonisolated static func uniqueBlobCandidates(_ candidates: [PushBlobCandidate]) -> [PushBlobCandidate] {
     var seenDigests: Set<String> = []
     var uniqueCandidates: [PushBlobCandidate] = []
@@ -590,6 +743,16 @@ actor ImageManager {
       uniqueCandidates.append(candidate)
     }
     return uniqueCandidates
+  }
+
+  private nonisolated static func timeoutMessage(from error: Error) -> String? {
+    if case OrasError.timeout(let message) = error {
+      return message
+    }
+    if case ZstdError.timeout(let message) = error {
+      return message
+    }
+    return nil
   }
 
   private func pushImagePackage(
@@ -708,20 +871,20 @@ actor ImageManager {
     timeout: TimeInterval?
   ) async throws -> String {
     if alreadyUploaded,
-       try await orasClient.blobExists(
+       try await orasClient.blobPresence(
          repositoryReference: repositoryReference,
          digest: candidate.descriptor.digest,
          insecure: insecure
-       )
+       ) == .exists
     {
       return candidate.descriptor.digest
     }
 
-    if try await orasClient.blobExists(
+    if try await orasClient.blobPresence(
       repositoryReference: repositoryReference,
       digest: candidate.descriptor.digest,
       insecure: insecure
-    ) {
+    ) == .exists {
       return candidate.descriptor.digest
     }
 
@@ -743,24 +906,27 @@ actor ImageManager {
     cachePath: String,
     insecure: Bool,
     orasClient: OrasClient,
+    blobCache: ImageBlobCache,
     timeout: TimeInterval?
   ) async throws {
-    if cachedBlobIsValid(
-      path: cachePath,
-      expectedDigest: descriptor.digest,
-      expectedSize: descriptor.size
-    ) {
-      return
+    try await blobCache.withExclusiveAccess(for: descriptor.digest) {
+      if cachedBlobIsValid(
+        path: cachePath,
+        expectedDigest: descriptor.digest,
+        expectedSize: descriptor.size
+      ) {
+        return
+      }
+      try? FileManager.default.removeItem(atPath: cachePath)
+      try await orasClient.fetchBlob(
+        reference: reference,
+        digest: descriptor.digest,
+        outputPath: cachePath,
+        expectedSize: descriptor.size,
+        insecure: insecure,
+        timeout: timeout
+      )
     }
-    try? FileManager.default.removeItem(atPath: cachePath)
-    try await orasClient.fetchBlob(
-      reference: reference,
-      digest: descriptor.digest,
-      outputPath: cachePath,
-      expectedSize: descriptor.size,
-      insecure: insecure,
-      timeout: timeout
-    )
   }
 
   nonisolated static func cachedBlobIsValid(
@@ -778,21 +944,24 @@ actor ImageManager {
   }
 
   private func effectiveImageTransferLimit() -> Int {
-    if config.images.maxParallelImageChunks > 0 {
-      return config.images.maxParallelImageChunks
-    }
-    return VMImagePackager.automaticParallelChunkLimit()
+    config.images.maxParallelImageBlobTransfers
   }
 
-  private nonisolated static func resumePullDirectory(manifestDigest: String) -> String {
+  nonisolated static func pullOperationDirectory(manifestDigest: String) -> String {
     JeballtoCachePaths.imageWork
-      .appendingPathComponent("resume/pulls/\(sanitizeCacheKey(manifestDigest))", isDirectory: true)
+      .appendingPathComponent(
+        "operations/pulls/\(sanitizeCacheKey(manifestDigest))",
+        isDirectory: true
+      )
       .path
   }
 
-  private nonisolated static func resumePushDirectory(sourceFingerprint: String) -> String {
+  nonisolated static func pushOperationDirectory(sourceFingerprint: String) -> String {
     JeballtoCachePaths.imageWork
-      .appendingPathComponent("resume/pushes/\(sanitizeCacheKey(sourceFingerprint))", isDirectory: true)
+      .appendingPathComponent(
+        "operations/pushes/\(sanitizeCacheKey(sourceFingerprint))",
+        isDirectory: true
+      )
       .path
   }
 

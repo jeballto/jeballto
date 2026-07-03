@@ -680,9 +680,11 @@ curl -X PATCH http://127.0.0.1:8011/v1/config \
 | `networking` | `autoEnableSSHForwarding` | bool |
 | `networking` | `vncPortRangeStart`, `vncPortRangeEnd` | 1024-65535 |
 | `images` | `defaultRegistry`, `insecureRegistries` | - |
-| `images` | `maxParallelImageChunks` | Concurrent image chunk fetch, compression, decompression, and upload. `0` auto, otherwise 1-32. Auto is `max(1, min(4, active CPU count / 2))` |
+| `images` | `maxParallelImageBlobTransfers` | Concurrent ORAS blob fetch and push processes. Default 16, range 1-64 |
+| `images` | `maxParallelImageDecompressions` | Concurrent zstd decompressions during image pull. Default 2, range 1-8 |
+| `images` | `maxParallelImageDiskWrites` | Concurrent output writes during image pull. Default 1, range 1-4 |
 
-Image transfer resume data is kept only within the current agent session under `~/Library/Caches/Jeballto/ImageWork/`. Startup removes it, and successful pull or push removes the operation cache immediately.
+Image transfer operation data is kept only within the current agent session under `~/Library/Caches/Jeballto/ImageWork/`. Startup removes it, and successful pull or push removes the operation cache immediately.
 
 ## System Reset
 

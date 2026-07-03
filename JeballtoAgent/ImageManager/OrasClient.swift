@@ -127,6 +127,11 @@ struct OrasManifestInfo: Sendable {
   }
 }
 
+enum OrasBlobPresence: Equatable, Sendable {
+  case exists
+  case missing
+}
+
 /// Swift wrapper around the oras CLI binary.
 /// Uses Process with array arguments (no shell) to prevent command injection.
 struct OrasClient: Sendable {
@@ -147,37 +152,12 @@ struct OrasClient: Sendable {
 
   // MARK: - Public API
 
-  /// Pushes pre-packed VM image chunks as independent OCI layers.
-  func pushImagePackage(
-    reference: ImageReference,
-    package: VMImagePackage,
-    insecure: Bool = false,
-    timeout: TimeInterval? = nil
-  ) async throws -> OrasPushResult {
-    var args = ["push", reference.fullReference]
-    args.append(contentsOf: [
-      "--config", "vm-bundle-config.json:\(jeballtoImageConfigMediaType)",
-      "--artifact-type", jeballtoImageArtifactType,
-      "--format", "json",
-      "--disable-path-validation",
-    ])
-    for layer in package.layers {
-      args.append("\(layer.relativePath):\(layer.mediaType)")
-    }
-    args.append(contentsOf: Self.transportSecurityArguments(plainHTTP: insecure))
-
-    let result = try await execute(
-      arguments: args,
-      timeout: timeout ?? Self.defaultTimeout,
-      workingDirectory: package.stagingDirectory
-    )
-    let stdout = String(data: result.stdout, encoding: .utf8) ?? ""
-    let digest = parseDigestFromJSON(stdout) ?? "unknown"
-    return OrasPushResult(digest: digest, rawOutput: stdout)
-  }
-
   /// Checks if a blob digest exists in a repository.
-  func blobExists(repositoryReference: String, digest: String, insecure: Bool = false) async throws -> Bool {
+  func blobPresence(
+    repositoryReference: String,
+    digest: String,
+    insecure: Bool = false
+  ) async throws -> OrasBlobPresence {
     try Task.checkCancellation()
 
     var args = ["blob", "fetch", "--descriptor", "\(repositoryReference)@\(digest)"]
@@ -185,11 +165,16 @@ struct OrasClient: Sendable {
 
     do {
       _ = try await execute(arguments: args, timeout: Self.shortTimeout)
-      return true
+      return .exists
     } catch is CancellationError {
       throw CancellationError()
+    } catch let error as OrasError {
+      if Self.isMissingBlobError(error) {
+        return .missing
+      }
+      throw error
     } catch {
-      return false
+      throw error
     }
   }
 
@@ -624,6 +609,17 @@ struct OrasClient: Sendable {
   private func parseDescriptorFromJSON(_ output: String) -> OrasDescriptor? {
     guard let data = output.data(using: .utf8), !data.isEmpty else { return nil }
     return try? JSONDecoder().decode(OrasDescriptor.self, from: data)
+  }
+
+  private static func isMissingBlobError(_ error: OrasError) -> Bool {
+    guard case .commandFailed(_, let stderr) = error else { return false }
+    let normalized = stderr.uppercased()
+    return normalized.contains("404")
+      || normalized.contains("NOT FOUND")
+      || normalized.contains("NOT_FOUND")
+      || normalized.contains("BLOB_UNKNOWN")
+      || normalized.contains("NAME_UNKNOWN")
+      || normalized.contains("MANIFEST_UNKNOWN")
   }
 
   private func fileSize(atPath path: String) throws -> UInt64 {

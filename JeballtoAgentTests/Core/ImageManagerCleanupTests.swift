@@ -96,7 +96,9 @@ struct ImageManagerCleanupTests {
     try await withTemporaryDirectory(prefix: "image-manager-config-update") { root in
       var config = Config.default
       config.images.imageStorageDir = root
-      config.images.maxParallelImageChunks = 1
+      config.images.maxParallelImageBlobTransfers = 1
+      config.images.maxParallelImageDecompressions = 1
+      config.images.maxParallelImageDiskWrites = 1
       config.storage.imageIndexPath = "\(root)/images.json"
       let manager = ImageManager(
         imageStore: ImageStore(storagePath: root, indexPath: config.storage.imageIndexPath),
@@ -106,14 +108,18 @@ struct ImageManagerCleanupTests {
       )
 
       var updatedConfig = config
-      updatedConfig.images.maxParallelImageChunks = 7
+      updatedConfig.images.maxParallelImageBlobTransfers = 7
+      updatedConfig.images.maxParallelImageDecompressions = 4
+      updatedConfig.images.maxParallelImageDiskWrites = 2
       updatedConfig.images.insecureRegistries = ["registry.example.com"]
       updatedConfig.images.orasPath = "\(root)/oras"
 
       await manager.updateConfiguration(updatedConfig)
 
       let imageConfig = await manager.currentImageConfig()
-      #expect(imageConfig.maxParallelImageChunks == 7)
+      #expect(imageConfig.maxParallelImageBlobTransfers == 7)
+      #expect(imageConfig.maxParallelImageDecompressions == 4)
+      #expect(imageConfig.maxParallelImageDiskWrites == 2)
       #expect(imageConfig.insecureRegistries == ["registry.example.com"])
       #expect(imageConfig.orasPath == "\(root)/oras")
     }
@@ -121,16 +127,57 @@ struct ImageManagerCleanupTests {
 
   @Test
   func startupCleanupRemovesSessionScopedImageWorkCache() throws {
-    let resumeCache = JeballtoCachePaths.imageWork
-      .appendingPathComponent("resume/pulls/sha256-test", isDirectory: true)
+    let operationCache = JeballtoCachePaths.imageWork
+      .appendingPathComponent("operations/pulls/sha256-test", isDirectory: true)
       .path
-    try FileManager.default.createDirectory(atPath: resumeCache, withIntermediateDirectories: true)
-    try Data("partial blob".utf8).write(to: URL(fileURLWithPath: "\(resumeCache)/layer"))
+    try FileManager.default.createDirectory(atPath: operationCache, withIntermediateDirectories: true)
+    try Data("partial blob".utf8).write(to: URL(fileURLWithPath: "\(operationCache)/layer"))
 
     ImageManager.cleanupImageWorkDirectory()
 
-    #expect(FileManager.default.fileExists(atPath: resumeCache) == false)
+    #expect(FileManager.default.fileExists(atPath: operationCache) == false)
     #expect(FileManager.default.fileExists(atPath: JeballtoCachePaths.imageWork.path) == false)
+  }
+
+  @Test
+  func operationDirectoriesAreStableForSameSessionResumeKey() {
+    let pullPath = ImageManager.pullOperationDirectory(manifestDigest: "sha256:abc/def")
+    let samePullPath = ImageManager.pullOperationDirectory(manifestDigest: "sha256:abc/def")
+    let differentPullPath = ImageManager.pullOperationDirectory(manifestDigest: "sha256:xyz")
+    let pushPath = ImageManager.pushOperationDirectory(sourceFingerprint: "sha256:source")
+    let samePushPath = ImageManager.pushOperationDirectory(sourceFingerprint: "sha256:source")
+
+    #expect(pullPath == samePullPath)
+    #expect(pullPath != differentPullPath)
+    #expect(pushPath == samePushPath)
+    #expect(pullPath.contains("/operations/pulls/"))
+    #expect(pushPath.contains("/operations/pushes/"))
+  }
+
+  @Test
+  func imageOperationDeadlineCancelsWholeOperation() async {
+    let startedAt = Date()
+
+    do {
+      _ = try await ImageManager.withImageOperationDeadline(
+        timeout: 0.05,
+        operationName: "test image operation"
+      ) {
+        try await Task.sleep(nanoseconds: 5_000_000_000)
+        return true
+      }
+      Issue.record("Expected image operation deadline to throw")
+    } catch let error as OrasError {
+      guard case .timeout(let command) = error else {
+        Issue.record("Expected OrasError.timeout, got \(error)")
+        return
+      }
+      #expect(command == "test image operation")
+    } catch {
+      Issue.record("Expected OrasError.timeout, got \(error)")
+    }
+
+    #expect(Date().timeIntervalSince(startedAt) < 1)
   }
 
   @Test
@@ -173,5 +220,172 @@ struct ImageManagerCleanupTests {
     #expect(manifest.artifactType == jeballtoImageArtifactType)
     #expect(manifest.configDescriptor == config)
     #expect(manifest.layers == [layer])
+  }
+
+  @Test
+  func blobCacheSerializesWorkForSameDigestOnly() async throws {
+    let cache = ImageBlobCache()
+    let recorder = BlobCacheRecorder()
+
+    try await withThrowingTaskGroup(of: Void.self) { group in
+      for _ in 0 ..< 3 {
+        group.addTask {
+          try await cache.withExclusiveAccess(for: "sha256:same") {
+            await recorder.beginSameDigestWork()
+            try await Task.sleep(nanoseconds: 20_000_000)
+            await recorder.endSameDigestWork()
+          }
+        }
+      }
+
+      try await group.waitForAll()
+    }
+
+    #expect(await recorder.maxActiveSameDigestWork() == 1)
+  }
+
+  @Test
+  func operationCacheSerializesWorkForSameKey() async throws {
+    let cache = ImageOperationCache()
+    let recorder = OperationCacheRecorder()
+
+    try await withThrowingTaskGroup(of: Void.self) { group in
+      for _ in 0 ..< 3 {
+        group.addTask {
+          try await cache.withExclusiveAccess(for: "pull:sha256-same") {
+            await recorder.beginSameKeyWork()
+            try await Task.sleep(nanoseconds: 20_000_000)
+            await recorder.endSameKeyWork()
+          }
+        }
+      }
+
+      try await group.waitForAll()
+    }
+
+    #expect(await recorder.maxActiveSameKeyWork() == 1)
+  }
+
+  @Test
+  func operationCacheCancelsWaitingWork() async throws {
+    let cache = ImageOperationCache()
+    let holderEntered = AsyncTestSignal()
+    let holder = Task {
+      try await cache.withExclusiveAccess(for: "pull:sha256-same") {
+        await holderEntered.signal()
+        try await Task.sleep(nanoseconds: 250_000_000)
+      }
+    }
+    await holderEntered.wait()
+
+    let waiter = Task {
+      try await cache.withExclusiveAccess(for: "pull:sha256-same") {
+        Issue.record("Cancelled waiter should not run cached work")
+      }
+    }
+    try await Task.sleep(nanoseconds: 20_000_000)
+
+    waiter.cancel()
+    await #expect(throws: CancellationError.self) {
+      try await waiter.value
+    }
+
+    holder.cancel()
+    _ = try? await holder.value
+
+    let completed = try await cache.withExclusiveAccess(for: "pull:sha256-same") {
+      true
+    }
+    #expect(completed)
+  }
+
+  @Test
+  func concurrencyLimiterCancelsWaitingWork() async throws {
+    let limiter = ImageConcurrencyLimiter(limit: 1)
+    let holderEntered = AsyncTestSignal()
+    let holder = Task {
+      try await limiter.withPermit {
+        await holderEntered.signal()
+        try await Task.sleep(nanoseconds: 250_000_000)
+      }
+    }
+    await holderEntered.wait()
+
+    let waiter = Task {
+      try await limiter.withPermit {
+        Issue.record("Cancelled waiter should not receive a permit")
+      }
+    }
+    try await Task.sleep(nanoseconds: 20_000_000)
+
+    waiter.cancel()
+    await #expect(throws: CancellationError.self) {
+      try await waiter.value
+    }
+
+    holder.cancel()
+    _ = try? await holder.value
+
+    let completed = try await limiter.withPermit {
+      true
+    }
+    #expect(completed)
+  }
+}
+
+private actor AsyncTestSignal {
+  private var isSignalled = false
+  private var continuations: [CheckedContinuation<Void, Never>] = []
+
+  func signal() {
+    isSignalled = true
+    let waitingContinuations = continuations
+    continuations.removeAll()
+    for continuation in waitingContinuations {
+      continuation.resume()
+    }
+  }
+
+  func wait() async {
+    guard isSignalled == false else { return }
+    await withCheckedContinuation { continuation in
+      continuations.append(continuation)
+    }
+  }
+}
+
+private actor BlobCacheRecorder {
+  private var activeSameDigestWork = 0
+  private var maxActiveSameDigestWorkValue = 0
+
+  func beginSameDigestWork() {
+    activeSameDigestWork += 1
+    maxActiveSameDigestWorkValue = max(maxActiveSameDigestWorkValue, activeSameDigestWork)
+  }
+
+  func endSameDigestWork() {
+    activeSameDigestWork -= 1
+  }
+
+  func maxActiveSameDigestWork() -> Int {
+    maxActiveSameDigestWorkValue
+  }
+}
+
+private actor OperationCacheRecorder {
+  private var activeSameKeyWork = 0
+  private var maxActiveSameKeyWorkValue = 0
+
+  func beginSameKeyWork() {
+    activeSameKeyWork += 1
+    maxActiveSameKeyWorkValue = max(maxActiveSameKeyWorkValue, activeSameKeyWork)
+  }
+
+  func endSameKeyWork() {
+    activeSameKeyWork -= 1
+  }
+
+  func maxActiveSameKeyWork() -> Int {
+    maxActiveSameKeyWorkValue
   }
 }

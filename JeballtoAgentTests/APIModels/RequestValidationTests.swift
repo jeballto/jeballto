@@ -143,31 +143,44 @@ struct RequestValidationTests {
   }
 
   @Test
-  func updateConfigImageParallelChunkValidation() throws {
-    let autoJSON = #"{"images":{"maxParallelImageChunks":0}}"#
-    let positiveJSON = #"{"images":{"maxParallelImageChunks":8}}"#
-    let negativeJSON = #"{"images":{"maxParallelImageChunks":-1}}"#
-    let tooHighJSON = #"{"images":{"maxParallelImageChunks":33}}"#
+  func updateConfigImageParallelismValidation() throws {
+    let validJSON = """
+    {"images":{
+      "maxParallelImageBlobTransfers":16,
+      "maxParallelImageDecompressions":2,
+      "maxParallelImageDiskWrites":1
+    }}
+    """
+    let zeroJSON = #"{"images":{"maxParallelImageBlobTransfers":0}}"#
+    let tooHighJSONs = [
+      #"{"images":{"maxParallelImageBlobTransfers":65}}"#,
+      #"{"images":{"maxParallelImageDecompressions":9}}"#,
+      #"{"images":{"maxParallelImageDiskWrites":5}}"#,
+    ]
 
-    let auto = try JSONDecoder().decode(UpdateConfigRequest.self, from: Data(autoJSON.utf8))
-    let positive = try JSONDecoder().decode(UpdateConfigRequest.self, from: Data(positiveJSON.utf8))
-    let negative = try JSONDecoder().decode(UpdateConfigRequest.self, from: Data(negativeJSON.utf8))
-    let tooHigh = try JSONDecoder().decode(UpdateConfigRequest.self, from: Data(tooHighJSON.utf8))
+    let valid = try JSONDecoder().decode(UpdateConfigRequest.self, from: Data(validJSON.utf8))
+    let zero = try JSONDecoder().decode(UpdateConfigRequest.self, from: Data(zeroJSON.utf8))
 
-    #expect(auto.validate().valid)
-    #expect(positive.validate().valid)
-    #expect(negative.validate().valid == false)
-    #expect(tooHigh.validate().valid == false)
+    #expect(valid.validate().valid)
+    #expect(zero.validate().valid == false)
+    for tooHighJSON in tooHighJSONs {
+      let tooHigh = try JSONDecoder().decode(UpdateConfigRequest.self, from: Data(tooHighJSON.utf8))
+      #expect(tooHigh.validate().valid == false)
+    }
   }
 
   @Test
-  func configResponseIncludesImageParallelChunkSetting() {
+  func configResponseIncludesImageParallelismSettings() {
     var config = Config.default
-    config.images.maxParallelImageChunks = 6
+    config.images.maxParallelImageBlobTransfers = 16
+    config.images.maxParallelImageDecompressions = 2
+    config.images.maxParallelImageDiskWrites = 1
 
     let response = ConfigResponse(from: config)
 
-    #expect(response.images.maxParallelImageChunks == 6)
+    #expect(response.images.maxParallelImageBlobTransfers == 16)
+    #expect(response.images.maxParallelImageDecompressions == 2)
+    #expect(response.images.maxParallelImageDiskWrites == 1)
   }
 
   @Test

@@ -461,8 +461,14 @@ extension APIServer {
     guard let images else { return }
     if let registry = images.defaultRegistry { config.images.defaultRegistry = registry }
     if let insecure = images.insecureRegistries { config.images.insecureRegistries = insecure }
-    if let maxParallelImageChunks = images.maxParallelImageChunks {
-      config.images.maxParallelImageChunks = maxParallelImageChunks
+    if let maxParallelImageBlobTransfers = images.maxParallelImageBlobTransfers {
+      config.images.maxParallelImageBlobTransfers = maxParallelImageBlobTransfers
+    }
+    if let maxParallelImageDecompressions = images.maxParallelImageDecompressions {
+      config.images.maxParallelImageDecompressions = maxParallelImageDecompressions
+    }
+    if let maxParallelImageDiskWrites = images.maxParallelImageDiskWrites {
+      config.images.maxParallelImageDiskWrites = maxParallelImageDiskWrites
     }
   }
 

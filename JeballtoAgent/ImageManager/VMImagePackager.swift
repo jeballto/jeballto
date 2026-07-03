@@ -73,6 +73,8 @@ private struct UnpackChunkRequest: Sendable {
   let outputPath: String
   let fetchLayer: VMImageLayerFetcher?
   let zstdClient: ZstdClient
+  let decompressionLimiter: ImageConcurrencyLimiter
+  let diskWriteLimiter: ImageConcurrencyLimiter
   let timeout: TimeInterval?
 }
 
@@ -228,6 +230,11 @@ private enum VMImageConfigValidator {
         "Zero chunk for \(packedFile.path) chunk \(chunk.index) must not include layer metadata"
       )
     }
+    guard chunk.uncompressedDigest == zeroDigest(size: chunk.uncompressedSize) else {
+      throw VMImagePackagerError.invalidConfig(
+        "Zero chunk for \(packedFile.path) chunk \(chunk.index) has an invalid uncompressed digest"
+      )
+    }
   }
 
   private static func validateNonzeroChunk(
@@ -270,6 +277,29 @@ private enum VMImageConfigValidator {
       lowercaseHex.contains(character)
     }
   }
+
+  private static func zeroDigest(size: UInt64) -> String {
+    let bufferSize = 1024 * 1024
+    let zeroBuffer = Data(repeating: 0, count: bufferSize)
+    var remaining = size
+    var hasher = SHA256()
+
+    while remaining > 0 {
+      let count = Int(min(UInt64(bufferSize), remaining))
+      if count == bufferSize {
+        hasher.update(data: zeroBuffer)
+      } else {
+        hasher.update(data: zeroBuffer.prefix(count))
+      }
+      remaining -= UInt64(count)
+    }
+
+    return hexDigest(hasher.finalize())
+  }
+
+  private static func hexDigest(_ digest: some Sequence<UInt8>) -> String {
+    "sha256:" + digest.map { String(format: "%02x", $0) }.joined()
+  }
 }
 
 struct VMImagePackager {
@@ -287,6 +317,9 @@ struct VMImagePackager {
   private let chunkSize: UInt64
   private let compressionLevel: Int
   private let maxParallelChunks: Int
+  private let maxParallelUnpackChunks: Int?
+  private let maxParallelDecompressions: Int?
+  private let maxParallelDiskWrites: Int?
   private let fileManager: FileManager
 
   init(
@@ -294,12 +327,18 @@ struct VMImagePackager {
     chunkSize: UInt64 = Self.defaultChunkSize,
     compressionLevel: Int = Self.defaultCompressionLevel,
     maxParallelChunks: Int = 0,
+    maxParallelUnpackChunks: Int? = nil,
+    maxParallelDecompressions: Int? = nil,
+    maxParallelDiskWrites: Int? = nil,
     fileManager: FileManager = .default
   ) {
     self.zstdClient = zstdClient
     self.chunkSize = chunkSize
     self.compressionLevel = compressionLevel
     self.maxParallelChunks = maxParallelChunks
+    self.maxParallelUnpackChunks = maxParallelUnpackChunks
+    self.maxParallelDecompressions = maxParallelDecompressions
+    self.maxParallelDiskWrites = maxParallelDiskWrites
     self.fileManager = fileManager
   }
 
@@ -633,7 +672,9 @@ struct VMImagePackager {
     let chunks = packedFile.chunks.filter { $0.zero == false }
     guard chunks.isEmpty == false else { return }
     let zstdClient = zstdClient
-    let limit = min(effectiveParallelChunks(), chunks.count)
+    let decompressionLimiter = ImageConcurrencyLimiter(limit: effectiveDecompressionLimit())
+    let diskWriteLimiter = ImageConcurrencyLimiter(limit: effectiveDiskWriteLimit())
+    let limit = min(effectiveUnpackChunkLimit(), chunks.count)
 
     try await withThrowingTaskGroup(of: Void.self) { group in
       var nextIndex = 0
@@ -647,6 +688,8 @@ struct VMImagePackager {
           outputPath: outputPath,
           fetchLayer: fetchLayer,
           zstdClient: zstdClient,
+          decompressionLimiter: decompressionLimiter,
+          diskWriteLimiter: diskWriteLimiter,
           timeout: timeout
         )
         group.addTask {
@@ -666,6 +709,8 @@ struct VMImagePackager {
               outputPath: outputPath,
               fetchLayer: fetchLayer,
               zstdClient: zstdClient,
+              decompressionLimiter: decompressionLimiter,
+              diskWriteLimiter: diskWriteLimiter,
               timeout: timeout
             )
             group.addTask {
@@ -686,6 +731,27 @@ struct VMImagePackager {
       return maxParallelChunks
     }
     return Self.automaticParallelChunkLimit()
+  }
+
+  private func effectiveUnpackChunkLimit() -> Int {
+    if let maxParallelUnpackChunks, maxParallelUnpackChunks > 0 {
+      return maxParallelUnpackChunks
+    }
+    return effectiveParallelChunks()
+  }
+
+  private func effectiveDecompressionLimit() -> Int {
+    if let maxParallelDecompressions, maxParallelDecompressions > 0 {
+      return maxParallelDecompressions
+    }
+    return effectiveParallelChunks()
+  }
+
+  private func effectiveDiskWriteLimit() -> Int {
+    if let maxParallelDiskWrites, maxParallelDiskWrites > 0 {
+      return maxParallelDiskWrites
+    }
+    return effectiveDecompressionLimit()
   }
 
   private static func packChunk(_ request: PackChunkRequest) async throws -> PackedChunkResult {
@@ -848,12 +914,15 @@ struct VMImagePackager {
         throw VMImagePackagerError.digestMismatch("Compressed digest mismatch for \(layerPath)")
       }
 
-      let actualRaw = try await request.zstdClient.decompressToFileRange(
-        inputPath: compressedPath,
-        destinationPath: request.outputPath,
-        offset: chunk.offset,
-        timeout: request.timeout
-      )
+      let actualRaw = try await request.decompressionLimiter.withPermit {
+        try await request.zstdClient.decompressToFileRange(
+          inputPath: compressedPath,
+          destinationPath: request.outputPath,
+          offset: chunk.offset,
+          diskWriteLimiter: request.diskWriteLimiter,
+          timeout: request.timeout
+        )
+      }
       guard actualRaw.size == chunk.uncompressedSize else {
         throw VMImagePackagerError.digestMismatch("Uncompressed size mismatch for \(layerPath)")
       }

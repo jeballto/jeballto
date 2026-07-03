@@ -123,6 +123,17 @@ actor ImageStore {
     try saveToDisk()
   }
 
+  func addImageIfReferenceAbsent(_ record: ImageRecord) throws -> ImageRecord {
+    ensureLoaded()
+    if let existing = index.images.values.first(where: { $0.reference == record.reference }) {
+      return existing
+    }
+    guard index.images[record.id] == nil else { throw ImageStoreError.imageAlreadyExists(record.id) }
+    index.images[record.id] = record
+    try saveToDisk()
+    return record
+  }
+
   func updateImage(_ record: ImageRecord) throws {
     ensureLoaded()
     guard index.images[record.id] != nil else { throw ImageStoreError.imageNotFound(record.id) }

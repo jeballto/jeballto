@@ -239,6 +239,13 @@ struct NetworkingConfig: Codable, Sendable {
 
 /// OCI image management configuration
 struct ImageConfig: Codable, Sendable {
+  static let defaultMaxParallelImageBlobTransfers = 16
+  static let defaultMaxParallelImageDecompressions = 2
+  static let defaultMaxParallelImageDiskWrites = 1
+  static let maximumParallelImageBlobTransfers = 64
+  static let maximumParallelImageDecompressions = 8
+  static let maximumParallelImageDiskWrites = 4
+
   /// Base directory for local image storage
   var imageStorageDir: String
 
@@ -248,9 +255,14 @@ struct ImageConfig: Codable, Sendable {
   /// Path to the `zstd` CLI binary. When `nil`, uses the binary bundled in the app's Resources directory.
   var zstdPath: String?
 
-  /// Maximum number of image chunks to fetch, compress, or decompress concurrently.
-  /// Zero uses an automatic value based on half the CPU count, capped at 4.
-  var maxParallelImageChunks: Int
+  /// Maximum number of OCI image blob transfers to run concurrently.
+  var maxParallelImageBlobTransfers: Int
+
+  /// Maximum number of image chunks to decompress concurrently while pulling.
+  var maxParallelImageDecompressions: Int
+
+  /// Maximum number of image chunk writes to perform concurrently while pulling.
+  var maxParallelImageDiskWrites: Int
 
   /// Default OCI registry (optional, used when reference has no registry prefix)
   var defaultRegistry: String?
@@ -262,7 +274,9 @@ struct ImageConfig: Codable, Sendable {
     imageStorageDir: String? = nil,
     orasPath: String? = nil,
     zstdPath: String? = nil,
-    maxParallelImageChunks: Int = 0,
+    maxParallelImageBlobTransfers: Int = Self.defaultMaxParallelImageBlobTransfers,
+    maxParallelImageDecompressions: Int = Self.defaultMaxParallelImageDecompressions,
+    maxParallelImageDiskWrites: Int = Self.defaultMaxParallelImageDiskWrites,
     defaultRegistry: String? = nil,
     insecureRegistries: [String] = []
   ) {
@@ -270,7 +284,9 @@ struct ImageConfig: Codable, Sendable {
     self.imageStorageDir = imageStorageDir ?? "\(defaultBase)/Images"
     self.orasPath = orasPath
     self.zstdPath = zstdPath
-    self.maxParallelImageChunks = maxParallelImageChunks
+    self.maxParallelImageBlobTransfers = maxParallelImageBlobTransfers
+    self.maxParallelImageDecompressions = maxParallelImageDecompressions
+    self.maxParallelImageDiskWrites = maxParallelImageDiskWrites
     self.defaultRegistry = defaultRegistry
     self.insecureRegistries = insecureRegistries
   }
@@ -281,11 +297,46 @@ struct ImageConfig: Codable, Sendable {
     imageStorageDir = try container.decodeIfPresent(String.self, forKey: .imageStorageDir) ?? "\(defaultBase)/Images"
     orasPath = try container.decodeIfPresent(String.self, forKey: .orasPath)
     zstdPath = try container.decodeIfPresent(String.self, forKey: .zstdPath)
-    maxParallelImageChunks = try container.decodeIfPresent(Int.self, forKey: .maxParallelImageChunks) ?? 0
-    guard (0 ... 32).contains(maxParallelImageChunks) else {
-      throw ConfigError.invalidFormat("images.maxParallelImageChunks must be between 0 and 32")
-    }
+    maxParallelImageBlobTransfers = try container.decodeIfPresent(
+      Int.self,
+      forKey: .maxParallelImageBlobTransfers
+    ) ?? Self.defaultMaxParallelImageBlobTransfers
+    maxParallelImageDecompressions = try container.decodeIfPresent(
+      Int.self,
+      forKey: .maxParallelImageDecompressions
+    ) ?? Self.defaultMaxParallelImageDecompressions
+    maxParallelImageDiskWrites = try container.decodeIfPresent(
+      Int.self,
+      forKey: .maxParallelImageDiskWrites
+    ) ?? Self.defaultMaxParallelImageDiskWrites
+    try Self.validateParallelism(
+      maxParallelImageBlobTransfers: maxParallelImageBlobTransfers,
+      maxParallelImageDecompressions: maxParallelImageDecompressions,
+      maxParallelImageDiskWrites: maxParallelImageDiskWrites
+    )
     defaultRegistry = try container.decodeIfPresent(String.self, forKey: .defaultRegistry)
     insecureRegistries = try container.decodeIfPresent([String].self, forKey: .insecureRegistries) ?? []
+  }
+
+  private static func validateParallelism(
+    maxParallelImageBlobTransfers: Int,
+    maxParallelImageDecompressions: Int,
+    maxParallelImageDiskWrites: Int
+  ) throws {
+    guard (1 ... maximumParallelImageBlobTransfers).contains(maxParallelImageBlobTransfers) else {
+      throw ConfigError.invalidFormat(
+        "images.maxParallelImageBlobTransfers must be between 1 and \(maximumParallelImageBlobTransfers)"
+      )
+    }
+    guard (1 ... maximumParallelImageDecompressions).contains(maxParallelImageDecompressions) else {
+      throw ConfigError.invalidFormat(
+        "images.maxParallelImageDecompressions must be between 1 and \(maximumParallelImageDecompressions)"
+      )
+    }
+    guard (1 ... maximumParallelImageDiskWrites).contains(maxParallelImageDiskWrites) else {
+      throw ConfigError.invalidFormat(
+        "images.maxParallelImageDiskWrites must be between 1 and \(maximumParallelImageDiskWrites)"
+      )
+    }
   }
 }

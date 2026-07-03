@@ -113,6 +113,31 @@ struct ImageStoreTests {
   }
 
   @Test
+  func addImageIfReferenceAbsentReturnsExistingRecord() async throws {
+    try await withTemporaryDirectory(prefix: "imagestore") { root in
+      let store = ImageStore(storagePath: root)
+      let existing = makeRecord(
+        id: UUID(),
+        reference: "registry.example.com/vm:latest",
+        localPath: "\(root)/existing.bundle"
+      )
+      let duplicate = makeRecord(
+        id: UUID(),
+        reference: existing.reference,
+        localPath: "\(root)/duplicate.bundle"
+      )
+
+      let inserted = try await store.addImageIfReferenceAbsent(existing)
+      let reused = try await store.addImageIfReferenceAbsent(duplicate)
+
+      #expect(inserted.id == existing.id)
+      #expect(reused.id == existing.id)
+      #expect(reused.localPath == existing.localPath)
+      #expect(await store.count() == 1)
+    }
+  }
+
+  @Test
   func missingOperationsThrowNotFound() async throws {
     try await withTemporaryDirectory(prefix: "imagestore") { root in
       let store = ImageStore(storagePath: root)
