@@ -183,7 +183,7 @@ curl -X POST http://127.0.0.1:8011/v1/registries/login \
 curl -X POST http://127.0.0.1:8011/v1/images/push \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"reference":"ghcr.io/myorg/vms/dev:latest","sourceVmId":"'$VM_ID'"}'
+  -d '{"reference":"ghcr.io/myorg/vms/dev:latest","source":"vm:'$VM_ID'"}'
 
 # Pull on another machine
 curl -X POST http://127.0.0.1:8011/v1/images/pull \

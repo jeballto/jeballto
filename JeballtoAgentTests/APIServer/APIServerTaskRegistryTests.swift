@@ -63,6 +63,169 @@ struct APIServerTaskRegistryTests {
       #expect(results.count == 1)
     }
   }
+
+  @Test(arguments: [ImageOperationKind.pull, .push])
+  func cancelImageOperationCancelsTaskAndMarksOperationCancelled(_ kind: ImageOperationKind) async throws {
+    try await withTemporaryDirectory { root in
+      let server = makeTestAPIServer(root: root)
+      let operation = await server.imageManager.startImageOperation(
+        kind: kind,
+        reference: "registry.example.com/vm/macos:latest"
+      )
+      let task = server.startImageOperationTask(operation.id) {
+        Task<Void, Never> {
+          while !Task.isCancelled {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+          }
+          try? await Task.sleep(nanoseconds: 50_000_000)
+          await server.imageManager.failImageOperation(operation.id, error: CancellationError())
+        }
+      }
+
+      let request = HTTPRequest(
+        method: "DELETE",
+        path: "/v1/images/\(kind.rawValue)/\(operation.id.uuidString)",
+        headers: [:],
+        body: nil,
+        queryParameters: [:]
+      )
+      let response = switch kind {
+      case .pull:
+        await server.handleCancelImagePull(request)
+      case .push:
+        await server.handleCancelImagePush(request)
+      }
+
+      #expect(response.statusCode == 200)
+      #expect(task.isCancelled)
+      let cancellingStatus = try JSONDecoder().decode(ImageOperationStatusResponse.self, from: #require(response.body))
+      #expect(cancellingStatus.status == "cancelling")
+      await task.value
+      let status = try #require(await server.imageManager.getImageOperationStatus(operation.id))
+      #expect(status.state == .cancelled)
+      #expect(server.cancelImageOperationTask(operation.id) == false)
+    }
+  }
+
+  @Test
+  func immediateImageOperationReleaseDoesNotLeaveStaleTask() async throws {
+    try await withTemporaryDirectory { root in
+      let server = makeTestAPIServer(root: root)
+      let operationId = UUID()
+      let task = server.startImageOperationTask(operationId) {
+        Task<Void, Never> {
+          server.releaseImageOperationTask(operationId)
+        }
+      }
+
+      await task.value
+
+      #expect(server.cancelImageOperationTask(operationId) == false)
+    }
+  }
+
+  @Test
+  func finishedImageOperationIsTerminalBeforeTaskRelease() async throws {
+    try await withTemporaryDirectory { root in
+      let server = makeTestAPIServer(root: root)
+      let operation = await server.imageManager.startImageOperation(
+        kind: .pull,
+        reference: "registry.example.com/vm/macos:latest"
+      )
+      let record = ImageRecord(
+        reference: operation.reference,
+        digest: "sha256:\(String(repeating: "c", count: 64))",
+        localPath: "\(root)/image.bundle"
+      )
+
+      let task = server.startImageOperationTask(operation.id) {
+        Task<Void, Never> {
+          await server.finishImageOperationTask(operation.id, result: .success(record))
+        }
+      }
+
+      await task.value
+      #expect(server.cancelImageOperationTask(operation.id) == false)
+
+      let status = try #require(await server.imageManager.getImageOperationStatus(operation.id))
+      #expect(status.state == .completed)
+
+      let cancelResponse = await server.handleCancelImagePull(HTTPRequest(
+        method: "DELETE",
+        path: "/v1/images/pull/\(operation.id.uuidString)",
+        headers: [:],
+        body: nil,
+        queryParameters: [:]
+      ))
+      #expect(cancelResponse.statusCode == 409)
+    }
+  }
+
+  @Test
+  func wipeAllImagesCancelsActiveImageOperationTasks() async throws {
+    try await withTemporaryDirectory { root in
+      let server = makeTestAPIServer(root: root)
+      let operation = await server.imageManager.startImageOperation(
+        kind: .pull,
+        reference: "registry.example.com/vm/macos:latest"
+      )
+      let task = server.startImageOperationTask(operation.id) {
+        Task<Void, Never> {
+          do {
+            while true {
+              try await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+          } catch is CancellationError {
+            await server.finishImageOperationTask(operation.id, result: .failure(CancellationError()))
+          } catch {
+            await server.finishImageOperationTask(operation.id, result: .failure(error))
+          }
+        }
+      }
+
+      let response = await server.handleWipeAllImages(HTTPRequest(
+        method: "DELETE",
+        path: "/v1/images",
+        headers: [:],
+        body: nil,
+        queryParameters: ["confirm": "true"]
+      ))
+
+      #expect(response.statusCode == 200)
+      #expect(task.isCancelled)
+      await task.value
+
+      let status = try #require(await server.imageManager.getImageOperationStatus(operation.id))
+      #expect(status.state == .cancelled)
+      #expect(server.cancelImageOperationTask(operation.id) == false)
+    }
+  }
+
+  @Test
+  func deleteImageConflictsWithActiveSourceImagePush() async throws {
+    try await withTemporaryDirectory { root in
+      let server = makeTestAPIServer(root: root)
+      let imageId = UUID()
+      let operation = await server.imageManager.startImageOperation(
+        kind: .push,
+        reference: "registry.example.com/vm/macos:latest",
+        source: "image:\(imageId.uuidString)"
+      )
+
+      let response = await server.handleDeleteImage(HTTPRequest(
+        method: "DELETE",
+        path: "/v1/images/\(imageId.uuidString)",
+        headers: [:],
+        body: nil,
+        queryParameters: [:]
+      ))
+
+      #expect(response.statusCode == 409)
+      let errorResponse = try JSONDecoder().decode(ErrorResponse.self, from: #require(response.body))
+      #expect(errorResponse.error.code == "IMAGE_IN_USE")
+      await server.imageManager.failImageOperation(operation.id, error: CancellationError())
+    }
+  }
 }
 
 private func claimUnending(server: APIServer, vmId: UUID) -> (token: UUID?, task: Task<Void, Never>) {

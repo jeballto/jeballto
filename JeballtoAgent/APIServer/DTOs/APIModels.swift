@@ -80,7 +80,7 @@ struct CreateVMRequest: Codable {
 
   func validate() -> (valid: Bool, error: String?) {
     guard VMNameValidator.validate(name) else {
-      return (false, "Invalid VM name. Must be 1-100 characters, alphanumeric, hyphens, and underscores only")
+      return (false, "Invalid VM name. Must be 1-100 characters, alphanumeric, hyphens, underscores, spaces, and dots")
     }
 
     if let image, !image.isEmpty {
@@ -180,7 +180,7 @@ struct CloneVMRequest: Codable {
 
   func validate() -> (valid: Bool, error: String?) {
     guard VMNameValidator.validate(name) else {
-      return (false, "Invalid VM name. Must be 1-100 characters, alphanumeric, hyphens, and underscores only")
+      return (false, "Invalid VM name. Must be 1-100 characters, alphanumeric, hyphens, underscores, spaces, and dots")
     }
     return (true, nil)
   }
@@ -594,6 +594,17 @@ struct SuccessResponse: Codable {
 struct PullImageRequest: Codable {
   let reference: String
   let timeout: Int?
+  var asyncRequested: Bool? = nil
+
+  enum CodingKeys: String, CodingKey {
+    case reference
+    case timeout
+    case asyncRequested = "async"
+  }
+
+  var shouldRunAsync: Bool {
+    asyncRequested ?? false
+  }
 
   func validate() -> (valid: Bool, error: String?) {
     guard !reference.isEmpty else {
@@ -615,6 +626,18 @@ struct PushImageRequest: Codable {
   let reference: String
   let source: String?
   let timeout: Int?
+  var asyncRequested: Bool? = nil
+
+  enum CodingKeys: String, CodingKey {
+    case reference
+    case source
+    case timeout
+    case asyncRequested = "async"
+  }
+
+  var shouldRunAsync: Bool {
+    asyncRequested ?? false
+  }
 
   func validate() -> (valid: Bool, error: String?) {
     guard !reference.isEmpty else {
@@ -742,6 +765,8 @@ struct ImagePullResponse: Codable {
   let digest: String?
   let image: ImageResponse?
   let message: String?
+  var operationId: String? = nil
+  var statusUrl: String? = nil
 }
 
 struct ImagePushResponse: Codable {
@@ -750,6 +775,65 @@ struct ImagePushResponse: Codable {
   let digest: String?
   let image: ImageResponse?
   let message: String?
+  var operationId: String? = nil
+  var statusUrl: String? = nil
+}
+
+struct ImageOperationStatusResponse: Codable {
+  let operationId: String
+  let type: String
+  let reference: String
+  let source: String?
+  let status: String
+  let stage: String?
+  let progress: Double?
+  let stageProgress: Double?
+  let averageSpeedMBps: Double?
+  let chunksCompleted: Int
+  let chunksTotal: Int?
+  let bytesCompleted: UInt64
+  let bytesTotal: UInt64?
+  let startedAt: String
+  let updatedAt: String
+  let completedAt: String?
+  let digest: String?
+  let image: ImageResponse?
+  let error: String?
+
+  init(from status: ImageOperationStatus) {
+    operationId = status.id.uuidString
+    type = status.kind.rawValue
+    reference = status.reference
+    source = status.source
+    self.status = status.state.rawValue
+    stage = status.stage?.rawValue
+    progress = status.progress.map(Self.roundTwoDecimals)
+    stageProgress = status.stageProgress.map(Self.roundTwoDecimals)
+    averageSpeedMBps = Self.averageSpeedMBps(for: status)
+    chunksCompleted = status.chunksCompleted
+    chunksTotal = status.chunksTotal
+    bytesCompleted = status.bytesCompleted
+    bytesTotal = status.bytesTotal
+    startedAt = iso8601Formatter.string(from: status.startedAt)
+    updatedAt = iso8601Formatter.string(from: status.updatedAt)
+    completedAt = status.completedAt.map { iso8601Formatter.string(from: $0) }
+    digest = status.digest
+    image = status.image.map { ImageResponse(from: $0) }
+    error = status.error
+  }
+
+  private static func averageSpeedMBps(for status: ImageOperationStatus) -> Double? {
+    let endDate = status.completedAt ?? status.updatedAt
+    let startedAt = status.stageStartedAt ?? status.startedAt
+    let elapsed = endDate.timeIntervalSince(startedAt)
+    guard elapsed > 0, status.bytesCompleted > 0 else { return nil }
+    let speed = Double(status.bytesCompleted) / elapsed / 1_000_000.0
+    return roundTwoDecimals(speed)
+  }
+
+  private static func roundTwoDecimals(_ value: Double) -> Double {
+    (value * 100).rounded() / 100
+  }
 }
 
 struct RegistryLoginResponse: Codable {

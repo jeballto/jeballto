@@ -172,6 +172,7 @@ First run creates `~/Library/Application Support/Jeballto/config.json` (permissi
     "orasPath": null,
     "zstdPath": null,
     "maxParallelImageBlobTransfers": 16,
+    "maxParallelImageCompressions": 4,
     "maxParallelImageDecompressions": 2,
     "maxParallelImageDiskWrites": 1,
     "defaultRegistry": null,
@@ -212,12 +213,12 @@ Parallelism is split by stage:
 | Setting | Default | Range | Used by |
 |---|---:|---:|---|
 | `maxParallelImageBlobTransfers` | 16 | 1-64 | ORAS blob fetches during pull and ORAS blob pushes during push |
+| `maxParallelImageCompressions` | 4 | 1-32 | Concurrent `zstd` compression processes during push |
 | `maxParallelImageDecompressions` | 2 | 1-8 | Concurrent `zstd` decompression processes during pull |
 | `maxParallelImageDiskWrites` | 1 | 1-4 | Concurrent output writes while pull decompression streams into bundle files |
 
-Push compression uses the packager's automatic chunk work limit, `max(1, min(4, active CPU count / 2))`.
-The decompression and disk-write limits apply only to pull, because push never reconstructs bundle files
-from compressed layers.
+Push compression uses `maxParallelImageCompressions`. The decompression and disk-write limits apply only
+to pull, because push never reconstructs bundle files from compressed layers.
 
 OCI pull and push operation cache is session-scoped under `~/Library/Caches/Jeballto/ImageWork/`. Agent
 startup removes the whole ImageWork directory, and each successful transfer deletes its own operation

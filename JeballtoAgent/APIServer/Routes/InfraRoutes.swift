@@ -464,6 +464,9 @@ extension APIServer {
     if let maxParallelImageBlobTransfers = images.maxParallelImageBlobTransfers {
       config.images.maxParallelImageBlobTransfers = maxParallelImageBlobTransfers
     }
+    if let maxParallelImageCompressions = images.maxParallelImageCompressions {
+      config.images.maxParallelImageCompressions = maxParallelImageCompressions
+    }
     if let maxParallelImageDecompressions = images.maxParallelImageDecompressions {
       config.images.maxParallelImageDecompressions = maxParallelImageDecompressions
     }

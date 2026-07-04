@@ -115,7 +115,7 @@ Thin wrapper around the `oras` CLI binary. Key design choices:
 - Output capped at 5 MB per stream
 - VM images are chunked by `VMImagePackager` and compressed by `zstd` before ORAS uploads each nonzero chunk as a separate layer
 - Pull and push operation cache lives under `ImageWork/operations/` for the current agent session only. Startup removes all ImageWork data, successful transfers delete their operation cache, and failed or cancelled transfers keep verified work until the agent exits
-- Image pull parallelism is split by stage: `maxParallelImageBlobTransfers` defaults to 16 ORAS blob transfers, `maxParallelImageDecompressions` defaults to 2 zstd decoders, and `maxParallelImageDiskWrites` defaults to 1 output write slot
+- Image transfer parallelism is split by stage: `maxParallelImageBlobTransfers` defaults to 16 ORAS blob transfers, `maxParallelImageCompressions` defaults to 4 zstd encoders, `maxParallelImageDecompressions` defaults to 2 zstd decoders, and `maxParallelImageDiskWrites` defaults to 1 output write slot
 
 Resolves `oras` binary: checks `config.images.orasPath` first, then `Bundle.main.resourceURL/oras`.
 Resolves `zstd` binary: checks `config.images.zstdPath` first, then `Bundle.main.resourceURL/zstd`.

@@ -65,6 +65,7 @@ struct ImageConfigResponse: Codable {
   let defaultRegistry: String?
   let insecureRegistries: [String]
   let maxParallelImageBlobTransfers: Int
+  let maxParallelImageCompressions: Int
   let maxParallelImageDecompressions: Int
   let maxParallelImageDiskWrites: Int
 
@@ -72,6 +73,7 @@ struct ImageConfigResponse: Codable {
     defaultRegistry = config.defaultRegistry
     insecureRegistries = config.insecureRegistries
     maxParallelImageBlobTransfers = config.maxParallelImageBlobTransfers
+    maxParallelImageCompressions = config.maxParallelImageCompressions
     maxParallelImageDecompressions = config.maxParallelImageDecompressions
     maxParallelImageDiskWrites = config.maxParallelImageDiskWrites
   }
@@ -183,6 +185,11 @@ struct UpdateConfigRequest: Codable {
         ImageConfig.maximumParallelImageBlobTransfers
       ),
       (
+        "maxParallelImageCompressions",
+        images.maxParallelImageCompressions,
+        ImageConfig.maximumParallelImageCompressions
+      ),
+      (
         "maxParallelImageDecompressions",
         images.maxParallelImageDecompressions,
         ImageConfig.maximumParallelImageDecompressions
@@ -217,6 +224,7 @@ struct ImageConfigUpdate: Codable {
   let defaultRegistry: String?
   let insecureRegistries: [String]?
   let maxParallelImageBlobTransfers: Int?
+  let maxParallelImageCompressions: Int?
   let maxParallelImageDecompressions: Int?
   let maxParallelImageDiskWrites: Int?
 }

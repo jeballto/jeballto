@@ -153,7 +153,7 @@ curl -X DELETE "http://127.0.0.1:8011/v1/vms/$VM_ID?force=true" \
 DELETE /v1/vms?confirm=true
 ```
 
-Requires `confirm=true`. Force-stops each VM, then deletes all.
+Requires `confirm=true`. Cancels active async image operations, force-stops each VM, then deletes all.
 
 ### Clone VM
 
@@ -561,17 +561,57 @@ curl -X POST http://127.0.0.1:8011/v1/images/pull \
 
 Optional `timeout` field (seconds). No timeout by default.
 
+Set `async` to `true` to return immediately with an operation ID:
+
+```bash
+curl -X POST http://127.0.0.1:8011/v1/images/pull \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"reference":"ghcr.io/myorg/vms/dev-env:latest","async":true}'
+```
+
+Poll progress with:
+
+```http
+GET /v1/images/pull/{operationId}/status
+```
+
+Cancel a running async pull with:
+
+```http
+DELETE /v1/images/pull/{operationId}
+```
+
+Async pull flow:
+
+1. Fetch the OCI manifest and validate the Jeballto artifact format.
+2. Fetch the config blob and chunk blobs through the ORAS blob cache.
+3. Decompress fetched chunk blobs and write the VM bundle files.
+4. Validate the reconstructed VM bundle and store the local image record.
+
+Pull work is pipelined, so there is no exclusive `stage`: blob fetches, decompression, and disk writes can overlap.
+For pull status, `bytesCompleted` counts completed compressed OCI artifact bytes, including the config blob and
+completed chunk blobs. `bytesTotal` is the compressed config plus compressed chunk blob total from the manifest.
+`chunksCompleted` counts completed chunk blobs, and `chunksTotal` is the number of chunk layers in the manifest.
+`progress` is derived from those compressed artifact bytes when totals are known.
+`averageSpeedMBps` is the full artifact-flow speed for pull: completed compressed OCI artifact bytes divided by elapsed
+pull operation time. It is not Activity Monitor network throughput, because it includes manifest work, cache waits,
+decompression, disk writes, validation, and blob completion granularity.
+
+After cancellation, status is `cancelling` while cleanup is still running, then `cancelled` when the operation is
+fully stopped.
+
 ### Push Image
 
 ```http
 POST /v1/images/push
 ```
 
-Pushes a VM bundle or existing local image. Provide exactly one of `sourceVmId` or `sourceImageId`.
+Pushes a VM bundle or existing local image. Use `source` with `vm:<uuid>` or `image:<uuid>`.
 
 **Requirements:**
 
-- When using `sourceVmId`, the VM must be in `STOPPED` or `CREATED` state. Returns 409 `INVALID_STATE` if the VM is running or otherwise not stopped.
+- When using `vm:<uuid>`, the VM must be in `STOPPED` or `CREATED` state. Returns 409 `INVALID_STATE` if the VM is running or otherwise not stopped.
 - The registry must be reachable before the push starts. A connectivity check against `<registry>/v2/` is performed upfront. Returns 503 `IMAGE_PUSH_FAILED` if the registry cannot be reached. This prevents waiting 20+ minutes for compression to complete before discovering connectivity issues.
 
 ```bash
@@ -580,9 +620,53 @@ curl -X POST http://127.0.0.1:8011/v1/images/push \
   -H "Content-Type: application/json" \
   -d '{
     "reference": "ghcr.io/myorg/vms/dev-env:latest",
-    "sourceVmId": "550e8400-e29b-41d4-a716-446655440000"
+    "source": "vm:550e8400-e29b-41d4-a716-446655440000"
   }'
 ```
+
+Set `async` to `true` to return immediately and poll progress:
+
+```bash
+curl -X POST http://127.0.0.1:8011/v1/images/push \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "reference": "ghcr.io/myorg/vms/dev-env:latest",
+    "source": "vm:550e8400-e29b-41d4-a716-446655440000",
+    "async": true
+  }'
+```
+
+```http
+GET /v1/images/push/{operationId}/status
+```
+
+Cancel a running async push with:
+
+```http
+DELETE /v1/images/push/{operationId}
+```
+
+Async push flow:
+
+1. Verify registry reachability before expensive local work starts.
+2. For `vm:<uuid>`, reserve the stopped VM bundle so it cannot be started, deleted, or resource-mutated mid-export.
+3. For `image:<uuid>`, reserve the local source image so it cannot be deleted mid-export.
+4. `compressing`: scan the VM bundle, split files into chunks, compress nonzero chunks with zstd, and build the OCI
+   package metadata.
+5. `uploading`: confirm or upload each config and chunk blob with ORAS, then push the OCI manifest.
+
+Push has two mostly sequential stages, so status includes `stage` and `stageProgress`. `compressing` counts
+uncompressed VM bundle bytes and chunks processed locally. When the stage switches to `uploading`, `bytesCompleted`
+and `chunksCompleted` reset and then count compressed OCI blobs confirmed or uploaded to the registry. Push `progress`
+is an overall value where compression contributes the first half and upload contributes the second half.
+`averageSpeedMBps` is the per-stage artifact-flow speed for push: uncompressed local bundle throughput while
+`compressing`, then compressed OCI artifact throughput while `uploading`. It is not raw system upload bandwidth,
+because it includes blob existence checks, ORAS process overhead, registry latency, and only advances when blobs
+complete.
+
+After cancellation, status is `cancelling` while cleanup is still running, then `cancelled` when the operation is
+fully stopped.
 
 ### List, Get, Delete Images
 
@@ -592,6 +676,9 @@ GET  /v1/images/{id}
 DELETE /v1/images/{id}
 DELETE /v1/images?confirm=true
 ```
+
+Deleting an individual image returns 409 while that image is the source of an active push operation.
+Deleting all images requires `confirm=true` and cancels active async image operations before image deletion starts.
 
 ### Image Reference Format
 
@@ -681,6 +768,7 @@ curl -X PATCH http://127.0.0.1:8011/v1/config \
 | `networking` | `vncPortRangeStart`, `vncPortRangeEnd` | 1024-65535 |
 | `images` | `defaultRegistry`, `insecureRegistries` | - |
 | `images` | `maxParallelImageBlobTransfers` | Concurrent ORAS blob fetch and push processes. Default 16, range 1-64 |
+| `images` | `maxParallelImageCompressions` | Concurrent zstd compressions during image push. Default 4, range 1-32 |
 | `images` | `maxParallelImageDecompressions` | Concurrent zstd decompressions during image pull. Default 2, range 1-8 |
 | `images` | `maxParallelImageDiskWrites` | Concurrent output writes during image pull. Default 1, range 1-4 |
 
@@ -694,8 +782,8 @@ POST /v1/system/reset?confirm=true
 
 Two modes:
 
-- **soft** - Deletes all VMs and images. Config and logs preserved. Agent keeps running.
-- **hard** - Deletes everything (VMs, images, config, logs) and terminates the process.
+- **soft** - Cancels active async image operations, deletes all VMs and images. Config and logs preserved. Agent keeps running.
+- **hard** - Cancels active async image operations, deletes everything (VMs, images, config, logs) and terminates the process.
 
 ```bash
 # Soft reset
