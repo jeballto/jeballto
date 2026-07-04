@@ -13,6 +13,87 @@ struct APIServerValidationPathTests {
   }
 
   @Test
+  func systemCapabilitiesReturnsHostAndFeatureData() async throws {
+    try await withTemporaryDirectory { root in
+      let server = makeTestAPIServer(root: root)
+
+      let response = await server.handleSystemCapabilities()
+      let capabilities = try JSONDecoder().decode(
+        SystemCapabilitiesResponse.self,
+        from: #require(response.body)
+      )
+
+      #expect(response.statusCode == 200)
+      #expect(capabilities.host.maxConcurrentVMs == 2)
+      #expect(capabilities.features.contains { $0.id == "macOSVirtualization" })
+      #expect(capabilities.features.contains { $0.id == "ociImagePackaging" })
+    }
+  }
+
+  @Test
+  func lifecycleRoutesRequireEnabledCapabilities() async throws {
+    try await withTemporaryDirectory { root in
+      let capabilities = VirtualizationCapabilities(
+        probe: VirtualizationHostProbe(
+          architecture: "arm64",
+          operatingSystemVersion: OperatingSystemVersion(majorVersion: 26, minorVersion: 5, patchVersion: 0),
+          virtualizationSupported: true,
+          entitlements: ["com.apple.security.virtualization"]
+        ),
+        featureFlags: VirtualizationFeatureFlags(overrides: [.macOSVirtualization: false])
+      )
+      let server = makeTestAPIServer(root: root, capabilityProvider: { capabilities })
+      let vmId = UUID()
+
+      let response = await server.handleStartVM(
+        HTTPRequest(
+          method: "POST",
+          path: "/v1/vms/\(vmId.uuidString)/start",
+          headers: [:],
+          body: nil,
+          queryParameters: [:]
+        )
+      )
+      let error = try decodedError(response)
+
+      #expect(response.statusCode == 409)
+      #expect(error.error.code == "CAPABILITY_UNAVAILABLE")
+      #expect(error.error.message.contains("macOSVirtualization"))
+    }
+  }
+
+  @Test
+  func createFromImageRequiresImageCapability() async throws {
+    try await withTemporaryDirectory { root in
+      let capabilities = VirtualizationCapabilities(
+        probe: VirtualizationHostProbe(
+          architecture: "arm64",
+          operatingSystemVersion: OperatingSystemVersion(majorVersion: 26, minorVersion: 5, patchVersion: 0),
+          virtualizationSupported: true,
+          entitlements: ["com.apple.security.virtualization"]
+        ),
+        featureFlags: VirtualizationFeatureFlags(overrides: [.ociImagePackaging: false])
+      )
+      let server = makeTestAPIServer(root: root, capabilityProvider: { capabilities })
+
+      let response = await server.handleCreateVM(
+        HTTPRequest(
+          method: "POST",
+          path: "/v1/vms",
+          headers: [:],
+          body: Data(#"{"name":"from-image","image":"registry.example.com/vms/dev:latest"}"#.utf8),
+          queryParameters: [:]
+        )
+      )
+      let error = try decodedError(response)
+
+      #expect(response.statusCode == 409)
+      #expect(error.error.code == "CAPABILITY_UNAVAILABLE")
+      #expect(error.error.message.contains("ociImagePackaging"))
+    }
+  }
+
+  @Test
   func handlersReturn400ForInvalidIdentifiersOrMissingBody() async throws {
     try await withTemporaryDirectory { root in
       let server = makeTestAPIServer(root: root)

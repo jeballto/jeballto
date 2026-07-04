@@ -28,7 +28,10 @@ func makeTestConfig(root: String) -> Config {
   )
 }
 
-func makeTestAPIServer(root: String) -> APIServer {
+func makeTestAPIServer(
+  root: String,
+  capabilityProvider: @escaping @Sendable () -> VirtualizationCapabilities = { testVirtualizationCapabilities() }
+) -> APIServer {
   let config = makeTestConfig(root: root)
   let eventBus = EventBus()
   let persistenceStore = PersistenceStore(databasePath: config.storage.databasePath)
@@ -51,6 +54,18 @@ func makeTestAPIServer(root: String) -> APIServer {
     portForwardingManager: portForwardingManager,
     imageManager: imageManager,
     eventBus: eventBus,
-    config: config
+    config: config,
+    capabilityProvider: capabilityProvider
+  )
+}
+
+func testVirtualizationCapabilities() -> VirtualizationCapabilities {
+  VirtualizationCapabilities(
+    probe: VirtualizationHostProbe(
+      architecture: "arm64",
+      operatingSystemVersion: OperatingSystemVersion(majorVersion: 26, minorVersion: 5, patchVersion: 0),
+      virtualizationSupported: true,
+      entitlements: ["com.apple.security.virtualization"]
+    )
   )
 }

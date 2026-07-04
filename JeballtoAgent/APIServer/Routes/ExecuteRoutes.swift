@@ -7,6 +7,7 @@ extension APIServer {
     guard let vmId = extractResourceId(from: request.path) else {
       return APIRouteErrorMapper.invalidID()
     }
+    if let response = requireCapability(.portForwarding) { return response }
 
     guard let body = request.body else {
       return APIRouteErrorMapper.missingBody()
@@ -29,6 +30,7 @@ extension APIServer {
     guard let vmId = extractResourceId(from: request.path) else {
       return APIRouteErrorMapper.invalidID()
     }
+    if let response = requireCapability(.keystrokeInjection) { return response }
 
     guard let body = request.body else {
       return APIRouteErrorMapper.missingBody()

@@ -17,6 +17,7 @@ class APIServer {
   let portForwardingManager: PortForwardingManager
   let imageManager: ImageManager
   let eventBus: EventBus
+  let capabilityProvider: @Sendable () -> VirtualizationCapabilities
 
   /// Lock protecting mutable state accessed from async route handlers
   private let stateLock = NSLock()
@@ -46,13 +47,15 @@ class APIServer {
     portForwardingManager: PortForwardingManager,
     imageManager: ImageManager,
     eventBus: EventBus,
-    config: Config
+    config: Config,
+    capabilityProvider: @escaping @Sendable () -> VirtualizationCapabilities = { VirtualizationCapabilities() }
   ) {
     httpServer = SimpleHTTPServer(port: UInt16(config.api.port), host: config.api.host)
     self.vmManager = vmManager
     self.portForwardingManager = portForwardingManager
     self.imageManager = imageManager
     self.eventBus = eventBus
+    self.capabilityProvider = capabilityProvider
     _config = config
     startTime = Date()
 
@@ -290,6 +293,10 @@ class APIServer {
   }
 
   private func registerSystemRoutes() {
+    httpServer.get("/v1/system/capabilities") { [weak self] _ in
+      return await self?.handleSystemCapabilities() ?? Self.serverUnavailableError
+    }
+
     httpServer.post("/v1/system/reset") { [weak self] request in
       return await self?.handleSystemReset(request) ?? Self.serverUnavailableError
     }
@@ -307,6 +314,26 @@ class APIServer {
     let guiOpen = await vmManager.isGUIOpen(definition.id)
     let uptime = try? await vmManager.getVMUptime(definition.id)
     return VMResponse(from: definition, guiOpen: guiOpen, uptime: uptime)
+  }
+
+  func requireCapability(_ feature: VirtualizationFeature) -> HTTPResponse? {
+    let capabilities = capabilityProvider()
+    guard let capability = capabilities.features.first(where: { $0.id == feature.rawValue }) else {
+      return HTTPResponse.error(
+        "CAPABILITY_UNAVAILABLE",
+        message: "Capability \(feature.rawValue) is not registered",
+        statusCode: 409
+      )
+    }
+    guard capability.enabled else {
+      let reason = capability.reason ?? "Capability is unavailable on this host"
+      return HTTPResponse.error(
+        "CAPABILITY_UNAVAILABLE",
+        message: "\(feature.rawValue) is unavailable: \(reason)",
+        statusCode: 409
+      )
+    }
+    return nil
   }
 
   func updateVMDefinition(_ vmId: UUID, definition: VMDefinition) async throws {

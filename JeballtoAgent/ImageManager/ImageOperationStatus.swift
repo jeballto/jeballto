@@ -16,9 +16,9 @@ enum ImageOperationState: String, Codable, Sendable {
   var isTerminal: Bool {
     switch self {
     case .completed, .failed, .cancelled:
-      return true
+      true
     case .started, .running, .cancelling:
-      return false
+      false
     }
   }
 }
@@ -236,9 +236,9 @@ actor ImageOperationTracker {
   private func weightedProgress(stage: ImageOperationStage, stageProgress: Double) -> Double {
     switch stage {
     case .compressing:
-      return clampedProgress(stageProgress * 0.5)
+      clampedProgress(stageProgress * 0.5)
     case .uploading:
-      return clampedProgress(0.5 + stageProgress * 0.5)
+      clampedProgress(0.5 + stageProgress * 0.5)
     }
   }
 }

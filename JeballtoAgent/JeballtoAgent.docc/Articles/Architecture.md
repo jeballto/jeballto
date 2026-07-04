@@ -50,6 +50,18 @@ See <doc:VMManager> for the symbol reference.
 
 `VZVirtualMachine` and its associated views require the main queue. `VMInstance` is `@MainActor` to enforce this. Calls from actor-isolated code go through `await MainActor.run { ... }`.
 
+### AVFAdapter
+
+Owns all direct Apple Virtualization configuration assembly:
+
+- `VMConfigurationSpec` is a pure Swift description of the VM hardware Jeballto wants.
+- `MacVMConfigurationBuilder` maps `VMDefinition` into runtime or installation specs.
+- `AVFConfigurationAssembler` converts specs into `VZVirtualMachineConfiguration`.
+- `VirtualizationRuntimeFactory` creates `VZVirtualMachine` and wires `AVFDelegate`.
+- `VirtualizationCapabilities` reports current host support and enabled runtime capabilities for `/v1/system/capabilities`.
+
+`VMManager`, `VMInstance`, and `VMInstaller` should depend on these adapter-level concepts instead of assembling device-specific `VZ*` objects directly.
+
 ### VMInstaller
 
 Three installation paths:

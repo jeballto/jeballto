@@ -60,6 +60,8 @@ extension APIServer {
   }
 
   func handlePullImage(_ request: HTTPRequest) async -> HTTPResponse {
+    if let response = requireCapability(.ociImagePackaging) { return response }
+
     guard let body = request.body else {
       return APIRouteErrorMapper.missingBody()
     }
@@ -148,6 +150,8 @@ extension APIServer {
   }
 
   func handlePushImage(_ request: HTTPRequest) async -> HTTPResponse {
+    if let response = requireCapability(.ociImagePackaging) { return response }
+
     guard let body = request.body else {
       return APIRouteErrorMapper.missingBody()
     }

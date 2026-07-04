@@ -84,6 +84,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/CapabilityUnavailable'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -295,7 +297,22 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          $ref: '#/components/responses/ConcurrentVMLimit'
+          description: VM limit reached or required capability is unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                vmLimit:
+                  value:
+                    error:
+                      code: VM_LIMIT_REACHED
+                      message: Cannot start VM - 2 VMs already active (max 2)
+                capabilityUnavailable:
+                  value:
+                    error:
+                      code: CAPABILITY_UNAVAILABLE
+                      message: "macOSVirtualization is unavailable: Requires Apple Silicon"
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -321,6 +338,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/CapabilityUnavailable'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -346,6 +365,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/CapabilityUnavailable'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -371,6 +392,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/CapabilityUnavailable'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -403,7 +426,27 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          $ref: '#/components/responses/ConcurrentVMLimit'
+          description: VM limit reached, installation already running, or required capability is unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                vmLimit:
+                  value:
+                    error:
+                      code: VM_LIMIT_REACHED
+                      message: Cannot install - 2 VMs already active (max 2)
+                installInProgress:
+                  value:
+                    error:
+                      code: INSTALL_IN_PROGRESS
+                      message: Installation is already in progress for this VM
+                capabilityUnavailable:
+                  value:
+                    error:
+                      code: CAPABILITY_UNAVAILABLE
+                      message: "macOSInstallation is unavailable: Requires macOS 12.0 or newer"
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -496,15 +539,22 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          description: VM is not in RUNNING state
+          description: VM is not in RUNNING state or required capability is unavailable
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-              example:
-                error:
-                  code: INVALID_STATE
-                  message: "VM must be RUNNING to enable SSH forwarding"
+              examples:
+                invalidState:
+                  value:
+                    error:
+                      code: INVALID_STATE
+                      message: "VM must be RUNNING to enable SSH forwarding"
+                capabilityUnavailable:
+                  value:
+                    error:
+                      code: CAPABILITY_UNAVAILABLE
+                      message: "portForwarding is unavailable: Capability is disabled"
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -577,15 +627,22 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          description: VM is not in RUNNING state
+          description: VM is not in RUNNING state or required capability is unavailable
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-              example:
-                error:
-                  code: INVALID_STATE
-                  message: "VM must be RUNNING to enable VNC forwarding"
+              examples:
+                invalidState:
+                  value:
+                    error:
+                      code: INVALID_STATE
+                      message: "VM must be RUNNING to enable VNC forwarding"
+                capabilityUnavailable:
+                  value:
+                    error:
+                      code: CAPABILITY_UNAVAILABLE
+                      message: "portForwarding is unavailable: Capability is disabled"
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -684,6 +741,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/CapabilityUnavailable'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -821,11 +880,22 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          description: VM is not in RUNNING state
+          description: VM is not in RUNNING state or required capability is unavailable
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                invalidState:
+                  value:
+                    error:
+                      code: INVALID_STATE
+                      message: "VM must be RUNNING to capture screenshot"
+                capabilityUnavailable:
+                  value:
+                    error:
+                      code: CAPABILITY_UNAVAILABLE
+                      message: "screenshotCapture is unavailable: Requires macOS 12.0 or newer"
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -860,15 +930,22 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          description: VM is in wrong state for this operation
+          description: VM is in wrong state for this operation or required capability is unavailable
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-              example:
-                error:
-                  code: INVALID_STATE
-                  message: "VM must be running for command execution"
+              examples:
+                invalidState:
+                  value:
+                    error:
+                      code: INVALID_STATE
+                      message: "VM must be running for command execution"
+                capabilityUnavailable:
+                  value:
+                    error:
+                      code: CAPABILITY_UNAVAILABLE
+                      message: "portForwarding is unavailable: Capability is disabled"
         '500':
           $ref: '#/components/responses/InternalError'
         '504':
@@ -925,15 +1002,22 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          description: VM is in wrong state for this operation
+          description: VM is in wrong state for this operation or required capability is unavailable
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-              example:
-                error:
-                  code: INVALID_STATE
-                  message: "VM must be running or installing for keystroke injection"
+              examples:
+                invalidState:
+                  value:
+                    error:
+                      code: INVALID_STATE
+                      message: "VM must be running or installing for keystroke injection"
+                capabilityUnavailable:
+                  value:
+                    error:
+                      code: CAPABILITY_UNAVAILABLE
+                      message: "keystrokeInjection is unavailable: Requires macOS 12.0 or newer"
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -1201,6 +1285,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/CapabilityUnavailable'
         '499':
           description: Image pull was cancelled
           content:
@@ -1315,11 +1401,22 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          description: VM is not in a stopped state
+          description: Source is not in a pushable state or required capability is unavailable
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                invalidState:
+                  value:
+                    error:
+                      code: INVALID_STATE
+                      message: "VM must be stopped or created before image export"
+                capabilityUnavailable:
+                  value:
+                    error:
+                      code: CAPABILITY_UNAVAILABLE
+                      message: "ociImagePackaging is unavailable: Capability is disabled"
         '499':
           description: Image push was cancelled
           content:
@@ -1607,6 +1704,27 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+
+  /system/capabilities:
+    get:
+      tags:
+        - system
+      summary: Get system capabilities
+      description: >
+        Returns host facts and the current Jeballto runtime capabilities for this
+        app build and machine.
+      operationId: getSystemCapabilities
+      responses:
+        '200':
+          description: System capabilities
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SystemCapabilitiesResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
 
   /system/reset:
     post:
@@ -2712,6 +2830,82 @@ components:
           nullable: true
           description: Failure or cancellation message
 
+    SystemCapabilitiesResponse:
+      type: object
+      required:
+        - host
+        - features
+      properties:
+        host:
+          $ref: '#/components/schemas/HostCapabilitiesResponse'
+        features:
+          type: array
+          items:
+            $ref: '#/components/schemas/FeatureCapabilityResponse'
+
+    HostCapabilitiesResponse:
+      type: object
+      required:
+        - architecture
+        - macOSVersion
+        - virtualizationSupported
+        - maxConcurrentVMs
+      properties:
+        architecture:
+          type: string
+          description: Host CPU architecture reported by the app process
+          example: arm64
+        macOSVersion:
+          type: string
+          description: Host macOS version
+          example: "26.5"
+        virtualizationSupported:
+          type: boolean
+          description: Whether Apple's Virtualization framework is available on this host
+        maxConcurrentVMs:
+          type: integer
+          description: Maximum number of active VMs Jeballto allows concurrently
+          example: 2
+
+    FeatureCapabilityResponse:
+      type: object
+      required:
+        - id
+        - status
+        - enabled
+        - minimumOS
+      properties:
+        id:
+          type: string
+          enum:
+            - macOSVirtualization
+            - macOSInstallation
+            - natNetworking
+            - portForwarding
+            - guiDisplay
+            - screenshotCapture
+            - keystrokeInjection
+            - saveRestore
+            - ociImagePackaging
+          description: Stable capability identifier
+        status:
+          type: string
+          enum:
+            - available
+            - unavailable
+          description: Host availability of this capability
+        enabled:
+          type: boolean
+          description: Whether Jeballto currently allows routes that depend on this capability
+        minimumOS:
+          type: string
+          description: Minimum macOS version needed for this capability
+          example: "12.0"
+        reason:
+          type: string
+          nullable: true
+          description: Human-readable reason when the capability is unavailable or disabled
+
     ConfigResponse:
       type: object
       required:
@@ -3064,8 +3258,10 @@ components:
                 - GUI_CLOSE_FAILED
                 - VM_LIMIT_REACHED
                 - INSTALL_FAILED
+                - INSTALL_IN_PROGRESS
                 - EXECUTE_FAILED
                 - INVALID_STATE
+                - CAPABILITY_UNAVAILABLE
                 - IMAGE_NOT_FOUND
                 - IMAGE_PULL_FAILED
                 - IMAGE_PULL_CANCELLED
@@ -3269,6 +3465,17 @@ components:
             error:
               code: VM_LIMIT_REACHED
               message: Cannot start VM - 2 VMs already active (max 2)
+
+    CapabilityUnavailable:
+      description: Required host or runtime capability is unavailable
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: CAPABILITY_UNAVAILABLE
+              message: "macOSVirtualization is unavailable: Requires Apple Silicon"
 
     InternalError:
       description: Internal server error

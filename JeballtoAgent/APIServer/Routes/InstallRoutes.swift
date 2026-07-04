@@ -7,6 +7,7 @@ extension APIServer {
     guard let vmId = extractResourceId(from: request.path) else {
       return APIRouteErrorMapper.invalidID()
     }
+    if let response = requireCapability(.macOSInstallation) { return response }
 
     // Parse request body (optional)
     var installRequest: InstallVMRequest?

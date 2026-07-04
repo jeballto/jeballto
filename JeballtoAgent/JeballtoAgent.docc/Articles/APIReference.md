@@ -774,6 +774,38 @@ curl -X PATCH http://127.0.0.1:8011/v1/config \
 
 Image transfer operation data is kept only within the current agent session under `~/Library/Caches/Jeballto/ImageWork/`. Startup removes it, and successful pull or push removes the operation cache immediately.
 
+## System Capabilities
+
+```http
+GET /v1/system/capabilities
+```
+
+Returns host facts and the Jeballto runtime capabilities available on this machine.
+
+```json
+{
+  "host": {
+    "architecture": "arm64",
+    "macOSVersion": "26.5",
+    "virtualizationSupported": true,
+    "maxConcurrentVMs": 2
+  },
+  "features": [
+    {
+      "id": "macOSVirtualization",
+      "status": "available",
+      "enabled": true,
+      "minimumOS": "11.0",
+      "reason": null
+    }
+  ]
+}
+```
+
+The capability list describes platform and runtime surfaces such as macOS installation, NAT networking, GUI display, screenshots, keystrokes, save/restore, port forwarding, and image packaging. It does not list ordinary VM actions such as create, start, stop, or delete.
+
+`status` describes whether the host can support the capability. `enabled` describes whether Jeballto currently allows routes that depend on it.
+
 ## System Reset
 
 ```http
@@ -844,11 +876,13 @@ All errors return:
 | `INVALID_ID` | 400 | Invalid UUID format |
 | `INVALID_STATE` | 409 | Operation not valid in current VM state |
 | `VM_LIMIT_REACHED` | 409 | Max 2 active or transitioning VMs |
+| `CAPABILITY_UNAVAILABLE` | 409 | Required host or runtime capability is unavailable |
 | `START_FAILED` | 500 | VM start failed |
 | `STOP_FAILED` | 500 | VM stop failed |
 | `PAUSE_FAILED` | 500 | VM pause failed |
 | `RESUME_FAILED` | 500 | VM resume failed |
 | `INSTALL_FAILED` | 500 | macOS installation failed |
+| `INSTALL_IN_PROGRESS` | 409 | Installation is already running for this VM |
 | `EXECUTE_FAILED` | 500 | Command/keystroke execution failed |
 | `EXECUTE_TIMEOUT` | 504 | Command timed out |
 | `GATEWAY_TIMEOUT` | 504 | Operation timed out |
