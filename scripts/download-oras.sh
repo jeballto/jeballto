@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-ORAS_VERSION="${1:-1.3.0}"
+ORAS_VERSION="${1:-1.3.2}"
 PLATFORM="darwin"
 ARCH="arm64"
 TARBALL="oras_${ORAS_VERSION}_${PLATFORM}_${ARCH}.tar.gz"
@@ -17,10 +17,11 @@ OUTPUT_DIR="${PROJECT_ROOT}/Resources"
 OUTPUT_PATH="${OUTPUT_DIR}/oras"
 
 if [[ -x "$OUTPUT_PATH" ]]; then
-  EXISTING=$("$OUTPUT_PATH" version 2>/dev/null || echo "unknown")
-  echo "oras already exists at ${OUTPUT_PATH} (version: ${EXISTING})"
-  echo "Delete it first to re-download."
-  exit 0
+  EXISTING=$("$OUTPUT_PATH" version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+  if [[ "$EXISTING" == "$ORAS_VERSION" ]]; then
+    echo "oras already exists at ${OUTPUT_PATH} (version: ${EXISTING})"
+    exit 0
+  fi
 fi
 
 mkdir -p "$OUTPUT_DIR"
@@ -39,8 +40,8 @@ if [[ ! -f "${TMPDIR}/oras" ]]; then
   exit 1
 fi
 
-cp "${TMPDIR}/oras" "$OUTPUT_PATH"
-chmod +x "$OUTPUT_PATH"
+rm -f "$OUTPUT_PATH"
+install -m 755 "${TMPDIR}/oras" "$OUTPUT_PATH"
 
 echo "oras v${ORAS_VERSION} installed to ${OUTPUT_PATH}"
 "$OUTPUT_PATH" version

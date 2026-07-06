@@ -28,7 +28,7 @@ vars:
   XCODE_DOCBUILD_FLAGS: '{{.XCODE_PROJECT_SCHEME}} -scmProvider system -destination "{{.DESTINATION}}" -derivedDataPath "{{.DOCS_DERIVED_DATA}}"'
   TEST_ARGS: '-destination "{{.DESTINATION}}" -only-testing:JeballtoAgentTests'
   # Versions
-  ORAS_VERSION: "1.3.0"
+  ORAS_VERSION: "1.3.2"
   ZSTD_VERSION: "1.5.7"
   APP_VERSION:
     sh: grep -m1 'MARKETING_VERSION' "{{.PROJECT}}/project.pbxproj" | sed 's/.*= \(.*\);/\1/' | tr -d ' '
@@ -285,7 +285,10 @@ tasks:
   oras:download:
     desc: Download oras binary to Resources/
     status:
-      - test -x "{{.ORAS_BINARY}}"
+      - |
+        test -x "{{.ORAS_BINARY}}"
+        actual=$("{{.ORAS_BINARY}}" version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        test "$actual" = "{{.ORAS_VERSION}}"
     cmds:
       - bash "{{.ROOT_DIR}}/scripts/download-oras.sh" "{{.ORAS_VERSION}}"
 
@@ -316,7 +319,10 @@ tasks:
   zstd:download:
     desc: Install zstd binary to Resources/
     status:
-      - test -x "{{.ZSTD_BINARY}}" && "{{.ZSTD_BINARY}}" --version >/dev/null 2>&1
+      - |
+        test -x "{{.ZSTD_BINARY}}"
+        actual=$("{{.ZSTD_BINARY}}" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        test "$actual" = "{{.ZSTD_VERSION}}"
     cmds:
       - bash "{{.ROOT_DIR}}/scripts/download-zstd.sh" "{{.ZSTD_VERSION}}"
 
