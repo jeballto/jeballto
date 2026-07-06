@@ -149,7 +149,7 @@ struct ImageOperationTrackerTests {
   @Test
   func statusResponseReportsAverageSpeedInMBps() {
     let operationId = UUID()
-    let startedAt = Date(timeIntervalSince1970: 1_000)
+    let startedAt = Date(timeIntervalSince1970: 1000)
     let updatedAt = startedAt.addingTimeInterval(4)
     let running = ImageOperationStatus(
       id: operationId,

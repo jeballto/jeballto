@@ -20,6 +20,7 @@ extension APIServer {
     guard validation.valid else {
       return HTTPResponse.error("INVALID_REQUEST", message: validation.error ?? "Invalid request", statusCode: 400)
     }
+    if let response = requireCapabilities(jeballtofileRequest.requiredCapabilities) { return response }
 
     // Create the VM
     let resources = jeballtofileRequest.resources?.toVMResources() ?? VMResources.default
@@ -136,6 +137,37 @@ extension APIServer {
     }
 
     return try JSONDecoder().decode(JeballtofileRequest.self, from: body)
+  }
+}
+
+private extension JeballtofileRequest {
+  var requiredCapabilities: [VirtualizationFeature] {
+    var capabilities: [VirtualizationFeature] = [.jeballtofileExecution]
+    for feature in steps.flatMap(\.requiredCapabilities) where !capabilities.contains(feature) {
+      capabilities.append(feature)
+    }
+    return capabilities
+  }
+}
+
+private extension JeballtofileStep {
+  var requiredCapabilities: [VirtualizationFeature] {
+    switch type {
+    case .install:
+      VirtualizationFeature.vmInstallationRequirements
+    case .start:
+      VirtualizationFeature.vmRuntimeRequirements
+    case .stop:
+      [.macOSVirtualization]
+    case .guiOpen:
+      [.guiDisplay]
+    case .guiClose, .wait:
+      []
+    case .keystrokes:
+      [.keystrokeInjection]
+    case .execute:
+      VirtualizationFeature.commandExecutionRequirements
+    }
   }
 }
 

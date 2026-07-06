@@ -308,26 +308,25 @@ class VMInstaller: NSObject, @unchecked Sendable { // swiftlint:disable:this typ
     statusMessage = "Creating VM bundle..."
     try createVMBundle()
 
-    // Create platform configuration and save artifacts
-    statusMessage = "Creating platform configuration..."
-    let platformConfig = try createPlatformConfiguration(macOSConfiguration: macOSConfiguration)
-
-    // Create full VM configuration for installation
     statusMessage = "Configuring VM hardware..."
-    let vmConfig = try createInstallationConfiguration(
-      platformConfig: platformConfig,
-      macOSConfiguration: macOSConfiguration
+    let installSpec = MacVMConfigurationBuilder().makeInstallationSpec(for: vmDefinition)
+    let assembler = AVFConfigurationAssembler()
+    try assembler.validateResources(
+      in: installSpec,
+      installationRequirements: macOSConfiguration
+    )
+    try createDiskImage()
+    let vmConfig = try assembler.createConfiguration(
+      from: installSpec,
+      installationRequirements: macOSConfiguration
     )
 
     // Create virtual machine on main queue (required by Virtualization framework)
     statusMessage = "Creating virtual machine..."
     logInfo("Creating VZVirtualMachine for installation on main queue", category: "VMInstaller")
-    let (vm, vmDelegate) = await MainActor.run {
-      let vm = VZVirtualMachine(configuration: vmConfig)
-      let vmDelegate = AVFDelegate(vmId: vmDefinition.id, eventBus: eventBus)
-      vm.delegate = vmDelegate
-      return (vm, vmDelegate)
-    }
+    let runtime = await createInstallationRuntime(configuration: vmConfig)
+    let vm = runtime.virtualMachine
+    let vmDelegate = runtime.delegate
 
     virtualMachine = vm
     delegate = vmDelegate
@@ -347,6 +346,17 @@ class VMInstaller: NSObject, @unchecked Sendable { // swiftlint:disable:this typ
     logInfo("Installation completed for VM \(vmDefinition.id)", category: "VMInstaller")
   }
 
+  @MainActor
+  private func createInstallationRuntime(
+    configuration: sending VZVirtualMachineConfiguration
+  ) -> VirtualizationRuntime {
+    VirtualizationRuntimeFactory().makeRuntime(
+      configuration: configuration,
+      vmId: vmDefinition.id,
+      eventBus: eventBus
+    )
+  }
+
   /// Creates the VM bundle directory structure
   private func createVMBundle() throws {
     let bundlePath = vmDefinition.paths.bundlePath
@@ -354,89 +364,6 @@ class VMInstaller: NSObject, @unchecked Sendable { // swiftlint:disable:this typ
     try FileManager.default.createDirectory(atPath: bundlePath, withIntermediateDirectories: true)
 
     logInfo("Created VM bundle at \(bundlePath)", category: "VMInstaller")
-  }
-
-  /// Creates the Mac platform configuration with hardware model and machine identifier
-  private func createPlatformConfiguration(macOSConfiguration: VZMacOSConfigurationRequirements) throws
-    -> VZMacPlatformConfiguration
-  {
-    let platformConfig = VZMacPlatformConfiguration()
-    let auxiliaryStorageURL = URL(fileURLWithPath: vmDefinition.paths.auxiliaryStoragePath)
-
-    logDebug("Creating auxiliary storage at \(auxiliaryStorageURL.path)", category: "VMInstaller")
-
-    let auxiliaryStorage: VZMacAuxiliaryStorage
-    do {
-      auxiliaryStorage = try VZMacAuxiliaryStorage(
-        creatingStorageAt: auxiliaryStorageURL,
-        hardwareModel: macOSConfiguration.hardwareModel,
-        options: []
-      )
-    } catch {
-      logError(
-        "Failed to create auxiliary storage at \(auxiliaryStorageURL.path): \(error.localizedDescription)",
-        category: "VMInstaller"
-      )
-      throw VMInstallerError.auxiliaryStorageCreationFailed(error.localizedDescription)
-    }
-
-    logDebug("Auxiliary storage created successfully", category: "VMInstaller")
-
-    platformConfig.auxiliaryStorage = auxiliaryStorage
-    platformConfig.hardwareModel = macOSConfiguration.hardwareModel
-    platformConfig.machineIdentifier = VZMacMachineIdentifier()
-
-    let hardwareModelURL = URL(fileURLWithPath: vmDefinition.paths.hardwareModelPath)
-    let machineIdentifierURL = URL(fileURLWithPath: vmDefinition.paths.machineIdentifierPath)
-
-    try platformConfig.hardwareModel.dataRepresentation.write(to: hardwareModelURL)
-    try platformConfig.machineIdentifier.dataRepresentation.write(to: machineIdentifierURL)
-
-    logDebug("Created and saved platform configuration artifacts", category: "VMInstaller")
-
-    return platformConfig
-  }
-
-  /// Creates the full VM configuration for installation
-  private func createInstallationConfiguration(
-    platformConfig: VZMacPlatformConfiguration,
-    macOSConfiguration: VZMacOSConfigurationRequirements
-  ) throws -> VZVirtualMachineConfiguration {
-    let config = VZVirtualMachineConfiguration()
-
-    config.platform = platformConfig
-
-    let cpuCount = computeCPUCount(requested: vmDefinition.resources.cpuCount)
-    if cpuCount < macOSConfiguration.minimumSupportedCPUCount {
-      throw VMInstallerError.insufficientResources(
-        "CPU count \(cpuCount) is below minimum \(macOSConfiguration.minimumSupportedCPUCount)"
-      )
-    }
-    config.cpuCount = cpuCount
-
-    let memorySize = computeMemorySize(requested: vmDefinition.resources.memorySize)
-    if memorySize < macOSConfiguration.minimumSupportedMemorySize {
-      throw VMInstallerError.insufficientResources("Memory size is below minimum required")
-    }
-    config.memorySize = memorySize
-
-    try createDiskImage()
-
-    config.bootLoader = VZMacOSBootLoader()
-    config.storageDevices = try [createBlockDeviceConfiguration()]
-    config.networkDevices = [createNetworkDeviceConfiguration()]
-    config.graphicsDevices = [createGraphicsDeviceConfiguration()]
-    config.audioDevices = [createSoundDeviceConfiguration()]
-    config.pointingDevices = [VZUSBScreenCoordinatePointingDeviceConfiguration()]
-    config.keyboards = [VZUSBKeyboardConfiguration()]
-
-    try config.validate()
-
-    try config.validateSaveRestoreSupport()
-
-    logInfo("Created installation VM configuration", category: "VMInstaller")
-
-    return config
   }
 
   /// Creates the disk image for the VM
@@ -471,71 +398,6 @@ class VMInstaller: NSObject, @unchecked Sendable { // swiftlint:disable:this typ
     }
   }
 
-  /// Creates block device configuration for the disk
-  private func createBlockDeviceConfiguration() throws -> VZVirtioBlockDeviceConfiguration {
-    let diskImageURL = URL(fileURLWithPath: vmDefinition.paths.diskImagePath)
-    let attachment = try VZDiskImageStorageDeviceAttachment(url: diskImageURL, readOnly: false)
-    return VZVirtioBlockDeviceConfiguration(attachment: attachment)
-  }
-
-  /// Creates network device configuration
-  private func createNetworkDeviceConfiguration() -> VZVirtioNetworkDeviceConfiguration {
-    let networkDevice = VZVirtioNetworkDeviceConfiguration()
-
-    if let macAddress = VZMACAddress(string: vmDefinition.network.macAddress) {
-      networkDevice.macAddress = macAddress
-    } else {
-      networkDevice.macAddress = VZMACAddress.randomLocallyAdministered()
-    }
-
-    networkDevice.attachment = VZNATNetworkDeviceAttachment()
-    return networkDevice
-  }
-
-  /// Creates graphics device configuration
-  private func createGraphicsDeviceConfiguration() -> VZMacGraphicsDeviceConfiguration {
-    let graphicsConfig = VZMacGraphicsDeviceConfiguration()
-    graphicsConfig.displays = [
-      VZMacGraphicsDisplayConfiguration(widthInPixels: 1920, heightInPixels: 1200, pixelsPerInch: 80),
-    ]
-    return graphicsConfig
-  }
-
-  /// Creates sound device configuration
-  private func createSoundDeviceConfiguration() -> VZVirtioSoundDeviceConfiguration {
-    let soundDevice = VZVirtioSoundDeviceConfiguration()
-    let outputStream = VZVirtioSoundDeviceOutputStreamConfiguration()
-    outputStream.sink = VZHostAudioOutputStreamSink()
-    soundDevice.streams = [outputStream]
-    return soundDevice
-  }
-
-  /// Computes appropriate CPU count
-  private func computeCPUCount(requested: Int) -> Int {
-    let totalAvailableCPUs = ProcessInfo.processInfo.processorCount
-    var cpuCount = requested
-
-    // Don't allocate all host CPUs (leave at least 1 for host)
-    if cpuCount >= totalAvailableCPUs { cpuCount = max(1, totalAvailableCPUs - 1) }
-
-    // Clamp to AVF limits
-    cpuCount = max(cpuCount, VZVirtualMachineConfiguration.minimumAllowedCPUCount)
-    cpuCount = min(cpuCount, VZVirtualMachineConfiguration.maximumAllowedCPUCount)
-
-    return cpuCount
-  }
-
-  /// Computes appropriate memory size
-  private func computeMemorySize(requested: UInt64) -> UInt64 {
-    var memorySize = requested
-
-    // Clamp to AVF limits
-    memorySize = max(memorySize, VZVirtualMachineConfiguration.minimumAllowedMemorySize)
-    memorySize = min(memorySize, VZVirtualMachineConfiguration.maximumAllowedMemorySize)
-
-    return memorySize
-  }
-
   /// Runs the installation process
   private func runInstallation(vm: VZVirtualMachine, restoreImageURL: URL) async throws {
     // swiftlint:disable:previous function_body_length
@@ -557,52 +419,51 @@ class VMInstaller: NSObject, @unchecked Sendable { // swiftlint:disable:this typ
     // Virtualization framework requires running on main thread
     logInfo("Switching to main thread for VZMacOSInstaller operations", category: "VMInstaller")
 
-    return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-      DispatchQueue.main.async {
-        logInfo("Creating VZMacOSInstaller with local IPSW URL: \(localIPSWURL)", category: "VMInstaller")
-        let installer = VZMacOSInstaller(virtualMachine: vm, restoringFromImageAt: localIPSWURL)
+    try await installOnMainActor(vm: vm, localIPSWURL: localIPSWURL)
+  }
 
-        // Set up progress observer BEFORE starting install
-        logInfo("Setting up installation progress observer", category: "VMInstaller")
-        let installStart = Self.installStart
-        let installRange = 1.0 - installStart
-        let observer = installer.progress.observe(\.fractionCompleted, options: [.initial, .new]) {
-          [weak self] _, change in // swiftlint:disable:this closure_parameter_position
-          guard let self, let newProgress = change.newValue else { return }
+  @MainActor
+  private func installOnMainActor(vm: sending VZVirtualMachine, localIPSWURL: URL) async throws {
+    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+      logInfo("Creating VZMacOSInstaller with local IPSW URL: \(localIPSWURL)", category: "VMInstaller")
+      let installer = VZMacOSInstaller(virtualMachine: vm, restoringFromImageAt: localIPSWURL)
 
-          if newProgress == 0.0 {
-            // VZMacOSInstaller hasn't started reporting real progress yet
-            publishIndeterminateProgress("Preparing macOS installation...")
-            return
-          }
+      logInfo("Setting up installation progress observer", category: "VMInstaller")
+      let installStart = Self.installStart
+      let installRange = 1.0 - installStart
+      let observer = installer.progress.observe(\.fractionCompleted, options: [.initial, .new]) {
+        [weak self] _, change in // swiftlint:disable:this closure_parameter_position
+        guard let self, let newProgress = change.newValue else { return }
 
-          let scaledProgress = installStart + (newProgress * installRange)
-          progress = scaledProgress
-
-          statusMessage = "Installing macOS: \(Int(newProgress * 100))%"
-          publishProgress(scaledProgress)
-
-          let percent = Int(newProgress * 100)
-          if shouldLogInstallProgress(percent: percent) {
-            logInfo("Installation progress: \(percent)%", category: "VMInstaller")
-          }
+        if newProgress == 0.0 {
+          publishIndeterminateProgress("Preparing macOS installation...")
+          return
         }
-        self.setInstallationObserver(observer)
 
-        // Start installation
-        logInfo("Calling installer.install()", category: "VMInstaller")
-        installer.install { result in
-          // Clean up observer
-          self.clearInstallationObserver()
+        let scaledProgress = installStart + (newProgress * installRange)
+        progress = scaledProgress
 
-          switch result {
-          case .success:
-            logInfo("Installation completed successfully (VM state: \(vm.state.rawValue))", category: "VMInstaller")
-            continuation.resume()
-          case .failure(let error):
-            logError("Installation failed: \(error.localizedDescription)", category: "VMInstaller")
-            continuation.resume(throwing: VMInstallerError.installationFailed(error.localizedDescription))
-          }
+        statusMessage = "Installing macOS: \(Int(newProgress * 100))%"
+        publishProgress(scaledProgress)
+
+        let percent = Int(newProgress * 100)
+        if shouldLogInstallProgress(percent: percent) {
+          logInfo("Installation progress: \(percent)%", category: "VMInstaller")
+        }
+      }
+      setInstallationObserver(observer)
+
+      logInfo("Calling installer.install()", category: "VMInstaller")
+      installer.install { [weak self] result in
+        self?.clearInstallationObserver()
+
+        switch result {
+        case .success:
+          logInfo("Installation completed successfully", category: "VMInstaller")
+          continuation.resume()
+        case .failure(let error):
+          logError("Installation failed: \(error.localizedDescription)", category: "VMInstaller")
+          continuation.resume(throwing: VMInstallerError.installationFailed(error.localizedDescription))
         }
       }
     }
@@ -791,8 +652,6 @@ enum VMInstallerError: Error, LocalizedError {
   case restoreImageFetchFailed(String)
   case noSupportedConfiguration
   case unsupportedHardware(String)
-  case insufficientResources(String)
-  case auxiliaryStorageCreationFailed(String)
   case diskCreationFailed(String)
   case installationFailed(String)
 
@@ -803,8 +662,6 @@ enum VMInstallerError: Error, LocalizedError {
     case .restoreImageFetchFailed(let msg): "Failed to fetch restore image: \(msg)"
     case .noSupportedConfiguration: "No supported macOS configuration available"
     case .unsupportedHardware(let msg): "Unsupported hardware: \(msg)"
-    case .insufficientResources(let msg): "Insufficient resources: \(msg)"
-    case .auxiliaryStorageCreationFailed(let msg): "Failed to create auxiliary storage: \(msg)"
     case .diskCreationFailed(let msg): "Failed to create disk image: \(msg)"
     case .installationFailed(let msg): "Installation failed: \(msg)"
     }
