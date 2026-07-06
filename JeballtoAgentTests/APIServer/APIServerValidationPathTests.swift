@@ -13,6 +13,246 @@ struct APIServerValidationPathTests {
   }
 
   @Test
+  func systemCapabilitiesReturnsHostAndFeatureData() async throws {
+    try await withTemporaryDirectory { root in
+      let server = makeTestAPIServer(root: root)
+
+      let response = await server.handleSystemCapabilities()
+      let capabilities = try JSONDecoder().decode(
+        SystemCapabilitiesResponse.self,
+        from: #require(response.body)
+      )
+
+      #expect(response.statusCode == 200)
+      #expect(capabilities.host.maxConcurrentVMs == 2)
+      #expect(capabilities.features.contains { $0.id == "macOSVirtualization" })
+      #expect(capabilities.features.contains { $0.id == "ociImagePackaging" })
+      #expect(capabilities.features.allSatisfy { $0.lifecycle == "stable" })
+    }
+  }
+
+  @Test
+  func lifecycleRoutesRequireEnabledCapabilities() async throws {
+    try await withTemporaryDirectory { root in
+      let capabilities = VirtualizationCapabilities(
+        probe: VirtualizationHostProbe(
+          architecture: "arm64",
+          operatingSystemVersion: OperatingSystemVersion(majorVersion: 26, minorVersion: 5, patchVersion: 0),
+          virtualizationSupported: true,
+          entitlements: ["com.apple.security.virtualization"]
+        ),
+        featureFlags: VirtualizationFeatureFlags(overrides: [.macOSVirtualization: false])
+      )
+      let server = makeTestAPIServer(root: root, capabilityProvider: { capabilities })
+      let vmId = UUID()
+
+      let response = await server.handleStartVM(
+        HTTPRequest(
+          method: "POST",
+          path: "/v1/vms/\(vmId.uuidString)/start",
+          headers: [:],
+          body: nil,
+          queryParameters: [:]
+        )
+      )
+      let error = try decodedError(response)
+
+      #expect(response.statusCode == 409)
+      #expect(error.error.code == "CAPABILITY_UNAVAILABLE")
+      #expect(error.error.message.contains("macOSVirtualization"))
+    }
+  }
+
+  @Test
+  func runtimeRoutesRequireNatNetworkingCapability() async throws {
+    try await withTemporaryDirectory { root in
+      let capabilities = VirtualizationCapabilities(
+        probe: VirtualizationHostProbe(
+          architecture: "arm64",
+          operatingSystemVersion: OperatingSystemVersion(majorVersion: 26, minorVersion: 5, patchVersion: 0),
+          virtualizationSupported: true,
+          entitlements: ["com.apple.security.virtualization"]
+        ),
+        featureFlags: VirtualizationFeatureFlags(overrides: [.natNetworking: false])
+      )
+      let server = makeTestAPIServer(root: root, capabilityProvider: { capabilities })
+      let vmId = UUID()
+
+      let response = await server.handleStartVM(
+        HTTPRequest(
+          method: "POST",
+          path: "/v1/vms/\(vmId.uuidString)/start",
+          headers: [:],
+          body: nil,
+          queryParameters: [:]
+        )
+      )
+      let error = try decodedError(response)
+
+      #expect(response.statusCode == 409)
+      #expect(error.error.code == "CAPABILITY_UNAVAILABLE")
+      #expect(error.error.message.contains("natNetworking"))
+    }
+  }
+
+  @Test
+  func installationRoutesRequireNatNetworkingCapability() async throws {
+    try await withTemporaryDirectory { root in
+      let capabilities = VirtualizationCapabilities(
+        probe: VirtualizationHostProbe(
+          architecture: "arm64",
+          operatingSystemVersion: OperatingSystemVersion(majorVersion: 26, minorVersion: 5, patchVersion: 0),
+          virtualizationSupported: true,
+          entitlements: ["com.apple.security.virtualization"]
+        ),
+        featureFlags: VirtualizationFeatureFlags(overrides: [.natNetworking: false])
+      )
+      let server = makeTestAPIServer(root: root, capabilityProvider: { capabilities })
+      let vmId = UUID()
+
+      let response = await server.handleInstallVM(
+        HTTPRequest(
+          method: "POST",
+          path: "/v1/vms/\(vmId.uuidString)/install",
+          headers: [:],
+          body: nil,
+          queryParameters: [:]
+        )
+      )
+      let error = try decodedError(response)
+
+      #expect(response.statusCode == 409)
+      #expect(error.error.code == "CAPABILITY_UNAVAILABLE")
+      #expect(error.error.message.contains("natNetworking"))
+    }
+  }
+
+  @Test
+  func createFromImageRequiresImageCapability() async throws {
+    try await withTemporaryDirectory { root in
+      let capabilities = VirtualizationCapabilities(
+        probe: VirtualizationHostProbe(
+          architecture: "arm64",
+          operatingSystemVersion: OperatingSystemVersion(majorVersion: 26, minorVersion: 5, patchVersion: 0),
+          virtualizationSupported: true,
+          entitlements: ["com.apple.security.virtualization"]
+        ),
+        featureFlags: VirtualizationFeatureFlags(overrides: [.ociImagePackaging: false])
+      )
+      let server = makeTestAPIServer(root: root, capabilityProvider: { capabilities })
+
+      let response = await server.handleCreateVM(
+        HTTPRequest(
+          method: "POST",
+          path: "/v1/vms",
+          headers: [:],
+          body: Data(#"{"name":"from-image","image":"registry.example.com/vms/dev:latest"}"#.utf8),
+          queryParameters: [:]
+        )
+      )
+      let error = try decodedError(response)
+
+      #expect(response.statusCode == 409)
+      #expect(error.error.code == "CAPABILITY_UNAVAILABLE")
+      #expect(error.error.message.contains("ociImagePackaging"))
+    }
+  }
+
+  @Test
+  func executeRouteRequiresCommandExecutionCapability() async throws {
+    try await withTemporaryDirectory { root in
+      let capabilities = VirtualizationCapabilities(
+        probe: VirtualizationHostProbe(
+          architecture: "arm64",
+          operatingSystemVersion: OperatingSystemVersion(majorVersion: 26, minorVersion: 5, patchVersion: 0),
+          virtualizationSupported: true,
+          entitlements: ["com.apple.security.virtualization"]
+        ),
+        featureFlags: VirtualizationFeatureFlags(overrides: [.commandExecution: false])
+      )
+      let server = makeTestAPIServer(root: root, capabilityProvider: { capabilities })
+      let vmId = UUID()
+
+      let response = await server.handleExecuteCommand(
+        HTTPRequest(
+          method: "POST",
+          path: "/v1/vms/\(vmId.uuidString)/execute",
+          headers: [:],
+          body: Data(#"{"command":"true"}"#.utf8),
+          queryParameters: [:]
+        )
+      )
+      let error = try decodedError(response)
+
+      #expect(response.statusCode == 409)
+      #expect(error.error.code == "CAPABILITY_UNAVAILABLE")
+      #expect(error.error.message.contains("commandExecution"))
+    }
+  }
+
+  @Test
+  func jeballtofileRouteRequiresJeballtofileExecutionCapability() async throws {
+    try await withTemporaryDirectory { root in
+      let capabilities = VirtualizationCapabilities(
+        probe: VirtualizationHostProbe(
+          architecture: "arm64",
+          operatingSystemVersion: OperatingSystemVersion(majorVersion: 26, minorVersion: 5, patchVersion: 0),
+          virtualizationSupported: true,
+          entitlements: ["com.apple.security.virtualization"]
+        ),
+        featureFlags: VirtualizationFeatureFlags(overrides: [.jeballtofileExecution: false])
+      )
+      let server = makeTestAPIServer(root: root, capabilityProvider: { capabilities })
+
+      let response = await server.handleCreateJeballtofile(
+        HTTPRequest(
+          method: "POST",
+          path: "/v1/jeballtofiles",
+          headers: ["content-type": "application/json"],
+          body: Data(#"{"name":"workflow","steps":[{"type":"wait","seconds":1}]}"#.utf8),
+          queryParameters: [:]
+        )
+      )
+      let error = try decodedError(response)
+
+      #expect(response.statusCode == 409)
+      #expect(error.error.code == "CAPABILITY_UNAVAILABLE")
+      #expect(error.error.message.contains("jeballtofileExecution"))
+    }
+  }
+
+  @Test
+  func jeballtofileRouteRequiresDeclaredStepCapabilities() async throws {
+    try await withTemporaryDirectory { root in
+      let capabilities = VirtualizationCapabilities(
+        probe: VirtualizationHostProbe(
+          architecture: "arm64",
+          operatingSystemVersion: OperatingSystemVersion(majorVersion: 26, minorVersion: 5, patchVersion: 0),
+          virtualizationSupported: true,
+          entitlements: ["com.apple.security.virtualization"]
+        ),
+        featureFlags: VirtualizationFeatureFlags(overrides: [.commandExecution: false])
+      )
+      let server = makeTestAPIServer(root: root, capabilityProvider: { capabilities })
+
+      let response = await server.handleCreateJeballtofile(
+        HTTPRequest(
+          method: "POST",
+          path: "/v1/jeballtofiles",
+          headers: ["content-type": "application/json"],
+          body: Data(#"{"name":"workflow","steps":[{"type":"execute","command":"true"}]}"#.utf8),
+          queryParameters: [:]
+        )
+      )
+      let error = try decodedError(response)
+
+      #expect(response.statusCode == 409)
+      #expect(error.error.code == "CAPABILITY_UNAVAILABLE")
+      #expect(error.error.message.contains("commandExecution"))
+    }
+  }
+
+  @Test
   func handlersReturn400ForInvalidIdentifiersOrMissingBody() async throws {
     try await withTemporaryDirectory { root in
       let server = makeTestAPIServer(root: root)

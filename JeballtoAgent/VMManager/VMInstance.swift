@@ -83,13 +83,15 @@ import Virtualization
     // Create AVF configuration and virtual machine
     let configHelper = AVFConfiguration(vmDefinition: definition)
     let vmConfig = try configHelper.createConfiguration()
-    let vm = VZVirtualMachine(configuration: vmConfig)
-
-    // Set up delegate
-    let vmDelegate = AVFDelegate(vmId: definition.id, eventBus: eventBus)
+    let runtime = VirtualizationRuntimeFactory().makeRuntime(
+      configuration: vmConfig,
+      vmId: definition.id,
+      eventBus: eventBus
+    )
+    let vm = runtime.virtualMachine
+    let vmDelegate = runtime.delegate
     vmDelegate.onError = { [weak self] error in Task { [weak self] in self?.handleError(error) } }
     vmDelegate.onStop = { [weak self] in Task { [weak self] in self?.handleStop() } }
-    vm.delegate = vmDelegate
 
     virtualMachine = vm
     delegate = vmDelegate

@@ -15,6 +15,12 @@ extension APIServer {
     return HTTPResponse.json(health)
   }
 
+  // MARK: - Capabilities
+
+  func handleSystemCapabilities() async -> HTTPResponse {
+    HTTPResponse.json(SystemCapabilitiesResponse(capabilities: capabilityProvider()))
+  }
+
   // MARK: - SSH
 
   func handleGetSSH(_ request: HTTPRequest) async -> HTTPResponse {
@@ -49,6 +55,7 @@ extension APIServer {
     guard let vmId = extractResourceId(from: request.path) else {
       return APIRouteErrorMapper.invalidID()
     }
+    if let response = requireCapability(.portForwarding) { return response }
 
     do {
       var definition = try await vmManager.getVM(vmId)
@@ -163,6 +170,7 @@ extension APIServer {
     guard let vmId = extractResourceId(from: request.path) else {
       return APIRouteErrorMapper.invalidID()
     }
+    if let response = requireCapability(.portForwarding) { return response }
 
     do {
       var definition = try await vmManager.getVM(vmId)
@@ -342,6 +350,7 @@ extension APIServer {
     guard let vmId = extractResourceId(from: request.path) else {
       return APIRouteErrorMapper.invalidID()
     }
+    if let response = requireCapability(.guiDisplay) { return response }
 
     do {
       try await vmManager.openGUI(vmId)

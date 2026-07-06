@@ -7,6 +7,7 @@ extension APIServer {
     guard let vmId = extractResourceId(from: request.path) else {
       return APIRouteErrorMapper.invalidID()
     }
+    if let response = requireCapability(.screenshotCapture) { return response }
 
     do {
       let pngData = try await vmManager.screenshotVM(vmId)

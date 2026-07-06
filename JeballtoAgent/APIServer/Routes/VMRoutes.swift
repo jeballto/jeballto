@@ -22,6 +22,10 @@ extension APIServer {
       )
     }
 
+    if let imageRef = createRequest.image, !imageRef.isEmpty, let response = requireCapability(.ociImagePackaging) {
+      return response
+    }
+
     let ephemeral = createRequest.ephemeral ?? false
     let lifetimeSeconds = createRequest.lifetimeSeconds
 
@@ -95,6 +99,7 @@ extension APIServer {
     guard let vmId = extractResourceId(from: request.path) else {
       return APIRouteErrorMapper.invalidID()
     }
+    if let response = requireCapabilities(VirtualizationFeature.vmRuntimeRequirements) { return response }
 
     do {
       try await vmManager.startVM(vmId)
@@ -114,6 +119,7 @@ extension APIServer {
     guard let vmId = extractResourceId(from: request.path) else {
       return APIRouteErrorMapper.invalidID()
     }
+    if let response = requireCapability(.macOSVirtualization) { return response }
 
     do {
       try await vmManager.stopVM(vmId)
@@ -129,6 +135,7 @@ extension APIServer {
     guard let vmId = extractResourceId(from: request.path) else {
       return APIRouteErrorMapper.invalidID()
     }
+    if let response = requireCapability(.macOSVirtualization) { return response }
 
     do {
       try await vmManager.pauseVM(vmId)
@@ -144,6 +151,7 @@ extension APIServer {
     guard let vmId = extractResourceId(from: request.path) else {
       return APIRouteErrorMapper.invalidID()
     }
+    if let response = requireCapabilities(VirtualizationFeature.vmRuntimeRequirements) { return response }
 
     do {
       try await vmManager.resumeVM(vmId)
