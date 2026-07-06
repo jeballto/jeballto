@@ -3,6 +3,20 @@ import Foundation
 
 /// Converts pure VM configuration specs into Apple Virtualization configurations.
 struct AVFConfigurationAssembler {
+  func validateResources(
+    in spec: VMConfigurationSpec,
+    installationRequirements: VZMacOSConfigurationRequirements?
+  ) throws {
+    _ = try computeCPUCount(
+      requested: spec.resources.cpuCount,
+      installationRequirements: installationRequirements
+    )
+    _ = try computeMemorySize(
+      requested: spec.resources.memorySize,
+      installationRequirements: installationRequirements
+    )
+  }
+
   func createConfiguration(
     from spec: VMConfigurationSpec,
     installationRequirements: VZMacOSConfigurationRequirements? = nil

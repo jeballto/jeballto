@@ -309,9 +309,14 @@ class VMInstaller: NSObject, @unchecked Sendable { // swiftlint:disable:this typ
     try createVMBundle()
 
     statusMessage = "Configuring VM hardware..."
-    try createDiskImage()
     let installSpec = MacVMConfigurationBuilder().makeInstallationSpec(for: vmDefinition)
-    let vmConfig = try AVFConfigurationAssembler().createConfiguration(
+    let assembler = AVFConfigurationAssembler()
+    try assembler.validateResources(
+      in: installSpec,
+      installationRequirements: macOSConfiguration
+    )
+    try createDiskImage()
+    let vmConfig = try assembler.createConfiguration(
       from: installSpec,
       installationRequirements: macOSConfiguration
     )

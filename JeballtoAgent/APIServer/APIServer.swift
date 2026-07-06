@@ -317,21 +317,27 @@ class APIServer {
   }
 
   func requireCapability(_ feature: VirtualizationFeature) -> HTTPResponse? {
+    requireCapabilities([feature])
+  }
+
+  func requireCapabilities(_ features: [VirtualizationFeature]) -> HTTPResponse? {
     let capabilities = capabilityProvider()
-    guard let capability = capabilities.features.first(where: { $0.id == feature.rawValue }) else {
-      return HTTPResponse.error(
-        "CAPABILITY_UNAVAILABLE",
-        message: "Capability \(feature.rawValue) is not registered",
-        statusCode: 409
-      )
-    }
-    guard capability.enabled else {
-      let reason = capability.reason ?? "Capability is unavailable on this host"
-      return HTTPResponse.error(
-        "CAPABILITY_UNAVAILABLE",
-        message: "\(feature.rawValue) is unavailable: \(reason)",
-        statusCode: 409
-      )
+    for feature in features {
+      guard let capability = capabilities.features.first(where: { $0.id == feature.rawValue }) else {
+        return HTTPResponse.error(
+          "CAPABILITY_UNAVAILABLE",
+          message: "Capability \(feature.rawValue) is not registered",
+          statusCode: 409
+        )
+      }
+      guard capability.enabled else {
+        let reason = capability.reason ?? "Capability is unavailable on this host"
+        return HTTPResponse.error(
+          "CAPABILITY_UNAVAILABLE",
+          message: "\(feature.rawValue) is unavailable: \(reason)",
+          statusCode: 409
+        )
+      }
     }
     return nil
   }

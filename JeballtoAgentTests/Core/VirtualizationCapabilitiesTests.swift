@@ -19,7 +19,21 @@ struct VirtualizationCapabilitiesTests {
     #expect(capabilities.host.macOSVersion == "26.5")
     #expect(capabilities.host.virtualizationSupported)
     #expect(capabilities.host.maxConcurrentVMs == 2)
+    #expect(Set(capabilities.features.map(\.id)) == [
+      "macOSVirtualization",
+      "macOSInstallation",
+      "natNetworking",
+      "portForwarding",
+      "commandExecution",
+      "guiDisplay",
+      "screenshotCapture",
+      "keystrokeInjection",
+      "jeballtofileExecution",
+      "ociImagePackaging",
+    ])
     #expect(capabilities.features.map(\.enabled).allSatisfy { $0 })
+    #expect(capabilities.features.map(\.lifecycle.rawValue).allSatisfy { $0 == "stable" })
+    #expect(capabilities.features.map(\.minimumOS).allSatisfy { $0 == "26.0" })
   }
 
   @Test
@@ -42,6 +56,80 @@ struct VirtualizationCapabilitiesTests {
   }
 
   @Test
+  func developmentLifecycleDisablesCapabilityByDefault() throws {
+    let capabilities = makeCapabilities(
+      featureFlags: VirtualizationFeatureFlags(lifecycleOverrides: [.guiDisplay: .development])
+    )
+
+    let guiDisplay = try #require(capabilities.features.first { $0.id == "guiDisplay" })
+
+    #expect(guiDisplay.status == .available)
+    #expect(guiDisplay.enabled == false)
+    #expect(guiDisplay.lifecycle == .development)
+    #expect(guiDisplay.deprecation == nil)
+    #expect(guiDisplay.reason == "Capability is in development")
+  }
+
+  @Test
+  func developmentLifecycleCanBeExplicitlyEnabled() throws {
+    let capabilities = makeCapabilities(
+      featureFlags: VirtualizationFeatureFlags(
+        overrides: [.guiDisplay: true],
+        lifecycleOverrides: [.guiDisplay: .development]
+      )
+    )
+
+    let guiDisplay = try #require(capabilities.features.first { $0.id == "guiDisplay" })
+
+    #expect(guiDisplay.enabled)
+    #expect(guiDisplay.lifecycle == .development)
+    #expect(guiDisplay.reason == nil)
+  }
+
+  @Test
+  func deprecatedLifecycleStaysDisabledAndReportsDeprecation() throws {
+    let deprecation = VirtualizationFeatureDeprecation(
+      since: "0.4.0",
+      message: "Use screenshotCapture instead"
+    )
+    let capabilities = makeCapabilities(
+      featureFlags: VirtualizationFeatureFlags(
+        overrides: [.guiDisplay: true],
+        lifecycleOverrides: [.guiDisplay: .deprecated(deprecation: deprecation)]
+      )
+    )
+
+    let guiDisplay = try #require(capabilities.features.first { $0.id == "guiDisplay" })
+
+    #expect(guiDisplay.status == .available)
+    #expect(guiDisplay.enabled == false)
+    #expect(guiDisplay.lifecycle == .deprecated(deprecation: deprecation))
+    #expect(guiDisplay.deprecation == deprecation)
+    #expect(guiDisplay.reason == "Capability is deprecated since 0.4.0: Use screenshotCapture instead")
+  }
+
+  @Test
+  func apiResponseIncludesLifecycleAndDeprecationDetails() throws {
+    let deprecation = VirtualizationFeatureDeprecation(
+      since: "0.4.0",
+      message: "Use screenshotCapture instead"
+    )
+    let capabilities = makeCapabilities(
+      featureFlags: VirtualizationFeatureFlags(
+        lifecycleOverrides: [.guiDisplay: .deprecated(deprecation: deprecation)]
+      )
+    )
+    let response = SystemCapabilitiesResponse(capabilities: capabilities)
+
+    let guiDisplay = try #require(response.features.first { $0.id == "guiDisplay" })
+    let responseDeprecation = try #require(guiDisplay.deprecation)
+
+    #expect(guiDisplay.lifecycle == "deprecated")
+    #expect(responseDeprecation.since == "0.4.0")
+    #expect(responseDeprecation.message == "Use screenshotCapture instead")
+  }
+
+  @Test
   func unsupportedArchitectureDisablesVirtualizationBackedCapabilities() throws {
     let capabilities = VirtualizationCapabilities(
       probe: VirtualizationHostProbe(
@@ -53,11 +141,17 @@ struct VirtualizationCapabilitiesTests {
     )
 
     let macOSVirtualization = try #require(capabilities.features.first { $0.id == "macOSVirtualization" })
+    let commandExecution = try #require(capabilities.features.first { $0.id == "commandExecution" })
+    let jeballtofileExecution = try #require(capabilities.features.first { $0.id == "jeballtofileExecution" })
     let imagePackaging = try #require(capabilities.features.first { $0.id == "ociImagePackaging" })
 
     #expect(macOSVirtualization.status == .unavailable)
     #expect(macOSVirtualization.enabled == false)
     #expect(macOSVirtualization.reason == "Requires Apple Silicon")
+    #expect(commandExecution.status == .unavailable)
+    #expect(commandExecution.enabled == false)
+    #expect(jeballtofileExecution.status == .unavailable)
+    #expect(jeballtofileExecution.enabled == false)
     #expect(imagePackaging.status == .available)
     #expect(imagePackaging.enabled)
   }
@@ -99,21 +193,44 @@ struct VirtualizationCapabilitiesTests {
   }
 
   @Test
-  func osVersionGateReportsMinimumVersion() throws {
+  func osVersionGateUsesJeballtoMinimumHostOS() throws {
     let capabilities = VirtualizationCapabilities(
       probe: VirtualizationHostProbe(
         architecture: "arm64",
-        operatingSystemVersion: OperatingSystemVersion(majorVersion: 13, minorVersion: 6, patchVersion: 0),
+        operatingSystemVersion: OperatingSystemVersion(majorVersion: 25, minorVersion: 6, patchVersion: 0),
         virtualizationSupported: true,
         entitlements: ["com.apple.security.virtualization"]
       )
     )
 
-    let saveRestore = try #require(capabilities.features.first { $0.id == "saveRestore" })
+    let macOSVirtualization = try #require(capabilities.features.first { $0.id == "macOSVirtualization" })
 
-    #expect(saveRestore.status == .unavailable)
-    #expect(saveRestore.enabled == false)
-    #expect(saveRestore.minimumOS == "14.0")
-    #expect(saveRestore.reason == "Requires macOS 14.0 or newer")
+    #expect(macOSVirtualization.status == .unavailable)
+    #expect(macOSVirtualization.enabled == false)
+    #expect(macOSVirtualization.minimumOS == "26.0")
+    #expect(macOSVirtualization.reason == "Requires macOS 26.0 or newer")
+  }
+
+  @Test
+  func effectiveMinimumOSUsesLaterFeatureAPIFloor() {
+    let effectiveMinimumOS = VirtualizationCapabilities.effectiveMinimumOS(
+      forFeatureRequiring: OperatingSystemVersion(majorVersion: 27, minorVersion: 0, patchVersion: 0)
+    )
+
+    #expect(VirtualizationCapabilities.versionString(effectiveMinimumOS) == "27.0")
+  }
+
+  private func makeCapabilities(
+    featureFlags: VirtualizationFeatureFlags = VirtualizationFeatureFlags()
+  ) -> VirtualizationCapabilities {
+    VirtualizationCapabilities(
+      probe: VirtualizationHostProbe(
+        architecture: "arm64",
+        operatingSystemVersion: OperatingSystemVersion(majorVersion: 26, minorVersion: 5, patchVersion: 0),
+        virtualizationSupported: true,
+        entitlements: ["com.apple.security.virtualization"]
+      ),
+      featureFlags: featureFlags
+    )
   }
 }

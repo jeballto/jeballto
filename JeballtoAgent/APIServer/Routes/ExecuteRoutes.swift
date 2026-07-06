@@ -7,7 +7,7 @@ extension APIServer {
     guard let vmId = extractResourceId(from: request.path) else {
       return APIRouteErrorMapper.invalidID()
     }
-    if let response = requireCapability(.portForwarding) { return response }
+    if let response = requireCapabilities(VirtualizationFeature.commandExecutionRequirements) { return response }
 
     guard let body = request.body else {
       return APIRouteErrorMapper.missingBody()

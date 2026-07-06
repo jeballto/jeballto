@@ -446,7 +446,7 @@ paths:
                   value:
                     error:
                       code: CAPABILITY_UNAVAILABLE
-                      message: "macOSInstallation is unavailable: Requires macOS 12.0 or newer"
+                      message: "macOSInstallation is unavailable: Requires macOS 26.0 or newer"
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -895,7 +895,7 @@ paths:
                   value:
                     error:
                       code: CAPABILITY_UNAVAILABLE
-                      message: "screenshotCapture is unavailable: Requires macOS 12.0 or newer"
+                      message: "screenshotCapture is unavailable: Requires macOS 26.0 or newer"
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -1017,7 +1017,7 @@ paths:
                   value:
                     error:
                       code: CAPABILITY_UNAVAILABLE
-                      message: "keystrokeInjection is unavailable: Requires macOS 12.0 or newer"
+                      message: "keystrokeInjection is unavailable: Requires macOS 26.0 or newer"
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -2873,6 +2873,7 @@ components:
         - id
         - status
         - enabled
+        - lifecycle
         - minimumOS
       properties:
         id:
@@ -2882,10 +2883,11 @@ components:
             - macOSInstallation
             - natNetworking
             - portForwarding
+            - commandExecution
             - guiDisplay
             - screenshotCapture
             - keystrokeInjection
-            - saveRestore
+            - jeballtofileExecution
             - ociImagePackaging
           description: Stable capability identifier
         status:
@@ -2897,14 +2899,42 @@ components:
         enabled:
           type: boolean
           description: Whether Jeballto currently allows routes that depend on this capability
+        lifecycle:
+          type: string
+          enum:
+            - development
+            - stable
+            - deprecated
+          description: Product lifecycle state for this capability
+          example: stable
         minimumOS:
           type: string
-          description: Minimum macOS version needed for this capability
-          example: "12.0"
+          description: Effective minimum macOS version needed for this capability, including Jeballto's supported host baseline
+          example: "26.0"
+        deprecation:
+          allOf:
+            - $ref: '#/components/schemas/FeatureDeprecationResponse'
+          nullable: true
+          description: Deprecation details when lifecycle is deprecated
         reason:
           type: string
           nullable: true
           description: Human-readable reason when the capability is unavailable or disabled
+
+    FeatureDeprecationResponse:
+      type: object
+      required:
+        - since
+        - message
+      properties:
+        since:
+          type: string
+          description: Jeballto version where this capability became deprecated
+          example: "0.4.0"
+        message:
+          type: string
+          description: Human-readable deprecation guidance
+          example: Use screenshotCapture instead
 
     ConfigResponse:
       type: object

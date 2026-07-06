@@ -21,25 +21,43 @@ struct VirtualizationHostProbe: Sendable {
 
 /// Internal feature switch input for capability resolution.
 struct VirtualizationFeatureFlags: Sendable {
-  private let overrides: [VirtualizationFeature: Bool]
+  private let enabledOverrides: [VirtualizationFeature: Bool]
+  private let lifecycleOverrides: [VirtualizationFeature: VirtualizationFeatureLifecycle]
 
-  init(overrides: [VirtualizationFeature: Bool] = [:]) {
-    self.overrides = overrides
+  init(
+    overrides: [VirtualizationFeature: Bool] = [:],
+    lifecycleOverrides: [VirtualizationFeature: VirtualizationFeatureLifecycle] = [:]
+  ) {
+    enabledOverrides = overrides
+    self.lifecycleOverrides = lifecycleOverrides
   }
 
   func enabledOverride(for feature: VirtualizationFeature) -> Bool? {
-    overrides[feature]
+    enabledOverrides[feature]
+  }
+
+  func lifecycleOverride(for feature: VirtualizationFeature) -> VirtualizationFeatureLifecycle? {
+    lifecycleOverrides[feature]
   }
 }
 
 /// Resolved host and feature capabilities for the running app.
 struct VirtualizationCapabilities: Sendable {
   static let maxConcurrentVMs = 2
+  /// Minimum host macOS version supported by this Jeballto release.
+  static let minimumSupportedHostOS = OperatingSystemVersion(
+    majorVersion: 26,
+    minorVersion: 0,
+    patchVersion: 0
+  )
 
   let host: Host
   let features: [Feature]
 
-  init(probe: VirtualizationHostProbe = .live, featureFlags: VirtualizationFeatureFlags = VirtualizationFeatureFlags()) {
+  init(
+    probe: VirtualizationHostProbe = .live,
+    featureFlags: VirtualizationFeatureFlags = VirtualizationFeatureFlags()
+  ) {
     host = Host(
       architecture: probe.architecture,
       macOSVersion: Self.versionString(probe.operatingSystemVersion),
@@ -62,7 +80,9 @@ struct VirtualizationCapabilities: Sendable {
     let id: String
     let status: VirtualizationFeatureStatus
     let enabled: Bool
+    let lifecycle: VirtualizationFeatureLifecycle
     let minimumOS: String
+    let deprecation: VirtualizationFeatureDeprecation?
     let reason: String?
   }
 
@@ -71,27 +91,32 @@ struct VirtualizationCapabilities: Sendable {
     using probe: VirtualizationHostProbe,
     featureFlags: VirtualizationFeatureFlags
   ) -> Feature {
-    let unavailableReason = unavailableReason(for: feature, using: probe)
+    let minimumOS = effectiveMinimumOS(for: feature)
+    let unavailableReason = unavailableReason(for: feature, minimumOS: minimumOS, using: probe)
     let supported = unavailableReason == nil
-    let flagEnabled = featureFlags.enabledOverride(for: feature) ?? feature.isEnabledByDefault
-    let enabled = supported && flagEnabled
-    let reason = unavailableReason ?? (enabled ? nil : "Capability is disabled")
+    let lifecycle = featureFlags.lifecycleOverride(for: feature) ?? feature.lifecycle
+    let requestedEnabled = featureFlags.enabledOverride(for: feature) ?? lifecycle.isEnabledByDefault
+    let enabled = supported && lifecycle.allowsEnablement && requestedEnabled
+    let reason = unavailableReason ?? disabledReason(for: lifecycle, enabled: enabled)
 
     return Feature(
       id: feature.rawValue,
       status: supported ? .available : .unavailable,
       enabled: enabled,
-      minimumOS: versionString(feature.minimumOS),
+      lifecycle: lifecycle,
+      minimumOS: versionString(minimumOS),
+      deprecation: lifecycle.deprecation,
       reason: reason
     )
   }
 
   private static func unavailableReason(
     for feature: VirtualizationFeature,
+    minimumOS: OperatingSystemVersion,
     using probe: VirtualizationHostProbe
   ) -> String? {
-    if isVersion(probe.operatingSystemVersion, earlierThan: feature.minimumOS) {
-      return "Requires macOS \(versionString(feature.minimumOS)) or newer"
+    if isVersion(probe.operatingSystemVersion, earlierThan: minimumOS) {
+      return "Requires macOS \(versionString(minimumOS)) or newer"
     }
 
     if feature.requiresVirtualizationSupport {
@@ -107,6 +132,30 @@ struct VirtualizationCapabilities: Sendable {
     }
 
     return nil
+  }
+
+  private static func disabledReason(for lifecycle: VirtualizationFeatureLifecycle, enabled: Bool) -> String? {
+    guard enabled == false else { return nil }
+
+    switch lifecycle {
+    case .development:
+      return "Capability is in development"
+    case .stable:
+      return "Capability is disabled"
+    case .deprecated(let deprecation):
+      return "Capability is deprecated since \(deprecation.since): \(deprecation.message)"
+    }
+  }
+
+  private static func effectiveMinimumOS(for feature: VirtualizationFeature) -> OperatingSystemVersion {
+    effectiveMinimumOS(forFeatureRequiring: feature.minimumOS)
+  }
+
+  /// Returns the later version between Jeballto's supported host baseline and a feature API floor.
+  static func effectiveMinimumOS(forFeatureRequiring featureMinimumOS: OperatingSystemVersion)
+    -> OperatingSystemVersion
+  {
+    laterVersion(minimumSupportedHostOS, featureMinimumOS)
   }
 
   static func versionString(_ version: OperatingSystemVersion) -> String {
@@ -128,16 +177,23 @@ struct VirtualizationCapabilities: Sendable {
     }
     return version.patchVersion < minimum.patchVersion
   }
+
+  private static func laterVersion(
+    _ lhs: OperatingSystemVersion,
+    _ rhs: OperatingSystemVersion
+  ) -> OperatingSystemVersion {
+    isVersion(lhs, earlierThan: rhs) ? rhs : lhs
+  }
 }
 
 private enum RuntimeArchitecture {
   static var current: String {
     #if arch(arm64)
-      "arm64"
+    "arm64"
     #elseif arch(x86_64)
-      "x86_64"
+    "x86_64"
     #else
-      "unknown"
+    "unknown"
     #endif
   }
 }

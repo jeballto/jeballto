@@ -795,16 +795,16 @@ Returns host facts and the Jeballto runtime capabilities available on this machi
       "id": "macOSVirtualization",
       "status": "available",
       "enabled": true,
-      "minimumOS": "11.0",
-      "reason": null
+      "lifecycle": "stable",
+      "minimumOS": "26.0"
     }
   ]
 }
 ```
 
-The capability list describes platform and runtime surfaces such as macOS installation, NAT networking, GUI display, screenshots, keystrokes, save/restore, port forwarding, and image packaging. It does not list ordinary VM actions such as create, start, stop, or delete.
+The capability list describes platform and runtime surfaces such as macOS installation, NAT networking, port forwarding, command execution, GUI display, screenshots, keystrokes, Jeballtofile execution, and image packaging. `minimumOS` is the effective minimum macOS version, including Jeballto's supported host baseline. It does not list ordinary VM actions such as create, start, stop, or delete.
 
-`status` describes whether the host can support the capability. `enabled` describes whether Jeballto currently allows routes that depend on it.
+`status` describes whether the host can support the capability. `enabled` describes whether Jeballto currently allows routes that depend on it. `lifecycle` describes the product lifecycle: `development` features are disabled by default, `stable` features are enabled by default, and `deprecated` features are disabled with deprecation details.
 
 ## System Reset
 

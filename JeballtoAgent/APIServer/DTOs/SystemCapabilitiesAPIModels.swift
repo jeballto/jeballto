@@ -28,14 +28,28 @@ struct FeatureCapabilityResponse: Codable {
   let id: String
   let status: String
   let enabled: Bool
+  let lifecycle: String
   let minimumOS: String
+  let deprecation: FeatureDeprecationResponse?
   let reason: String?
 
   init(_ feature: VirtualizationCapabilities.Feature) {
     id = feature.id
     status = feature.status.rawValue
     enabled = feature.enabled
+    lifecycle = feature.lifecycle.rawValue
     minimumOS = feature.minimumOS
+    deprecation = feature.deprecation.map(FeatureDeprecationResponse.init)
     reason = feature.reason
+  }
+}
+
+struct FeatureDeprecationResponse: Codable {
+  let since: String
+  let message: String
+
+  init(_ deprecation: VirtualizationFeatureDeprecation) {
+    since = deprecation.since
+    message = deprecation.message
   }
 }

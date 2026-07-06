@@ -58,7 +58,7 @@ Owns all direct Apple Virtualization configuration assembly:
 - `MacVMConfigurationBuilder` maps `VMDefinition` into runtime or installation specs.
 - `AVFConfigurationAssembler` converts specs into `VZVirtualMachineConfiguration`.
 - `VirtualizationRuntimeFactory` creates `VZVirtualMachine` and wires `AVFDelegate`.
-- `VirtualizationCapabilities` reports current host support and enabled runtime capabilities for `/v1/system/capabilities`.
+- `VirtualizationCapabilities` reports host support, feature lifecycle, and enabled runtime capabilities for `/v1/system/capabilities`.
 
 `VMManager`, `VMInstance`, and `VMInstaller` should depend on these adapter-level concepts instead of assembling device-specific `VZ*` objects directly.
 
