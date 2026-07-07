@@ -9,6 +9,7 @@ class StatusBarManager: NSObject, NSMenuDelegate {
   private var vmManager: VMManager?
   private var serverStartTime: Date?
   private var updaterManager: UpdaterManager?
+  private var countRefreshTimer: Timer?
 
   // Menu items that get updated dynamically
   private var statusMenuItem: NSMenuItem?
@@ -20,6 +21,10 @@ class StatusBarManager: NSObject, NSMenuDelegate {
   // Cached values for sync access (actor-isolated VMManager can't be called from sync context)
   private var cachedRunningVMs: Int = 0
   private var cachedTotalVMs: Int = 0
+
+  deinit {
+    countRefreshTimer?.invalidate()
+  }
 
   func setup(updaterManager: UpdaterManager) {
     self.updaterManager = updaterManager
@@ -113,12 +118,14 @@ class StatusBarManager: NSObject, NSMenuDelegate {
     // Immediately reflect that initialization is complete
     statusMenuItem?.title = "Status: Healthy"
     vmsMenuItem?.title = "VMs: 0 running / \(initialVMCount) total"
+    refreshCachedCounts()
+    startCountRefreshTimer()
   }
 
   // MARK: - NSMenuDelegate
 
   func menuNeedsUpdate(_ menu: NSMenu) {
-    guard let vmManager else {
+    guard vmManager != nil else {
       statusMenuItem?.title = "Status: Starting..."
       vmsMenuItem?.title = "VMs: -"
       uptimeMenuItem?.title = "Uptime: -"
@@ -129,8 +136,25 @@ class StatusBarManager: NSObject, NSMenuDelegate {
 
     vmsMenuItem?.title = "VMs: \(cachedRunningVMs) running / \(cachedTotalVMs) total"
 
-    // Refresh cached counts in background and update visible menu
-    Task {
+    loginItemMenuItem?.state = SMAppService.mainApp.status == .enabled ? .on : .off
+    betaUpdatesMenuItem?.state = updaterManager?.isBetaUpdatesEnabled == true ? .on : .off
+
+    if let startTime = serverStartTime {
+      let seconds = Int(Date().timeIntervalSince(startTime))
+      uptimeMenuItem?.title = "Uptime: \(formatUptime(seconds))"
+    }
+  }
+
+  private func startCountRefreshTimer() {
+    countRefreshTimer?.invalidate()
+    countRefreshTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+      self?.refreshCachedCounts()
+    }
+  }
+
+  private func refreshCachedCounts() {
+    guard let vmManager else { return }
+    Task<Void, Never> {
       let running = await vmManager.runningVMCount()
       let total = await vmManager.vmCount()
       await MainActor.run {
@@ -138,14 +162,6 @@ class StatusBarManager: NSObject, NSMenuDelegate {
         self.cachedTotalVMs = total
         self.vmsMenuItem?.title = "VMs: \(running) running / \(total) total"
       }
-    }
-
-    loginItemMenuItem?.state = SMAppService.mainApp.status == .enabled ? .on : .off
-    betaUpdatesMenuItem?.state = updaterManager?.isBetaUpdatesEnabled == true ? .on : .off
-
-    if let startTime = serverStartTime {
-      let seconds = Int(Date().timeIntervalSince(startTime))
-      uptimeMenuItem?.title = "Uptime: \(formatUptime(seconds))"
     }
   }
 

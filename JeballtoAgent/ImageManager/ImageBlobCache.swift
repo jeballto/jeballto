@@ -1,13 +1,8 @@
 import Foundation
 
 actor ImageBlobCache {
-  private struct Waiter {
-    let id: UUID
-    let continuation: CheckedContinuation<Bool, Never>
-  }
-
   private var activeDigests: Set<String> = []
-  private var waitersByDigest: [String: [Waiter]] = [:]
+  private let retryDelay: UInt64 = 1_000_000
 
   func withExclusiveAccess<T: Sendable>(
     for digest: String,
@@ -20,43 +15,17 @@ actor ImageBlobCache {
   }
 
   private func acquire(_ digest: String) async throws {
-    try Task.checkCancellation()
-    if activeDigests.contains(digest) == false {
-      activeDigests.insert(digest)
-      return
-    }
-
-    let waiterID = UUID()
-    let acquired = await withTaskCancellationHandler {
-      await withCheckedContinuation { continuation in
-        waitersByDigest[digest, default: []].append(Waiter(id: waiterID, continuation: continuation))
+    while true {
+      try Task.checkCancellation()
+      if activeDigests.contains(digest) == false {
+        activeDigests.insert(digest)
+        return
       }
-    } onCancel: {
-      Task { await self.cancelWaiter(waiterID, for: digest) }
-    }
-
-    guard acquired else {
-      throw CancellationError()
+      try await Task.sleep(nanoseconds: retryDelay)
     }
   }
 
   private func release(_ digest: String) {
-    guard var waiters = waitersByDigest[digest], waiters.isEmpty == false else {
-      activeDigests.remove(digest)
-      waitersByDigest[digest] = nil
-      return
-    }
-
-    let next = waiters.removeFirst()
-    waitersByDigest[digest] = waiters.isEmpty ? nil : waiters
-    next.continuation.resume(returning: true)
-  }
-
-  private func cancelWaiter(_ id: UUID, for digest: String) {
-    guard var waiters = waitersByDigest[digest],
-          let index = waiters.firstIndex(where: { $0.id == id }) else { return }
-    let waiter = waiters.remove(at: index)
-    waitersByDigest[digest] = waiters.isEmpty ? nil : waiters
-    waiter.continuation.resume(returning: false)
+    activeDigests.remove(digest)
   }
 }

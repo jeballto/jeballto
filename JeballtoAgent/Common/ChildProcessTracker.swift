@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 /// Tracks running child processes (oras, tar, etc.) so they can be terminated
@@ -9,6 +10,8 @@ import Foundation
 /// - On shutdown: `ChildProcessTracker.shared.terminateAll()`
 final class ChildProcessTracker: @unchecked Sendable {
   static let shared = ChildProcessTracker()
+
+  private static let forceKillDelayNanoseconds: UInt64 = 1_000_000_000
 
   private let lock = NSLock()
   private var processes: Set<ObjectWrapper> = []
@@ -41,6 +44,7 @@ final class ChildProcessTracker: @unchecked Sendable {
     for wrapper in current where wrapper.process.isRunning {
       logInfo("Terminating child process (pid \(wrapper.process.processIdentifier))", category: "ChildProcessTracker")
       wrapper.process.terminate()
+      scheduleForceKillIfNeeded(wrapper.process)
     }
   }
 
@@ -49,8 +53,19 @@ final class ChildProcessTracker: @unchecked Sendable {
     if process.isRunning {
       logInfo("Cancelling child process (pid \(process.processIdentifier))", category: "ChildProcessTracker")
       process.terminate()
+      scheduleForceKillIfNeeded(process)
     }
     untrack(process)
+  }
+
+  private func scheduleForceKillIfNeeded(_ process: Process) {
+    let pid = process.processIdentifier
+    Task.detached {
+      try? await Task.sleep(nanoseconds: Self.forceKillDelayNanoseconds)
+      guard process.isRunning else { return }
+      logWarning("Force killing child process (pid \(pid))", category: "ChildProcessTracker")
+      kill(pid, SIGKILL)
+    }
   }
 }
 

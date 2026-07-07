@@ -103,7 +103,10 @@ struct HTTPResponse: Error {
     case 405: "Method Not Allowed"
     case 409: "Conflict"
     case 413: "Payload Too Large"
+    case 429: "Too Many Requests"
+    case 499: "Client Closed Request"
     case 500: "Internal Server Error"
+    case 503: "Service Unavailable"
     case 504: "Gateway Timeout"
     default: "Unknown"
     }
@@ -129,9 +132,12 @@ enum HTTPServerError: Error, LocalizedError {
 class SimpleHTTPServer {
   private let port: UInt16
   private let host: String
+  private let maxConcurrentRequests: Int
   private let queue: DispatchQueue
   private var listener: NWListener?
   private var isRunning = false
+  private let requestLimitLock = NSLock()
+  private var activeRequestCount = 0
 
   /// Maximum allowed request body size (1 MB)
   private static let maxRequestBodySize = 1_048_576
@@ -145,9 +151,10 @@ class SimpleHTTPServer {
   private var routes: [String: [String: RouteHandler]] = [:]
   var authToken: String?
 
-  init(port: UInt16, host: String = "0.0.0.0") {
+  init(port: UInt16, host: String = "0.0.0.0", maxConcurrentRequests: Int = 100) {
     self.port = port
     self.host = host
+    self.maxConcurrentRequests = max(1, maxConcurrentRequests)
     queue = DispatchQueue(label: "com.jeballto.httpserver")
   }
 
@@ -217,16 +224,37 @@ class SimpleHTTPServer {
     queue.asyncAfter(deadline: .now() + Self.connectionTimeoutSeconds, execute: timeoutItem)
 
     // Read complete HTTP request (headers + body)
-    readFullRequest(connection: connection, accumulatedData: Data()) { [weak self] fullData in
+    readFullRequest(connection: connection, accumulatedData: Data()) { [weak self] readResult in
       timeoutItem.cancel()
-      guard let self, let fullData else {
+      guard let self, let readResult else {
         connection.cancel()
+        return
+      }
+
+      let fullData: Data
+      switch readResult {
+      case .success(let data):
+        fullData = data
+      case .failure(let errorResponse):
+        let responseData = errorResponse.toData()
+        connection.send(content: responseData, completion: .contentProcessed { _ in connection.cancel() })
         return
       }
 
       switch parseHTTPRequest(fullData) {
       case .success(let request):
+        guard claimRequestSlot() else {
+          let response = HTTPResponse.error(
+            "TOO_MANY_REQUESTS",
+            message: "Maximum concurrent requests exceeded",
+            statusCode: 429
+          )
+          let responseData = response.toData()
+          connection.send(content: responseData, completion: .contentProcessed { _ in connection.cancel() })
+          return
+        }
         let task = Task<Void, Never> {
+          defer { self.releaseRequestSlot() }
           let response = await self.handleRequest(request)
           guard !Task.isCancelled else {
             connection.cancel()
@@ -253,11 +281,11 @@ class SimpleHTTPServer {
   private func readFullRequest(
     connection: NWConnection,
     accumulatedData: Data,
-    completion: @escaping (Data?) -> Void
+    completion: @escaping (Result<Data, HTTPResponse>?) -> Void
   ) {
     connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, isComplete, error in
       guard let data else {
-        completion(accumulatedData.isEmpty ? nil : accumulatedData)
+        completion(accumulatedData.isEmpty ? nil : .success(accumulatedData))
         return
       }
 
@@ -284,7 +312,7 @@ class SimpleHTTPServer {
           return
         }
         if isComplete || error != nil {
-          completion(accumulated)
+          completion(.success(accumulated))
         } else {
           self.readFullRequest(connection: connection, accumulatedData: accumulated, completion: completion)
         }
@@ -294,20 +322,37 @@ class SimpleHTTPServer {
       // Parse Content-Length from headers
       let headerData = accumulated[accumulated.startIndex ..< headerEnd]
       let headerString = String(data: headerData, encoding: .utf8) ?? ""
-      var contentLength = 0
-      for line in headerString.components(separatedBy: "\r\n") {
-        if line.lowercased().hasPrefix("content-length:") {
-          let value = line.dropFirst("content-length:".count).trimmingCharacters(in: .whitespaces)
-          contentLength = Int(value) ?? 0
-          break
-        }
+      let contentLength: Int
+      switch Self.contentLength(fromHeaderString: headerString) {
+      case .success(let value):
+        contentLength = value
+      case .failure(let response):
+        completion(.failure(response))
+        return
+      }
+
+      if contentLength > Self.maxRequestBodySize {
+        logWarning(
+          "Content-Length \(contentLength) exceeds \(Self.maxRequestBodySize), rejecting",
+          category: "HTTPServer"
+        )
+        completion(.failure(Self.payloadTooLargeResponse()))
+        return
       }
 
       // Check if we have the full body
       let bodyStart = headerEnd + 4 // skip \r\n\r\n
       let receivedBodyLength = accumulated.endIndex - bodyStart
+      if receivedBodyLength > Self.maxRequestBodySize {
+        logWarning(
+          "Request body exceeds \(Self.maxRequestBodySize) bytes while reading, rejecting",
+          category: "HTTPServer"
+        )
+        completion(.failure(Self.payloadTooLargeResponse()))
+        return
+      }
       if receivedBodyLength >= contentLength || isComplete || error != nil {
-        completion(accumulated)
+        completion(.success(accumulated))
       } else {
         self.readFullRequest(connection: connection, accumulatedData: accumulated, completion: completion)
       }
@@ -317,6 +362,25 @@ class SimpleHTTPServer {
   private static let malformedRequestError = HTTPResponse.error(
     "INVALID_REQUEST", message: "Malformed HTTP request", statusCode: 400
   )
+
+  static func contentLength(fromHeaderString headerString: String) -> Result<Int, HTTPResponse> {
+    for line in headerString.components(separatedBy: "\r\n") where line.lowercased().hasPrefix("content-length:") {
+      let value = line.dropFirst("content-length:".count).trimmingCharacters(in: .whitespaces)
+      guard let contentLength = Int(value), contentLength >= 0 else {
+        return .failure(malformedRequestError)
+      }
+      return .success(contentLength)
+    }
+    return .success(0)
+  }
+
+  private static func payloadTooLargeResponse() -> HTTPResponse {
+    HTTPResponse.error(
+      "PAYLOAD_TOO_LARGE",
+      message: "Request body exceeds maximum size of \(maxRequestBodySize) bytes",
+      statusCode: 413
+    )
+  }
 
   private func parseHTTPRequest(_ data: Data) -> Result<HTTPRequest, HTTPResponse> {
     // Find the header/body separator (\r\n\r\n) in raw bytes
@@ -371,11 +435,7 @@ class SimpleHTTPServer {
       let bodyData = data[bodyStartIndex ..< data.endIndex]
       if bodyData.count > Self.maxRequestBodySize {
         logWarning("Request body too large (\(bodyData.count) bytes), rejecting", category: "HTTPServer")
-        return .failure(HTTPResponse.error(
-          "PAYLOAD_TOO_LARGE",
-          message: "Request body exceeds maximum size of \(Self.maxRequestBodySize) bytes",
-          statusCode: 413
-        ))
+        return .failure(Self.payloadTooLargeResponse())
       }
       if !bodyData.isEmpty { body = Data(bodyData) }
     }
@@ -429,6 +489,20 @@ class SimpleHTTPServer {
       message: "The requested resource was not found",
       statusCode: 404
     )
+  }
+
+  private func claimRequestSlot() -> Bool {
+    requestLimitLock.lock()
+    defer { requestLimitLock.unlock() }
+    guard activeRequestCount < maxConcurrentRequests else { return false }
+    activeRequestCount += 1
+    return true
+  }
+
+  private func releaseRequestSlot() {
+    requestLimitLock.lock()
+    activeRequestCount = max(0, activeRequestCount - 1)
+    requestLimitLock.unlock()
   }
 
   /// Constant-time string comparison to prevent timing side-channel attacks.

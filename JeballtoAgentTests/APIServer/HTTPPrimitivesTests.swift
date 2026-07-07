@@ -40,6 +40,40 @@ struct HTTPPrimitivesTests {
   }
 
   @Test
+  func responseSerializationUsesKnownReasonPhrases() {
+    let cancelled = String(data: HTTPResponse(statusCode: 499).toData(), encoding: .utf8)
+    let unavailable = String(data: HTTPResponse(statusCode: 503).toData(), encoding: .utf8)
+
+    #expect(cancelled?.contains("HTTP/1.1 499 Client Closed Request") == true)
+    #expect(unavailable?.contains("HTTP/1.1 503 Service Unavailable") == true)
+  }
+
+  @Test
+  func contentLengthRejectsMalformedValues() throws {
+    let missing = SimpleHTTPServer.contentLength(fromHeaderString: "Host: example.test")
+    let valid = SimpleHTTPServer.contentLength(fromHeaderString: "Host: example.test\r\nContent-Length: 42")
+    let malformed = SimpleHTTPServer.contentLength(fromHeaderString: "Content-Length: nope")
+    let negative = SimpleHTTPServer.contentLength(fromHeaderString: "Content-Length: -1")
+
+    if case .success(let length) = missing {
+      #expect(length == 0)
+    } else {
+      Issue.record("Expected missing Content-Length to default to 0")
+    }
+
+    if case .success(let length) = valid {
+      #expect(length == 42)
+    } else {
+      Issue.record("Expected valid Content-Length to parse")
+    }
+
+    let malformedError = try #require(malformed.failureResponse)
+    let negativeError = try #require(negative.failureResponse)
+    #expect(malformedError.statusCode == 400)
+    #expect(negativeError.statusCode == 400)
+  }
+
+  @Test
   func helperFactoriesProduceExpectedPayloads() throws {
     let success = HTTPResponse.success(message: "ok", statusCode: 201)
     let error = HTTPResponse.error("BAD", message: "nope", statusCode: 400)
@@ -53,5 +87,12 @@ struct HTTPPrimitivesTests {
     #expect(error.statusCode == 400)
     #expect(errorBody.error.code == "BAD")
     #expect(errorBody.error.message == "nope")
+  }
+}
+
+private extension Result where Success == Int, Failure == HTTPResponse {
+  var failureResponse: HTTPResponse? {
+    if case .failure(let response) = self { return response }
+    return nil
   }
 }

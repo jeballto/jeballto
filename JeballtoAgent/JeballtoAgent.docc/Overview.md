@@ -4,7 +4,7 @@ A headless macOS virtual machine manager for Apple Silicon, exposing a REST API 
 
 ## Overview
 
-JeballtoAgent runs as a macOS menu-bar app on Apple Silicon (M1+, macOS 26.0+) and serves a REST API on `localhost:8011` by default. It writes an API token on first launch; see <doc:APIReference> for auth details.
+JeballtoAgent runs as a macOS menu-bar app on Apple Silicon (M1+, macOS 26.0+) and serves a REST API on `0.0.0.0:8011` by default. Same-machine examples use `localhost` or `127.0.0.1`. It writes an API token on first launch; see <doc:APIReference> for auth details.
 
 Two primary workflows:
 

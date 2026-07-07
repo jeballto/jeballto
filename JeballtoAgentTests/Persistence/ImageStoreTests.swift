@@ -200,17 +200,29 @@ struct ImageStoreTests {
   }
 
   @Test
-  func invalidOnDiskDataFallsBackToEmptyIndex() async throws {
+  func invalidOnDiskDataBlocksMutationAndPreservesFile() async throws {
     try await withTemporaryDirectory(prefix: "imagestore") { root in
       let indexPath = "\(root)/images.json"
-      try Data("not-json".utf8).write(to: URL(fileURLWithPath: indexPath))
+      let originalData = Data("not-json".utf8)
+      try originalData.write(to: URL(fileURLWithPath: indexPath))
 
       let store = ImageStore(storagePath: root)
       #expect(await store.count() == 0)
 
       let record = makeRecord(reference: "after-recovery:1.0", localPath: root)
-      try await store.addImage(record)
-      #expect(await store.count() == 1)
+      do {
+        try await store.addImage(record)
+        Issue.record("Expected corrupt image index to block writes")
+      } catch let error as ImageStoreError {
+        if case .invalidData(let reason) = error {
+          #expect(reason.contains("Refusing to overwrite it"))
+        } else {
+          Issue.record("Expected invalidData, got \(error.localizedDescription)")
+        }
+      }
+
+      let preservedData = try Data(contentsOf: URL(fileURLWithPath: indexPath))
+      #expect(preservedData == originalData)
     }
   }
 }

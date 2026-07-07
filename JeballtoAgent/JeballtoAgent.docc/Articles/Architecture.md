@@ -169,7 +169,7 @@ One slow subscriber cannot block others. See <doc:EventBus>.
 
 See <doc:VMState> for the full transition table.
 
-**State persistence:** Every transition is persisted immediately. On restart, transitional states (STARTING, STOPPING, PAUSING, RESUMING) are reset to STOPPED. PAUSED with a save file is preserved.
+**State persistence:** Lifecycle operations persist their resulting state before API handlers return. Event handlers also persist lifecycle events and run side effects such as networking cleanup. On restart, transitional states (STARTING, STOPPING, PAUSING, RESUMING) are reset to STOPPED. PAUSED with a save file is preserved.
 
 **Error recovery:** If a lifecycle operation fails (e.g. `vm.start()` throws), the VM transitions to ERROR state rather than remaining stuck in an intermediate state. This is enforced in every lifecycle method via do/catch with `forceState(.error)`.
 
@@ -223,7 +223,7 @@ Images pulled from an OCI registry are stored under `Application Support/Jeballt
 
 ## Architectural Constraints
 
-**Concurrent VM limit:** Max 2 VMs simultaneously on Apple Silicon. This is a hardware limitation enforced by the Virtualization framework. Paused VMs do not count toward the limit.
+**Concurrent VM limit:** Max 2 capacity-consuming VMs simultaneously on Apple Silicon. This is a hardware limitation enforced by the Virtualization framework. Installing, starting, running, pausing, paused, resuming, and in-flight capacity reservations count toward the limit.
 
 **Platform:** Apple Silicon only (ARM64 check on startup). macOS 26.0+.
 
@@ -232,7 +232,7 @@ Images pulled from an OCI registry are stored under `Application Support/Jeballt
 ## Security
 
 - Token auto-generated on first run, stored in config file with 600 permissions
-- API binds to localhost by default
+- API binds to all interfaces by default (`0.0.0.0`) and requires the bearer token for every endpoint except `/v1/health`
 - SSH passwords passed via `SSH_ASKPASS` script (not in process arguments)
 - OCI registry passwords passed via stdin to oras (not in process arguments)
 - Tokens masked in logs (first 4 + last 4 chars shown)

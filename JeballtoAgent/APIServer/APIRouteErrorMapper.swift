@@ -72,7 +72,7 @@ enum APIRouteErrorMapper {
 
   static func commandExecutor(_ error: CommandExecutorError, defaultCode: String = "EXECUTE_FAILED") -> HTTPResponse {
     HTTPResponse.error(
-      defaultCode,
+      error.isTimeout ? "EXECUTE_TIMEOUT" : defaultCode,
       message: error.localizedDescription,
       statusCode: error.isTimeout ? 504 : 500
     )

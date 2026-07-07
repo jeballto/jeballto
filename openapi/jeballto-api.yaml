@@ -104,6 +104,7 @@ paths:
             type: integer
             minimum: 1
             maximum: 1000
+            default: 100
         - name: offset
           in: query
           required: false
@@ -956,7 +957,7 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
               example:
                 error:
-                  code: EXECUTE_FAILED
+                  code: EXECUTE_TIMEOUT
                   message: "Command timed out after 30 seconds"
 
   /vms/{id}/keystrokes:
@@ -1137,6 +1138,7 @@ paths:
             type: integer
             minimum: 1
             maximum: 1000
+            default: 100
         - name: offset
           in: query
           required: false
@@ -1307,13 +1309,16 @@ paths:
       tags:
         - images
       summary: Cancel image pull
-      description: Cancel a running asynchronous image pull operation.
+      description: >
+        Cancel a running asynchronous image pull operation. The request waits
+        for task cleanup and child-process termination before returning the
+        terminal operation status.
       operationId: cancelImagePull
       parameters:
         - $ref: '#/components/parameters/imageOperationId'
       responses:
         '200':
-          description: Image pull cancellation requested
+          description: Image pull cancelled
           content:
             application/json:
               schema:
@@ -1443,13 +1448,16 @@ paths:
       tags:
         - images
       summary: Cancel image push
-      description: Cancel a running asynchronous image push operation.
+      description: >
+        Cancel a running asynchronous image push operation. The request waits
+        for task cleanup and child-process termination before returning the
+        terminal operation status.
       operationId: cancelImagePush
       parameters:
         - $ref: '#/components/parameters/imageOperationId'
       responses:
         '200':
-          description: Image push cancellation requested
+          description: Image push cancelled
           content:
             application/json:
               schema:
@@ -1676,7 +1684,7 @@ paths:
       summary: Cancel a Jeballtofile execution
       description: >
         Requests cancellation of a running Jeballtofile execution.
-        The current step will finish before execution halts.
+        The current step is marked cancelled when the task observes cancellation.
       operationId: cancelJeballtofile
       parameters:
         - name: executionId
@@ -2107,7 +2115,7 @@ components:
           type: integer
           nullable: true
           description: VNC forwarding port
-          example: 5900
+          example: 5901
         natIP:
           type: string
           nullable: true
@@ -2175,7 +2183,7 @@ components:
         port:
           type: integer
           description: VNC port
-          example: 5900
+          example: 5901
         status:
           type: string
           description: "Forwarding status: ready, unavailable, or disabled"
@@ -2486,9 +2494,11 @@ components:
           type: integer
           nullable: true
           minimum: 1
+          maximum: 604800
           description: >
             Timeout in seconds for the pull operation. If omitted or null,
-            the operation runs without a time limit (unlimited).
+            the operation runs without a time limit (unlimited). Maximum when
+            set is 604800 seconds (7 days).
           example: 3600
         async:
           type: boolean
@@ -2518,9 +2528,11 @@ components:
           type: integer
           nullable: true
           minimum: 1
+          maximum: 604800
           description: >
             Timeout in seconds for the push operation. If omitted or null,
-            the operation runs without a time limit (unlimited).
+            the operation runs without a time limit (unlimited). Maximum when
+            set is 604800 seconds (7 days).
           example: 7200
         async:
           type: boolean
@@ -2727,7 +2739,10 @@ components:
             - completed
             - failed
             - cancelled
-          description: Current operation status. `cancelling` means cancellation was requested and cleanup is still running.
+          description: >
+            Current operation status. `cancelling` means cancellation was
+            requested and cleanup is still running. DELETE cancellation
+            endpoints wait for cleanup and normally return `cancelled`.
         stage:
           type: string
           enum:
@@ -3273,6 +3288,7 @@ components:
                 - UNAUTHORIZED
                 - INVALID_ID
                 - INVALID_REQUEST
+                - PAYLOAD_TOO_LARGE
                 - NOT_FOUND
                 - CREATE_FAILED
                 - START_FAILED
@@ -3290,8 +3306,10 @@ components:
                 - INSTALL_FAILED
                 - INSTALL_IN_PROGRESS
                 - EXECUTE_FAILED
+                - EXECUTE_TIMEOUT
                 - INVALID_STATE
                 - CAPABILITY_UNAVAILABLE
+                - TOO_MANY_REQUESTS
                 - IMAGE_NOT_FOUND
                 - IMAGE_PULL_FAILED
                 - IMAGE_PULL_CANCELLED

@@ -1,5 +1,6 @@
 // swiftlint:disable file_length
 
+import CryptoKit
 import Foundation
 @preconcurrency import Virtualization
 
@@ -242,9 +243,7 @@ class VMInstaller: NSObject, @unchecked Sendable { // swiftlint:disable:this typ
 
     try FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
 
-    // Use filename from URL. The final path's presence = fully downloaded (renames are atomic on same
-    // volume). Partial downloads live at `<filename>.partial` and only get promoted on success.
-    let filename = remoteURL.lastPathComponent
+    let filename = Self.cacheFilename(for: remoteURL)
     let localURL = cacheDir.appendingPathComponent(filename)
     let partialURL = cacheDir.appendingPathComponent("\(filename).partial")
 
@@ -272,6 +271,7 @@ class VMInstaller: NSObject, @unchecked Sendable { // swiftlint:disable:this typ
     // handler bypasses delegate methods (didWriteData) so progress would never update.
     let delegate = DownloadDelegate(installer: self, destinationURL: partialURL)
     let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
+    defer { session.finishTasksAndInvalidate() }
 
     let downloadedURL: URL = try await withTaskCancellationHandler {
       try await withCheckedThrowingContinuation { continuation in
@@ -292,6 +292,26 @@ class VMInstaller: NSObject, @unchecked Sendable { // swiftlint:disable:this typ
 
     logInfo("IPSW downloaded successfully to \(localURL.path)", category: "VMInstaller")
     return localURL
+  }
+
+  static func cacheFilename(for remoteURL: URL) -> String {
+    let urlData = Data(remoteURL.absoluteString.utf8)
+    let digest = SHA256.hash(data: urlData)
+      .prefix(12)
+      .map { String(format: "%02x", $0) }
+      .joined()
+
+    let rawFilename = remoteURL.lastPathComponent.isEmpty ? "restore.ipsw" : remoteURL.lastPathComponent
+    let filename = rawFilename.replacingOccurrences(of: "/", with: "_")
+    let nsFilename = filename as NSString
+    let ext = nsFilename.pathExtension
+    let rawStem = nsFilename.deletingPathExtension.isEmpty ? "restore" : nsFilename.deletingPathExtension
+    let stem = String(rawStem.prefix(180))
+
+    if ext.isEmpty {
+      return "\(stem)-\(digest)"
+    }
+    return "\(stem)-\(digest).\(ext)"
   }
 
   /// Installs macOS from a restore image
@@ -524,6 +544,7 @@ class DownloadDelegate: NSObject, URLSessionDownloadDelegate {
   private let lock = NSLock()
   private var continuation: CheckedContinuation<URL, Error>?
   private var downloadTask: URLSessionDownloadTask?
+  private var isCancelled = false
   private let destinationURL: URL
   private var lastLoggedPercent: Int = -1
   private var lastProgressUpdateTime: Date = .distantPast
@@ -540,8 +561,13 @@ class DownloadDelegate: NSObject, URLSessionDownloadDelegate {
     session: URLSession,
     continuation: CheckedContinuation<URL, Error>
   ) {
-    let task = session.downloadTask(with: url)
     lock.lock()
+    guard !isCancelled else {
+      lock.unlock()
+      continuation.resume(throwing: CancellationError())
+      return
+    }
+    let task = session.downloadTask(with: url)
     self.continuation = continuation
     downloadTask = task
     lock.unlock()
@@ -549,16 +575,26 @@ class DownloadDelegate: NSObject, URLSessionDownloadDelegate {
   }
 
   func cancel() {
-    let continuation = takeContinuation()
     lock.lock()
+    isCancelled = true
     let task = downloadTask
+    let continuation = continuation
     downloadTask = nil
+    self.continuation = nil
     lock.unlock()
     task?.cancel()
     continuation?.resume(throwing: CancellationError())
   }
 
   func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
+    do {
+      try Self.validateHTTPResponse(downloadTask.response)
+    } catch {
+      takeContinuation()?.resume(throwing: error)
+      clearTask()
+      return
+    }
+
     // Move downloaded file to cache before temp is cleaned up
     do {
       try FileManager.default.moveItem(at: location, to: destinationURL)
@@ -572,7 +608,7 @@ class DownloadDelegate: NSObject, URLSessionDownloadDelegate {
   }
 
   func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-    // Called on network errors or HTTP failures (didFinishDownloadingTo is NOT called on error)
+    // Called on transport errors. HTTP status failures are handled before moving the downloaded file.
     guard let error else { return } // success is handled in didFinishDownloadingTo
     takeContinuation()?.resume(throwing: VMInstallerError.restoreImageFetchFailed(
       "Failed to download IPSW: \(error.localizedDescription)"
@@ -602,31 +638,86 @@ class DownloadDelegate: NSObject, URLSessionDownloadDelegate {
     lastProgressUpdateTime = now
     lastSpeedCheckBytes = totalBytesWritten
 
-    let rawProgress = Double(totalBytesWritten) / Double(totalBytesExpectedToWrite)
-    let phaseProgress = (rawProgress * 100).rounded() / 100
-    let scaledProgress = (rawProgress * VMInstaller.installStart * 100).rounded() / 100
-    let downloadedMB = totalBytesWritten / 1_000_000
-    let totalMB = totalBytesExpectedToWrite / 1_000_000
-    let speedMBps = Double(lastCalculatedSpeed) / 1_000_000.0
-    let message = String(
-      format: "Downloading: %d%% (%lldMB / %lldMB) %.1f MB/s",
-      Int(phaseProgress * 100), downloadedMB, totalMB, speedMBps
+    let progressUpdate = Self.makeProgressUpdate(
+      totalBytesWritten: totalBytesWritten,
+      totalBytesExpectedToWrite: totalBytesExpectedToWrite,
+      speedBytesPerSecond: lastCalculatedSpeed
     )
-
-    let percent = Int(phaseProgress * 100)
     DispatchQueue.main.async {
       installer.updateDownloadProgress(
-        scaledProgress, phaseProgress: phaseProgress, message: message,
-        bytesDownloaded: UInt64(totalBytesWritten),
-        bytesTotal: UInt64(totalBytesExpectedToWrite),
+        progressUpdate.scaledProgress,
+        phaseProgress: progressUpdate.phaseProgress,
+        message: progressUpdate.message,
+        bytesDownloaded: progressUpdate.bytesDownloaded,
+        bytesTotal: progressUpdate.bytesTotal,
         downloadSpeed: self.lastCalculatedSpeed
       )
 
-      if percent != self.lastLoggedPercent {
+      if let percent = progressUpdate.percent, percent != self.lastLoggedPercent {
         self.lastLoggedPercent = percent
         logInfo("Download progress: \(percent)%", category: "VMInstaller")
       }
     }
+  }
+
+  static func validateHTTPResponse(_ response: URLResponse?) throws {
+    guard let httpResponse = response as? HTTPURLResponse else {
+      throw VMInstallerError.restoreImageFetchFailed("Download did not return an HTTP response")
+    }
+
+    guard (200 ... 299).contains(httpResponse.statusCode) else {
+      throw VMInstallerError.restoreImageFetchFailed(
+        "IPSW download failed with HTTP \(httpResponse.statusCode)"
+      )
+    }
+  }
+
+  static func makeProgressUpdate(
+    totalBytesWritten: Int64,
+    totalBytesExpectedToWrite: Int64,
+    speedBytesPerSecond: UInt64
+  ) -> DownloadProgressUpdate {
+    let bytesDownloaded = UInt64(max(0, totalBytesWritten))
+    let downloadedMB = max(0, totalBytesWritten) / 1_000_000
+    let speedMBps = Double(speedBytesPerSecond) / 1_000_000.0
+
+    guard totalBytesExpectedToWrite > 0 else {
+      let message = String(
+        format: "Downloading: %lldMB downloaded %.1f MB/s",
+        downloadedMB,
+        speedMBps
+      )
+      return DownloadProgressUpdate(
+        scaledProgress: -1.0,
+        phaseProgress: -1.0,
+        percent: nil,
+        message: message,
+        bytesDownloaded: bytesDownloaded,
+        bytesTotal: nil
+      )
+    }
+
+    let rawProgress = min(1.0, max(0.0, Double(totalBytesWritten) / Double(totalBytesExpectedToWrite)))
+    let phaseProgress = (rawProgress * 100).rounded() / 100
+    let scaledProgress = (rawProgress * VMInstaller.installStart * 100).rounded() / 100
+    let totalMB = totalBytesExpectedToWrite / 1_000_000
+    let percent = Int(phaseProgress * 100)
+    let message = String(
+      format: "Downloading: %d%% (%lldMB / %lldMB) %.1f MB/s",
+      percent,
+      downloadedMB,
+      totalMB,
+      speedMBps
+    )
+
+    return DownloadProgressUpdate(
+      scaledProgress: scaledProgress,
+      phaseProgress: phaseProgress,
+      percent: percent,
+      message: message,
+      bytesDownloaded: bytesDownloaded,
+      bytesTotal: UInt64(totalBytesExpectedToWrite)
+    )
   }
 
   private func takeContinuation() -> CheckedContinuation<URL, Error>? {
@@ -642,6 +733,15 @@ class DownloadDelegate: NSObject, URLSessionDownloadDelegate {
     defer { lock.unlock() }
     downloadTask = nil
   }
+}
+
+struct DownloadProgressUpdate: Equatable {
+  let scaledProgress: Double
+  let phaseProgress: Double
+  let percent: Int?
+  let message: String
+  let bytesDownloaded: UInt64
+  let bytesTotal: UInt64?
 }
 
 // MARK: - Errors

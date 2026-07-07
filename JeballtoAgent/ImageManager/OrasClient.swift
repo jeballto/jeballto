@@ -292,7 +292,6 @@ struct OrasClient: Sendable {
       try FileManager.default.moveItem(atPath: tempOutputPath, toPath: outputPath)
     } catch {
       try? FileManager.default.removeItem(atPath: tempOutputPath)
-      try? FileManager.default.removeItem(atPath: outputPath)
       throw error
     }
   }
@@ -654,7 +653,7 @@ struct OrasClient: Sendable {
       }
       if let timeout {
         group.addTask {
-          try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+          try await Task.sleep(nanoseconds: timeoutNanoseconds(timeout))
           return .timedOut
         }
       }
@@ -663,6 +662,7 @@ struct OrasClient: Sendable {
         switch event {
         case .exited(let status):
           group.cancelAll()
+          try Task.checkCancellation()
           return status
         case .timedOut:
           ChildProcessTracker.shared.terminateIfRunning(process)
@@ -673,6 +673,12 @@ struct OrasClient: Sendable {
 
       throw OrasError.commandFailed(exitCode: -1, stderr: "Process ended without status")
     }
+  }
+
+  private static func timeoutNanoseconds(_ timeout: TimeInterval) -> UInt64 {
+    guard timeout.isFinite, timeout > 0 else { return 0 }
+    let maxSeconds = TimeInterval(UInt64.max / 1_000_000_000)
+    return UInt64(min(timeout, maxSeconds) * 1_000_000_000)
   }
 }
 

@@ -182,14 +182,18 @@ class CommandExecutor {
     }
   }
 
-  private func createAskpassScript(password: String) throws -> String {
-    let tempDir = NSTemporaryDirectory()
-    let scriptPath = "\(tempDir)jeballto_askpass_\(UUID().uuidString).sh"
+  static func askpassScriptContent(for password: String) -> String {
     let escapedPassword = password
       .replacingOccurrences(of: "'", with: "'\\''")
       .replacingOccurrences(of: "\n", with: "")
       .replacingOccurrences(of: "\r", with: "")
-    let content = "#!/bin/sh\necho '\(escapedPassword)'\n"
+    return "#!/bin/sh\nprintf '%s\\n' '\(escapedPassword)'\n"
+  }
+
+  private func createAskpassScript(password: String) throws -> String {
+    let tempDir = NSTemporaryDirectory()
+    let scriptPath = "\(tempDir)jeballto_askpass_\(UUID().uuidString).sh"
+    let content = Self.askpassScriptContent(for: password)
 
     // Create file with 0o700 permissions atomically to avoid TOCTOU race
     // (no window where file exists with default permissions)

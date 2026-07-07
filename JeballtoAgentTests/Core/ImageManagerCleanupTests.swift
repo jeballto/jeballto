@@ -253,6 +253,39 @@ struct ImageManagerCleanupTests {
   }
 
   @Test
+  func blobCacheCancelsWaitingWork() async throws {
+    let cache = ImageBlobCache()
+    let holderEntered = AsyncTestSignal()
+    let holder = Task {
+      try await cache.withExclusiveAccess(for: "sha256:same") {
+        await holderEntered.signal()
+        try await Task.sleep(nanoseconds: 250_000_000)
+      }
+    }
+    await holderEntered.wait()
+
+    let waiter = Task {
+      try await cache.withExclusiveAccess(for: "sha256:same") {
+        Issue.record("Cancelled waiter should not run blob work")
+      }
+    }
+    try await Task.sleep(nanoseconds: 20_000_000)
+
+    waiter.cancel()
+    await #expect(throws: CancellationError.self) {
+      try await waiter.value
+    }
+
+    holder.cancel()
+    _ = try? await holder.value
+
+    let completed = try await cache.withExclusiveAccess(for: "sha256:same") {
+      true
+    }
+    #expect(completed)
+  }
+
+  @Test
   func operationCacheSerializesWorkForSameKey() async throws {
     let cache = ImageOperationCache()
     let recorder = OperationCacheRecorder()

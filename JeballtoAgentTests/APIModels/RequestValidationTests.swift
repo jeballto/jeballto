@@ -96,10 +96,15 @@ struct RequestValidationTests {
     let valid = PullImageRequest(reference: "registry.example.com/vm/macos:latest", timeout: 10)
     let invalidRef = PullImageRequest(reference: "not valid", timeout: 10)
     let invalidTimeout = PullImageRequest(reference: "registry.example.com/vm/macos:latest", timeout: 0)
+    let timeoutTooHigh = PullImageRequest(
+      reference: "registry.example.com/vm/macos:latest",
+      timeout: PullImageRequest.maxTimeoutSeconds + 1
+    )
 
     #expect(valid.validate().valid)
     #expect(invalidRef.validate().valid == false)
     #expect(invalidTimeout.validate().valid == false)
+    #expect(timeoutTooHigh.validate().valid == false)
   }
 
   @Test
@@ -127,10 +132,16 @@ struct RequestValidationTests {
       source: "bad:\(id)",
       timeout: nil
     )
+    let timeoutTooHigh = PushImageRequest(
+      reference: "registry.example.com/vm/macos:latest",
+      source: vmSource,
+      timeout: PushImageRequest.maxTimeoutSeconds + 1
+    )
 
     #expect(vmRequest.validate().valid)
     #expect(imageRequest.validate().valid)
     #expect(invalidSource.validate().valid == false)
+    #expect(timeoutTooHigh.validate().valid == false)
 
     #expect(vmRequest.parseSource()?.type == .vm)
     #expect(imageRequest.parseSource()?.type == .image)
@@ -256,6 +267,35 @@ struct RequestValidationTests {
     #expect(invalidRetention.validate().valid == false)
     #expect(invalidSize.validate().valid == false)
     #expect(invalidPortRange.validate().valid == false)
+  }
+
+  @Test
+  func updateConfigRejectsRequestsWithoutSupportedSections() throws {
+    let apiOnlyJSON = #"{"api":{"host":"127.0.0.1"}}"#
+    let request = try JSONDecoder().decode(UpdateConfigRequest.self, from: Data(apiOnlyJSON.utf8))
+
+    let validation = request.validate()
+
+    #expect(validation.valid == false)
+    #expect(validation.error?.contains("logging, networking, or images") == true)
+  }
+
+  @Test
+  func updateConfigDistinguishesNullFromMissingNullableValues() throws {
+    let clearJSON = #"{"logging":{"timezone":null},"images":{"defaultRegistry":null}}"#
+    let missingJSON = #"{"logging":{"level":"info"},"images":{"insecureRegistries":[]}}"#
+
+    let clear = try JSONDecoder().decode(UpdateConfigRequest.self, from: Data(clearJSON.utf8))
+    let missing = try JSONDecoder().decode(UpdateConfigRequest.self, from: Data(missingJSON.utf8))
+
+    #expect(clear.logging?.timezone != nil)
+    #expect(clear.logging?.timezone! == nil)
+    #expect(clear.images?.defaultRegistry != nil)
+    #expect(clear.images?.defaultRegistry! == nil)
+    #expect(missing.logging?.timezone == nil)
+    #expect(missing.images?.defaultRegistry == nil)
+    #expect(clear.validate().valid)
+    #expect(missing.validate().valid)
   }
 
   @Test

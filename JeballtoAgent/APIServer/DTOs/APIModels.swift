@@ -592,6 +592,8 @@ struct SuccessResponse: Codable {
 // MARK: - Image Request Models
 
 struct PullImageRequest: Codable {
+  static let maxTimeoutSeconds = 604_800
+
   let reference: String
   let timeout: Int?
   var asyncRequested: Bool? = nil
@@ -610,8 +612,9 @@ struct PullImageRequest: Codable {
     guard !reference.isEmpty else {
       return (false, "Image reference is required")
     }
-    if let t = timeout, t <= 0 {
-      return (false, "Timeout must be positive if specified")
+    if let t = timeout {
+      if t <= 0 { return (false, "Timeout must be positive if specified") }
+      if t > Self.maxTimeoutSeconds { return (false, "Timeout must not exceed \(Self.maxTimeoutSeconds) seconds") }
     }
     do {
       _ = try ImageReference.parse(reference)
@@ -623,6 +626,8 @@ struct PullImageRequest: Codable {
 }
 
 struct PushImageRequest: Codable {
+  static let maxTimeoutSeconds = 604_800
+
   let reference: String
   let source: String?
   let timeout: Int?
@@ -643,8 +648,9 @@ struct PushImageRequest: Codable {
     guard !reference.isEmpty else {
       return (false, "Image reference is required")
     }
-    if let t = timeout, t <= 0 {
-      return (false, "Timeout must be positive if specified")
+    if let t = timeout {
+      if t <= 0 { return (false, "Timeout must be positive if specified") }
+      if t > Self.maxTimeoutSeconds { return (false, "Timeout must not exceed \(Self.maxTimeoutSeconds) seconds") }
     }
     do {
       _ = try ImageReference.parse(reference)

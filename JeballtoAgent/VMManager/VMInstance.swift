@@ -384,6 +384,7 @@ import Virtualization
     logError("VM \(definition.id) error: \(error.localizedDescription)", category: "VMInstance")
     stateMachine.forceState(.error)
     definition.updateState(.error)
+    eventBus.publish(.errorOccurred(vmId: definition.id, error: error.localizedDescription))
   }
 
   private func handleStop() {

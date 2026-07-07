@@ -98,9 +98,8 @@ struct APIServerTaskRegistryTests {
 
       #expect(response.statusCode == 200)
       #expect(task.isCancelled)
-      let cancellingStatus = try JSONDecoder().decode(ImageOperationStatusResponse.self, from: #require(response.body))
-      #expect(cancellingStatus.status == "cancelling")
-      await task.value
+      let cancelledStatus = try JSONDecoder().decode(ImageOperationStatusResponse.self, from: #require(response.body))
+      #expect(cancelledStatus.status == "cancelled")
       let status = try #require(await server.imageManager.getImageOperationStatus(operation.id))
       #expect(status.state == .cancelled)
       #expect(server.cancelImageOperationTask(operation.id) == false)

@@ -67,7 +67,7 @@ extension APIServer {
   func handleListVMs(_ request: HTTPRequest) async -> HTTPResponse {
     let allVMs = await vmManager.listVMs()
 
-    let requestedLimit = Int(request.queryParameters["limit"] ?? "") ?? allVMs.count
+    let requestedLimit = Int(request.queryParameters["limit"] ?? "") ?? 100
     let limit = max(1, min(requestedLimit, 1000))
     let offset = max(0, Int(request.queryParameters["offset"] ?? "") ?? 0)
 

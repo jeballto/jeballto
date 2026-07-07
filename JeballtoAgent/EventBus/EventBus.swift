@@ -168,14 +168,14 @@ class EventBus {
   /// - Returns: A token that can be used to unsubscribe
   @discardableResult func subscribe(_ callback: @escaping EventSubscriber) -> SubscriptionToken {
     let token = UUID()
-    queue.async(flags: .barrier) { self.subscribers[token] = callback }
+    queue.sync(flags: .barrier) { self.subscribers[token] = callback }
     return token
   }
 
   /// Unsubscribes from events
   /// - Parameter token: The subscription token returned from subscribe()
   func unsubscribe(_ token: SubscriptionToken) {
-    queue.async(flags: .barrier) { self.subscribers.removeValue(forKey: token) }
+    _ = queue.sync(flags: .barrier) { self.subscribers.removeValue(forKey: token) }
   }
 
   /// Publishes an event to all subscribers
@@ -192,7 +192,7 @@ class EventBus {
       }
 
       // Notify each subscriber independently so one slow subscriber cannot block others
-      let currentSubscribers = self.subscribers.values
+      let currentSubscribers = Array(self.subscribers.values)
       for subscriber in currentSubscribers {
         DispatchQueue.global(qos: .userInitiated).async { subscriber(event) }
       }
