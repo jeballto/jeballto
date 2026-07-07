@@ -7,7 +7,7 @@ struct VMManagerCapacityTests {
   @Test
   func pausedVMsCountAgainstCapacityBeforeStartingAnotherVM() async throws {
     try await withTemporaryDirectory { root in
-      let (vmManager, _) = makeManager(root: root)
+      let (vmManager, _, _) = makeManager(root: root)
 
       let first = try await vmManager.createVM(name: "first", resources: .default)
       let second = try await vmManager.createVM(name: "second", resources: .default)
@@ -27,7 +27,7 @@ struct VMManagerCapacityTests {
   @Test
   func failedStartReleasesCapacityReservation() async throws {
     try await withTemporaryDirectory { root in
-      let (vmManager, _) = makeManager(root: root)
+      let (vmManager, _, _) = makeManager(root: root)
 
       let active = try await vmManager.createVM(name: "active", resources: .default)
       let failing = try await vmManager.createVM(name: "failing", resources: .default)
@@ -45,7 +45,7 @@ struct VMManagerCapacityTests {
   @Test
   func imageExportReservationBlocksBundleMutationsUntilReleased() async throws {
     try await withTemporaryDirectory { root in
-      let (vmManager, _) = makeManager(root: root)
+      let (vmManager, _, _) = makeManager(root: root)
       let definition = try await vmManager.createVM(name: "exporting", resources: .default)
 
       let exportToken = try await vmManager.claimImageExport(definition.id)
@@ -75,7 +75,30 @@ struct VMManagerCapacityTests {
     }
   }
 
-  private func makeManager(root: String) -> (VMManager, PersistenceStore) {
+  @Test
+  func deleteReleasesPersistedNetworkPorts() async throws {
+    try await withTemporaryDirectory { root in
+      let (vmManager, persistenceStore, portForwardingManager) = makeManager(root: root)
+      let definition = try await vmManager.createVM(name: "networked", resources: .default)
+      var updated = definition
+      updated.updateSSHPort(2222)
+      updated.updateVNCPort(5901)
+      updated.updateNATIP("192.168.64.2")
+      try await vmManager.updateVMDefinition(definition.id, definition: updated)
+      await portForwardingManager.registerPort(2222)
+      await portForwardingManager.registerVNCPort(5901)
+
+      try await vmManager.deleteVM(definition.id, deleteFiles: false)
+
+      #expect(await portForwardingManager.isPortAllocated(2222) == false)
+      #expect(await portForwardingManager.isVNCPortAllocated(5901) == false)
+      await #expect(throws: PersistenceError.self) {
+        try await persistenceStore.getVM(definition.id)
+      }
+    }
+  }
+
+  private func makeManager(root: String) -> (VMManager, PersistenceStore, PortForwardingManager) {
     let config = makeTestConfig(root: root)
     let persistenceStore = PersistenceStore(databasePath: config.storage.databasePath)
     let eventBus = EventBus()
@@ -89,7 +112,7 @@ struct VMManagerCapacityTests {
       networkManager: networkManager,
       portForwardingManager: portForwardingManager
     )
-    return (vmManager, persistenceStore)
+    return (vmManager, persistenceStore, portForwardingManager)
   }
 
   private func setState(_ state: VMState, vmId: UUID, vmManager: VMManager) async throws {

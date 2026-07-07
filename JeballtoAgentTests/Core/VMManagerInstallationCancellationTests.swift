@@ -44,6 +44,40 @@ struct VMManagerInstallationCancellationTests {
   }
 
   @Test
+  func downloadDelegateCancellationBeforeStartResumesAsCancellation() async throws {
+    try await withTemporaryDirectory { root in
+      let id = UUID()
+      let definition = VMDefinition(
+        id: id,
+        name: "download-cancel-before-start",
+        resources: .default,
+        paths: VMPaths.forVM(id: id, baseDir: root)
+      )
+      let installer = VMInstaller(vmDefinition: definition, eventBus: EventBus())
+      let delegate = DownloadDelegate(
+        installer: installer,
+        destinationURL: URL(fileURLWithPath: root).appendingPathComponent("download.ipsw")
+      )
+      let configuration = URLSessionConfiguration.ephemeral
+      configuration.protocolClasses = [SuspendedDownloadURLProtocol.self]
+      let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
+      defer { session.invalidateAndCancel() }
+
+      delegate.cancel()
+
+      await #expect(throws: CancellationError.self) {
+        try await withCheckedThrowingContinuation { continuation in
+          delegate.startDownload(
+            from: URL(string: "https://example.invalid/download.ipsw")!,
+            session: session,
+            continuation: continuation
+          )
+        }
+      }
+    }
+  }
+
+  @Test
   func cancelledInstallationFinalizersDoNotMutateDeletedVM() async throws {
     try await withTemporaryDirectory { root in
       let config = makeTestConfig(root: root)

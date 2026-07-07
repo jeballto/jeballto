@@ -1,14 +1,9 @@
 import Foundation
 
 actor ImageConcurrencyLimiter {
-  private struct Waiter {
-    let id: UUID
-    let continuation: CheckedContinuation<Bool, Never>
-  }
-
   private let limit: Int
   private var available: Int
-  private var waiters: [Waiter] = []
+  private let retryDelay: UInt64 = 1_000_000
 
   init(limit: Int) {
     let boundedLimit = max(1, limit)
@@ -26,39 +21,17 @@ actor ImageConcurrencyLimiter {
   }
 
   private func acquire() async throws {
-    try Task.checkCancellation()
-    if available > 0 {
-      available -= 1
-      return
-    }
-
-    let waiterID = UUID()
-    let acquired = await withTaskCancellationHandler {
-      await withCheckedContinuation { continuation in
-        waiters.append(Waiter(id: waiterID, continuation: continuation))
+    while true {
+      try Task.checkCancellation()
+      if available > 0 {
+        available -= 1
+        return
       }
-    } onCancel: {
-      Task { await self.cancelWaiter(waiterID) }
-    }
-
-    guard acquired else {
-      throw CancellationError()
+      try await Task.sleep(nanoseconds: retryDelay)
     }
   }
 
   private func release() {
-    guard waiters.isEmpty == false else {
-      available = min(limit, available + 1)
-      return
-    }
-
-    let next = waiters.removeFirst()
-    next.continuation.resume(returning: true)
-  }
-
-  private func cancelWaiter(_ id: UUID) {
-    guard let index = waiters.firstIndex(where: { $0.id == id }) else { return }
-    let waiter = waiters.remove(at: index)
-    waiter.continuation.resume(returning: false)
+    available = min(limit, available + 1)
   }
 }

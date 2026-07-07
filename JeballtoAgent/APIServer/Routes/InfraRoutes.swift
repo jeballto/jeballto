@@ -113,6 +113,7 @@ extension APIServer {
 
       do {
         try await portForwardingManager.setupSSHForwarding(vmId: vmId, vmIPAddress: natIP, sshPort: sshPort)
+        await vmManager.startSSHReadinessProbe(vmId: vmId, sshPort: sshPort)
       } catch {
         await portForwardingManager.releasePort(sshPort)
         return HTTPResponse.error("SSH_ENABLE_FAILED", message: error.localizedDescription, statusCode: 500)
@@ -495,8 +496,8 @@ extension APIServer {
     if let maxTotalSize = logging.maxTotalSize, let bytes = LoggingConfig.parseSize(maxTotalSize) {
       Logger.shared.maxTotalSizeBytes = bytes
     }
-    if let tzId = logging.timezone, let tz = TimeZone(identifier: tzId) {
-      Logger.shared.timezone = tz
+    if let tz = logging.timezone {
+      Logger.shared.timezone = tz.flatMap(TimeZone.init(identifier:)) ?? .current
     }
   }
 }

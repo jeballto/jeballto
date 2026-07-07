@@ -169,17 +169,29 @@ struct PersistenceStoreTests {
   }
 
   @Test
-  func invalidOnDiskDataFallsBackToEmptyDatabase() async throws {
+  func invalidOnDiskDataBlocksMutationAndPreservesFile() async throws {
     try await withTemporaryDirectory(prefix: "persistence") { root in
       let dbPath = "\(root)/vms.json"
-      try Data("not-json".utf8).write(to: URL(fileURLWithPath: dbPath))
+      let originalData = Data("not-json".utf8)
+      try originalData.write(to: URL(fileURLWithPath: dbPath))
 
       let store = PersistenceStore(databasePath: dbPath)
       #expect(await store.count() == 0)
 
       let vm = makeDefinition(name: "after-recovery", basePath: root, createdAt: Date())
-      try await store.createVM(vm)
-      #expect(await store.count() == 1)
+      do {
+        try await store.createVM(vm)
+        Issue.record("Expected corrupt database to block writes")
+      } catch let error as PersistenceError {
+        if case .invalidData(let reason) = error {
+          #expect(reason.contains("Refusing to overwrite it"))
+        } else {
+          Issue.record("Expected invalidData, got \(error.localizedDescription)")
+        }
+      }
+
+      let preservedData = try Data(contentsOf: URL(fileURLWithPath: dbPath))
+      #expect(preservedData == originalData)
     }
   }
 }

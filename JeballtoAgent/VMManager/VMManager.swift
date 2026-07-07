@@ -110,22 +110,14 @@ actor VMManager {
     case .vmStopped(let id):
       await persistState(id, .stopped)
       runningSinceByVM.removeValue(forKey: id)
-      networkingTasks[id]?.cancel()
-      networkingTasks.removeValue(forKey: id)
-      sshProbingTasks[id]?.cancel()
-      sshProbingTasks.removeValue(forKey: id)
-      sshReadyVMs.remove(id)
+      cancelNetworkingTasks(for: id)
       cancelExpiry(id)
       await cleanupNetworkingForVM(id)
       await deleteIfEphemeral(id)
     case .vmPaused(let id):
       await persistState(id, .paused)
       runningSinceByVM.removeValue(forKey: id)
-      networkingTasks[id]?.cancel()
-      networkingTasks.removeValue(forKey: id)
-      sshProbingTasks[id]?.cancel()
-      sshProbingTasks.removeValue(forKey: id)
-      sshReadyVMs.remove(id)
+      cancelNetworkingTasks(for: id)
       await cleanupNetworkingForVM(id)
     case .vmResumed(let id):
       await persistState(id, .running, label: "after resume")
@@ -157,6 +149,7 @@ actor VMManager {
       )
     case .errorOccurred(let id, _):
       if let id {
+        await persistState(id, .error)
         cancelExpiry(id)
         await deleteIfEphemeral(id)
       }
@@ -254,6 +247,26 @@ actor VMManager {
       let suffix = label.map { " \($0)" } ?? ""
       logError("Failed to persist \(state.rawValue)\(suffix) for VM \(vmId): \(error)", category: "VMManager")
     }
+  }
+
+  private func persistCurrentState(_ vmId: UUID, from instance: VMInstance) async throws {
+    try await persistenceStore.updateVMState(vmId, state: instance.currentState)
+  }
+
+  private func persistCurrentStateAfterFailure(_ vmId: UUID, from instance: VMInstance) async {
+    do {
+      try await persistCurrentState(vmId, from: instance)
+    } catch {
+      logError("Failed to persist failure state for VM \(vmId): \(error)", category: "VMManager")
+    }
+  }
+
+  private func cancelNetworkingTasks(for vmId: UUID) {
+    networkingTasks[vmId]?.cancel()
+    networkingTasks.removeValue(forKey: vmId)
+    sshProbingTasks[vmId]?.cancel()
+    sshProbingTasks.removeValue(forKey: vmId)
+    sshReadyVMs.remove(vmId)
   }
 
   // MARK: - Initialization
@@ -633,8 +646,13 @@ actor VMManager {
     // Initialize if not already initialized
     if await MainActor.run(body: { instance.virtualMachine }) == nil { try await instance.initialize() }
 
-    // Start the VM (event handler will persist the state)
-    try await instance.start()
+    do {
+      try await instance.start()
+      try await persistCurrentState(vmId, from: instance)
+    } catch {
+      await persistCurrentStateAfterFailure(vmId, from: instance)
+      throw error
+    }
 
     logInfo("VM \(vmId) started successfully", category: "VMManager")
   }
@@ -650,8 +668,13 @@ actor VMManager {
 
     logInfo("Stopping VM \(vmId)", category: "VMManager")
 
-    // Stop the VM (event handler will persist the state via delegate callback)
-    try await instance.stop()
+    do {
+      try await instance.stop()
+      try await persistCurrentState(vmId, from: instance)
+    } catch {
+      await persistCurrentStateAfterFailure(vmId, from: instance)
+      throw error
+    }
 
     logInfo("VM \(vmId) stopped successfully", category: "VMManager")
   }
@@ -662,8 +685,13 @@ actor VMManager {
 
     logInfo("Pausing VM \(vmId)", category: "VMManager")
 
-    // Pause the VM (event handler will persist the state)
-    try await instance.pause()
+    do {
+      try await instance.pause()
+      try await persistCurrentState(vmId, from: instance)
+    } catch {
+      await persistCurrentStateAfterFailure(vmId, from: instance)
+      throw error
+    }
 
     logInfo("VM \(vmId) paused successfully", category: "VMManager")
   }
@@ -688,13 +716,25 @@ actor VMManager {
        FileManager.default.fileExists(atPath: saveFilePath)
     {
       logInfo("Resuming VM \(vmId) from saved state file", category: "VMManager")
-      try await instance.resumeFromSave()
+      do {
+        try await instance.resumeFromSave()
+        try await persistCurrentState(vmId, from: instance)
+      } catch {
+        await persistCurrentStateAfterFailure(vmId, from: instance)
+        throw error
+      }
       logInfo("VM \(vmId) resumed from save file successfully", category: "VMManager")
       return
     }
 
     // Normal resume (VM already in memory)
-    try await instance.resume()
+    do {
+      try await instance.resume()
+      try await persistCurrentState(vmId, from: instance)
+    } catch {
+      await persistCurrentStateAfterFailure(vmId, from: instance)
+      throw error
+    }
 
     logInfo("VM \(vmId) resumed successfully", category: "VMManager")
   }
@@ -705,11 +745,13 @@ actor VMManager {
 
     logInfo("Saving VM \(vmId) state", category: "VMManager")
 
-    // Save the VM
-    try await instance.save()
-
-    // Update persistence
-    try await persistenceStore.updateVMState(vmId, state: .paused)
+    do {
+      try await instance.save()
+      try await persistCurrentState(vmId, from: instance)
+    } catch {
+      await persistCurrentStateAfterFailure(vmId, from: instance)
+      throw error
+    }
 
     logInfo("VM \(vmId) state saved successfully", category: "VMManager")
   }
@@ -884,8 +926,7 @@ actor VMManager {
           try await portForwardingManager.setupSSHForwarding(vmId: vmId, vmIPAddress: ip, sshPort: sshPort)
           updated.updateSSHPort(sshPort)
           logInfo("Auto-enabled SSH forwarding for VM \(vmId) on port \(sshPort)", category: "VMManager")
-          sshProbingTasks[vmId]?.cancel()
-          sshProbingTasks[vmId] = Task<Void, Never> { await self.probeSSHReadiness(vmId: vmId, sshPort: sshPort) }
+          startSSHReadinessProbe(vmId: vmId, sshPort: sshPort)
         } catch {
           await portForwardingManager.releasePort(sshPort)
           logError("Failed to setup SSH forwarding for VM \(vmId): \(error)", category: "VMManager")
@@ -906,6 +947,12 @@ actor VMManager {
 
   /// Probes localhost:sshPort in the background until the SSH daemon responds with its banner,
   /// then publishes sshReady. Stops on task cancellation or if already published for this boot.
+  func startSSHReadinessProbe(vmId: UUID, sshPort: Int) {
+    sshReadyVMs.remove(vmId)
+    sshProbingTasks[vmId]?.cancel()
+    sshProbingTasks[vmId] = Task<Void, Never> { await self.probeSSHReadiness(vmId: vmId, sshPort: sshPort) }
+  }
+
   private func probeSSHReadiness(vmId: UUID, sshPort: Int) async {
     let maxAttempts = 40
     let probeDelay: UInt64 = 3_000_000_000 // 3 seconds between probes
@@ -1226,6 +1273,10 @@ actor VMManager {
     } catch {
       logError("Failed to persist forced stop for VM \(vmId): \(error)", category: "VMManager")
     }
+    runningSinceByVM.removeValue(forKey: vmId)
+    cancelNetworkingTasks(for: vmId)
+    cancelExpiry(vmId)
+    await cleanupNetworkingForVM(vmId)
   }
 
   /// Force-stops a VM regardless of its current state.
@@ -1293,8 +1344,9 @@ actor VMManager {
       }
     }
 
-    networkingTasks[vmId]?.cancel()
-    networkingTasks.removeValue(forKey: vmId)
+    cancelNetworkingTasks(for: vmId)
+    cancelExpiry(vmId)
+    await cleanupNetworkingForVM(vmId)
     runningSinceByVM.removeValue(forKey: vmId)
     await instance.cleanup()
     vmRegistry.removeValue(forKey: vmId)

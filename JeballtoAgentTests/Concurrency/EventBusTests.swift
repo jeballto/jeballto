@@ -7,38 +7,29 @@ struct EventBusTests {
   @Test
   func subscribePublishAndUnsubscribeWork() async {
     let bus = EventBus(maxHistorySize: 20)
-    let lock = NSLock()
-    var received: [VMEvent] = []
+    let recorder = EventRecorder()
 
     let token = bus.subscribe { event in
-      lock.lock()
-      received.append(event)
-      lock.unlock()
+      recorder.append(event)
     }
 
-    let subscribed = await waitUntil { bus.subscriberCount == 1 }
-    #expect(subscribed)
+    #expect(bus.subscriberCount == 1)
 
     let vmId = UUID()
     bus.publish(.vmCreated(vmId: vmId, name: "one"))
 
     let delivered = await waitUntil {
-      lock.lock()
-      defer { lock.unlock() }
-      return received.count == 1
+      recorder.count == 1
     }
     #expect(delivered)
 
     bus.unsubscribe(token)
-    let unsubscribed = await waitUntil { bus.subscriberCount == 0 }
-    #expect(unsubscribed)
+    #expect(bus.subscriberCount == 0)
 
     bus.publish(.vmCreated(vmId: UUID(), name: "two"))
     try? await Task.sleep(nanoseconds: 50_000_000)
 
-    lock.lock()
-    defer { lock.unlock() }
-    #expect(received.count == 1)
+    #expect(recorder.count == 1)
   }
 
   @Test
@@ -107,5 +98,22 @@ struct EventBusTests {
     let cleared = await waitUntil { bus.eventCount == 0 }
     #expect(cleared)
     #expect(bus.getAllEvents(limit: 10).isEmpty)
+  }
+}
+
+private final class EventRecorder: @unchecked Sendable {
+  private let lock = NSLock()
+  private var events: [VMEvent] = []
+
+  var count: Int {
+    lock.lock()
+    defer { lock.unlock() }
+    return events.count
+  }
+
+  func append(_ event: VMEvent) {
+    lock.lock()
+    defer { lock.unlock() }
+    events.append(event)
   }
 }

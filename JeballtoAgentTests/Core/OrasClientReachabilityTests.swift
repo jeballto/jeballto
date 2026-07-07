@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 import Testing
 @testable import JeballtoAgent
@@ -175,6 +176,56 @@ struct OrasClientReachabilityTests {
 
       let output = try Data(contentsOf: URL(fileURLWithPath: outputPath))
       #expect(output == payload)
+    }
+  }
+
+  @Test
+  func fetchBlobCancellationTerminatesOrasProcess() async throws {
+    try await withTemporaryDirectory(prefix: "oras-blob-cancel") { root in
+      let orasPath = "\(root)/oras"
+      let pidPath = "\(root)/oras.pid"
+      let outputPath = "\(root)/blob"
+      let script = """
+      #!/bin/sh
+      echo $$ > "\(pidPath)"
+      sleep 30
+      """
+      try script.write(toFile: orasPath, atomically: true, encoding: .utf8)
+      try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: orasPath)
+      let existingOutput = Data("existing blob".utf8)
+      try existingOutput.write(to: URL(fileURLWithPath: outputPath))
+
+      let client = OrasClient(config: ImageConfig(
+        imageStorageDir: root,
+        orasPath: orasPath,
+        defaultRegistry: nil,
+        insecureRegistries: []
+      ))
+      let reference = try ImageReference.parse("registry.example.com/repo:tag")
+      let task = Task {
+        try await client.fetchBlob(
+          reference: reference,
+          digest: "sha256:\(String(repeating: "a", count: 64))",
+          outputPath: outputPath
+        )
+      }
+      let processStarted = await waitUntil {
+        FileManager.default.fileExists(atPath: pidPath)
+      }
+      try #require(processStarted)
+
+      task.cancel()
+
+      await #expect(throws: CancellationError.self) {
+        try await task.value
+      }
+      let pidText = try String(contentsOfFile: pidPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
+      let pid = try #require(Int32(pidText))
+      let processStopped = await waitUntil {
+        kill(pid, 0) == -1
+      }
+      #expect(processStopped)
+      #expect(try Data(contentsOf: URL(fileURLWithPath: outputPath)) == existingOutput)
     }
   }
 

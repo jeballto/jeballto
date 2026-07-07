@@ -30,9 +30,11 @@ func makeTestConfig(root: String) -> Config {
 
 func makeTestAPIServer(
   root: String,
+  configure: (inout Config) -> Void = { _ in },
   capabilityProvider: @escaping @Sendable () -> VirtualizationCapabilities = { testVirtualizationCapabilities() }
 ) -> APIServer {
-  let config = makeTestConfig(root: root)
+  var config = makeTestConfig(root: root)
+  configure(&config)
   let eventBus = EventBus()
   let persistenceStore = PersistenceStore(databasePath: config.storage.databasePath)
   let networkManager = NetworkManager(eventBus: eventBus)

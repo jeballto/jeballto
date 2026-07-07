@@ -50,7 +50,11 @@ class APIServer {
     config: Config,
     capabilityProvider: @escaping @Sendable () -> VirtualizationCapabilities = { VirtualizationCapabilities() }
   ) {
-    httpServer = SimpleHTTPServer(port: UInt16(config.api.port), host: config.api.host)
+    httpServer = SimpleHTTPServer(
+      port: UInt16(config.api.port),
+      host: config.api.host,
+      maxConcurrentRequests: config.api.maxConcurrentRequests
+    )
     self.vmManager = vmManager
     self.portForwardingManager = portForwardingManager
     self.imageManager = imageManager
@@ -416,6 +420,19 @@ class APIServer {
   }
 
   @discardableResult
+  func cancelAndWaitImageOperationTask(_ operationId: UUID) async -> Bool {
+    let task: Task<Void, Never>?
+    stateLock.lock()
+    task = _imageOperationTasks.removeValue(forKey: operationId)
+    stateLock.unlock()
+
+    guard let task else { return false }
+    task.cancel()
+    await task.value
+    return true
+  }
+
+  @discardableResult
   func cancelAllImageOperationTasks() async -> Int {
     let tasks = drainImageOperationTasks()
 
@@ -454,6 +471,26 @@ class APIServer {
     stateLock.lock()
     defer { stateLock.unlock() }
     _jeballtofileExecutors.removeValue(forKey: executionId)
+  }
+
+  @discardableResult
+  func cancelAllJeballtofileExecutors() async -> Int {
+    let executors = drainJeballtofileExecutors()
+    for executor in executors.values where executor.execution.status == .running {
+      executor.cancel()
+    }
+    for executor in executors.values {
+      await executor.waitUntilFinished()
+    }
+    return executors.count
+  }
+
+  private func drainJeballtofileExecutors() -> [UUID: JeballtofileExecutor] {
+    stateLock.lock()
+    defer { stateLock.unlock() }
+    let executors = _jeballtofileExecutors
+    _jeballtofileExecutors.removeAll()
+    return executors
   }
 
   /// Returns the executor for the given id, or nil.

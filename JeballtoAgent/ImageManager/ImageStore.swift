@@ -49,6 +49,7 @@ struct ImageIndex: Codable, Sendable {
 enum ImageStoreError: Error, LocalizedError {
   case imageNotFound(UUID)
   case imageAlreadyExists(UUID)
+  case invalidData(String)
   case encodingFailed(Error)
   case decodingFailed(Error)
   case directoryCreationFailed(String)
@@ -57,6 +58,7 @@ enum ImageStoreError: Error, LocalizedError {
     switch self {
     case .imageNotFound(let id): "Image not found with ID: \(id.uuidString)"
     case .imageAlreadyExists(let id): "Image already exists with ID: \(id.uuidString)"
+    case .invalidData(let reason): "Invalid image index: \(reason)"
     case .encodingFailed(let error): "Failed to encode image index: \(error.localizedDescription)"
     case .decodingFailed(let error): "Failed to decode image index: \(error.localizedDescription)"
     case .directoryCreationFailed(let path): "Failed to create directory: \(path)"
@@ -71,6 +73,7 @@ actor ImageStore {
   private let fileManager = FileManager.default
   private var index: ImageIndex
   private var isLoaded = false
+  private var loadFailure: Error?
   private let encoder: JSONEncoder
   private let decoder: JSONDecoder
 
@@ -101,8 +104,9 @@ actor ImageStore {
       let loaded = try loadFromDisk()
       index = loaded
     } catch {
+      loadFailure = error
       logWarning(
-        "Failed to load image index from \(indexPath): \(error). Starting with empty index.",
+        "Failed to load image index from \(indexPath): \(error). Refusing writes until the file is repaired.",
         category: "ImageStore"
       )
     }
@@ -117,14 +121,14 @@ actor ImageStore {
   // MARK: - Public API
 
   func addImage(_ record: ImageRecord) throws {
-    ensureLoaded()
+    try ensureLoadedForMutation()
     guard index.images[record.id] == nil else { throw ImageStoreError.imageAlreadyExists(record.id) }
     index.images[record.id] = record
     try saveToDisk()
   }
 
   func addImageIfReferenceAbsent(_ record: ImageRecord) throws -> ImageRecord {
-    ensureLoaded()
+    try ensureLoadedForMutation()
     if let existing = index.images.values.first(where: { $0.reference == record.reference }) {
       return existing
     }
@@ -135,14 +139,14 @@ actor ImageStore {
   }
 
   func updateImage(_ record: ImageRecord) throws {
-    ensureLoaded()
+    try ensureLoadedForMutation()
     guard index.images[record.id] != nil else { throw ImageStoreError.imageNotFound(record.id) }
     index.images[record.id] = record
     try saveToDisk()
   }
 
   func removeImage(id: UUID) throws {
-    ensureLoaded()
+    try ensureLoadedForMutation()
     guard index.images[id] != nil else { throw ImageStoreError.imageNotFound(id) }
     index.images.removeValue(forKey: id)
     try saveToDisk()
@@ -185,6 +189,15 @@ actor ImageStore {
       return try decoder.decode(ImageIndex.self, from: data)
     } catch let error as DecodingError {
       throw ImageStoreError.decodingFailed(error)
+    }
+  }
+
+  private func ensureLoadedForMutation() throws {
+    ensureLoaded()
+    if let loadFailure {
+      throw ImageStoreError.invalidData(
+        "Failed to load existing index at \(indexPath): \(loadFailure.localizedDescription). Refusing to overwrite it"
+      )
     }
   }
 

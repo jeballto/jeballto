@@ -88,6 +88,9 @@ struct UpdateConfigRequest: Codable {
   private static let validLogLevels = ["debug", "info", "warning", "error"]
 
   func validate(currentConfig: NetworkingConfig? = nil) -> (valid: Bool, error: String?) {
+    if logging == nil, networking == nil, images == nil {
+      return (false, "At least one supported config section must be provided: logging, networking, or images")
+    }
     if let error = Self.validateLogging(logging) {
       return (false, error)
     }
@@ -112,7 +115,7 @@ struct UpdateConfigRequest: Codable {
     if let error = validateLogSize(logging.maxTotalSize) {
       return error
     }
-    if let tz = logging.timezone, TimeZone(identifier: tz) == nil {
+    if let timezone = logging.timezone, let tz = timezone, TimeZone(identifier: tz) == nil {
       return "Invalid timezone identifier '\(tz)'. Use an IANA timezone name (e.g. 'UTC', 'America/New_York')."
     }
     return nil
@@ -209,7 +212,24 @@ struct LoggingConfigUpdate: Codable {
   let level: String?
   let retentionDays: Int?
   let maxTotalSize: String?
-  let timezone: String?
+  let timezone: String??
+
+  init(level: String?, retentionDays: Int?, maxTotalSize: String?, timezone: String??) {
+    self.level = level
+    self.retentionDays = retentionDays
+    self.maxTotalSize = maxTotalSize
+    self.timezone = timezone
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    level = try container.decodeIfPresent(String.self, forKey: .level)
+    retentionDays = try container.decodeIfPresent(Int.self, forKey: .retentionDays)
+    maxTotalSize = try container.decodeIfPresent(String.self, forKey: .maxTotalSize)
+    timezone = try container.contains(.timezone)
+      ? .some(container.decodeIfPresent(String.self, forKey: .timezone))
+      : nil
+  }
 }
 
 struct NetworkingConfigUpdate: Codable {
@@ -221,10 +241,38 @@ struct NetworkingConfigUpdate: Codable {
 }
 
 struct ImageConfigUpdate: Codable {
-  let defaultRegistry: String?
+  let defaultRegistry: String??
   let insecureRegistries: [String]?
   let maxParallelImageBlobTransfers: Int?
   let maxParallelImageCompressions: Int?
   let maxParallelImageDecompressions: Int?
   let maxParallelImageDiskWrites: Int?
+
+  init(
+    defaultRegistry: String??,
+    insecureRegistries: [String]?,
+    maxParallelImageBlobTransfers: Int?,
+    maxParallelImageCompressions: Int?,
+    maxParallelImageDecompressions: Int?,
+    maxParallelImageDiskWrites: Int?
+  ) {
+    self.defaultRegistry = defaultRegistry
+    self.insecureRegistries = insecureRegistries
+    self.maxParallelImageBlobTransfers = maxParallelImageBlobTransfers
+    self.maxParallelImageCompressions = maxParallelImageCompressions
+    self.maxParallelImageDecompressions = maxParallelImageDecompressions
+    self.maxParallelImageDiskWrites = maxParallelImageDiskWrites
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    defaultRegistry = try container.contains(.defaultRegistry)
+      ? .some(container.decodeIfPresent(String.self, forKey: .defaultRegistry))
+      : nil
+    insecureRegistries = try container.decodeIfPresent([String].self, forKey: .insecureRegistries)
+    maxParallelImageBlobTransfers = try container.decodeIfPresent(Int.self, forKey: .maxParallelImageBlobTransfers)
+    maxParallelImageCompressions = try container.decodeIfPresent(Int.self, forKey: .maxParallelImageCompressions)
+    maxParallelImageDecompressions = try container.decodeIfPresent(Int.self, forKey: .maxParallelImageDecompressions)
+    maxParallelImageDiskWrites = try container.decodeIfPresent(Int.self, forKey: .maxParallelImageDiskWrites)
+  }
 }

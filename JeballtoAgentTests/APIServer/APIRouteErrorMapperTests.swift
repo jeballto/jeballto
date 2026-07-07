@@ -98,6 +98,7 @@ struct APIRouteErrorMapperTests {
     )
 
     #expect(timeout.statusCode == 504)
+    #expect(try decodedError(timeout).error.code == "EXECUTE_TIMEOUT")
     #expect(launchFailure.statusCode == 500)
   }
 

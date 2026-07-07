@@ -30,10 +30,14 @@ class JeballtofileExecutor {
     }
   }
 
-  /// Cancels execution after the current step finishes
+  /// Cancels execution and marks the current step as cancelled when the task observes cancellation.
   func cancel() {
     execution.cancel()
     task?.cancel()
+  }
+
+  func waitUntilFinished() async {
+    await task?.value
   }
 
   private func run() async {

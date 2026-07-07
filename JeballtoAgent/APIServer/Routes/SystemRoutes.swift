@@ -41,6 +41,7 @@ extension APIServer {
   private func performSoftReset() async -> HTTPResponse {
     var errors: [String] = []
     await cancelAllImageOperationTasks()
+    await cancelAllJeballtofileExecutors()
 
     // 1. Wipe all VMs (force-stop + delete)
     var vmsDeleted = 0
@@ -84,6 +85,7 @@ extension APIServer {
   private func performHardReset() async -> HTTPResponse {
     var errors: [String] = []
     await cancelAllImageOperationTasks()
+    await cancelAllJeballtofileExecutors()
 
     // 1. Wipe all VMs (force-stop + delete)
     var vmsDeleted = 0

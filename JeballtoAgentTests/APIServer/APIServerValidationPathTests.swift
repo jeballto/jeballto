@@ -771,7 +771,7 @@ struct APIServerValidationPathTests {
       let cancelStatus = try decodedImageOperationStatus(cancelResponse)
 
       #expect(cancelResponse.statusCode == 200)
-      #expect(["cancelling", "cancelled"].contains(cancelStatus.status))
+      #expect(["cancelled", "failed"].contains(cancelStatus.status))
 
       let operationUUID = try #require(UUID(uuidString: operationId))
       var finalStatus: ImageOperationStatus?

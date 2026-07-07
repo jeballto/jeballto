@@ -54,6 +54,7 @@ struct ZstdClient: Sendable {
     var isZero = true
 
     while remaining > 0 {
+      try Task.checkCancellation()
       let readSize = min(Self.bufferSize, remaining)
       guard let data = try inputHandle.read(upToCount: readSize), !data.isEmpty else {
         throw ZstdError.streamingFailed("Unexpected EOF in \(inputPath)")
@@ -186,6 +187,9 @@ struct ZstdClient: Sendable {
         ChildProcessTracker.shared.terminateIfRunning(process)
         group.cancelAll()
         try? stdinPipe.fileHandleForWriting.close()
+        if Task.isCancelled {
+          throw CancellationError()
+        }
         throw error
       }
 
@@ -307,6 +311,9 @@ struct ZstdClient: Sendable {
       } catch {
         ChildProcessTracker.shared.terminateIfRunning(process)
         group.cancelAll()
+        if Task.isCancelled {
+          throw CancellationError()
+        }
         throw error
       }
 
@@ -356,6 +363,7 @@ struct ZstdClient: Sendable {
     var isZero = true
 
     while remaining > 0 {
+      try Task.checkCancellation()
       let readSize = min(Self.bufferSize, remaining)
       guard let data = try inputHandle.read(upToCount: readSize), !data.isEmpty else {
         throw ZstdError.streamingFailed("Unexpected EOF in \(inputPath)")
@@ -421,7 +429,7 @@ struct ZstdClient: Sendable {
       }
       if let timeout {
         group.addTask {
-          try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+          try await Task.sleep(nanoseconds: timeoutNanoseconds(timeout))
           return .timedOut
         }
       }
@@ -430,6 +438,7 @@ struct ZstdClient: Sendable {
         switch event {
         case .exited(let status):
           group.cancelAll()
+          try Task.checkCancellation()
           return status
         case .timedOut:
           ChildProcessTracker.shared.terminateIfRunning(process)
@@ -440,6 +449,12 @@ struct ZstdClient: Sendable {
 
       throw ZstdError.commandFailed(exitCode: -1, stderr: "Process ended without status")
     }
+  }
+
+  private static func timeoutNanoseconds(_ timeout: TimeInterval) -> UInt64 {
+    guard timeout.isFinite, timeout > 0 else { return 0 }
+    let maxSeconds = TimeInterval(UInt64.max / 1_000_000_000)
+    return UInt64(min(timeout, maxSeconds) * 1_000_000_000)
   }
 
   private static func hexDigest(_ digest: some Sequence<UInt8>) -> String {

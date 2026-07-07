@@ -1,13 +1,8 @@
 import Foundation
 
 actor ImageOperationCache {
-  private struct Waiter {
-    let id: UUID
-    let continuation: CheckedContinuation<Bool, Never>
-  }
-
   private var activeKeys: Set<String> = []
-  private var waitersByKey: [String: [Waiter]] = [:]
+  private let retryDelay: UInt64 = 1_000_000
 
   func withExclusiveAccess<T: Sendable>(
     for key: String,
@@ -20,43 +15,17 @@ actor ImageOperationCache {
   }
 
   private func acquire(_ key: String) async throws {
-    try Task.checkCancellation()
-    if activeKeys.contains(key) == false {
-      activeKeys.insert(key)
-      return
-    }
-
-    let waiterID = UUID()
-    let acquired = await withTaskCancellationHandler {
-      await withCheckedContinuation { continuation in
-        waitersByKey[key, default: []].append(Waiter(id: waiterID, continuation: continuation))
+    while true {
+      try Task.checkCancellation()
+      if activeKeys.contains(key) == false {
+        activeKeys.insert(key)
+        return
       }
-    } onCancel: {
-      Task { await self.cancelWaiter(waiterID, for: key) }
-    }
-
-    guard acquired else {
-      throw CancellationError()
+      try await Task.sleep(nanoseconds: retryDelay)
     }
   }
 
   private func release(_ key: String) {
-    guard var waiters = waitersByKey[key], waiters.isEmpty == false else {
-      activeKeys.remove(key)
-      waitersByKey[key] = nil
-      return
-    }
-
-    let next = waiters.removeFirst()
-    waitersByKey[key] = waiters.isEmpty ? nil : waiters
-    next.continuation.resume(returning: true)
-  }
-
-  private func cancelWaiter(_ id: UUID, for key: String) {
-    guard var waiters = waitersByKey[key],
-          let index = waiters.firstIndex(where: { $0.id == id }) else { return }
-    let waiter = waiters.remove(at: index)
-    waitersByKey[key] = waiters.isEmpty ? nil : waiters
-    waiter.continuation.resume(returning: false)
+    activeKeys.remove(key)
   }
 }

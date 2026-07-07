@@ -6,7 +6,7 @@ extension APIServer {
   func handleListImages(_ request: HTTPRequest) async -> HTTPResponse {
     let allImages = await imageManager.listImages()
 
-    let requestedLimit = Int(request.queryParameters["limit"] ?? "") ?? allImages.count
+    let requestedLimit = Int(request.queryParameters["limit"] ?? "") ?? 100
     let limit = max(1, min(requestedLimit, 1000))
     let offset = max(0, Int(request.queryParameters["offset"] ?? "") ?? 0)
 
@@ -383,7 +383,9 @@ extension APIServer {
     }
 
     _ = await imageManager.cancelImageOperation(operationId)
-    if cancelImageOperationTask(operationId) == false {
+    if await cancelAndWaitImageOperationTask(operationId) == false {
+      await imageManager.failImageOperation(operationId, error: CancellationError())
+    } else if let status = await imageManager.getImageOperationStatus(operationId), status.state.isTerminal == false {
       await imageManager.failImageOperation(operationId, error: CancellationError())
     }
     guard let cancelled = await imageManager.getImageOperationStatus(operationId) else {

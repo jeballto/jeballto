@@ -29,6 +29,7 @@ actor PersistenceStore {
   private let fileManager = FileManager.default
   private var database: VMDatabase
   private var isLoaded = false
+  private var loadFailure: Error?
   private let encoder: JSONEncoder
   private let decoder: JSONDecoder
 
@@ -67,8 +68,9 @@ actor PersistenceStore {
       let loadedDB = try loadFromDisk()
       database = loadedDB
     } catch {
+      loadFailure = error
       logWarning(
-        "Failed to load database from \(databasePath): \(error). Starting with empty database.",
+        "Failed to load database from \(databasePath): \(error). Refusing writes until the file is repaired.",
         category: "PersistenceStore"
       )
     }
@@ -85,13 +87,13 @@ actor PersistenceStore {
 
   /// Saves the current database to disk
   func save() throws {
-    ensureLoaded()
+    try ensureLoadedForMutation()
     try saveToDisk()
   }
 
   /// Creates a new VM definition
   func createVM(_ definition: VMDefinition) throws {
-    ensureLoaded()
+    try ensureLoadedForMutation()
     guard database.vms[definition.id] == nil else { throw PersistenceError.vmAlreadyExists(definition.id) }
     database.vms[definition.id] = definition
     try saveToDisk()
@@ -99,7 +101,7 @@ actor PersistenceStore {
 
   /// Updates an existing VM definition
   func updateVM(_ id: UUID, _ definition: VMDefinition) throws {
-    ensureLoaded()
+    try ensureLoadedForMutation()
     guard definition.id == id else {
       throw PersistenceError.invalidData("Definition ID \(definition.id) does not match key \(id)")
     }
@@ -110,7 +112,7 @@ actor PersistenceStore {
 
   /// Deletes a VM definition
   func deleteVM(_ id: UUID) throws {
-    ensureLoaded()
+    try ensureLoadedForMutation()
     guard database.vms[id] != nil else { throw PersistenceError.vmNotFound(id) }
     database.vms.removeValue(forKey: id)
     try saveToDisk()
@@ -119,6 +121,11 @@ actor PersistenceStore {
   /// Retrieves a specific VM definition
   func getVM(_ id: UUID) throws -> VMDefinition {
     ensureLoaded()
+    if let loadFailure {
+      throw PersistenceError.invalidData(
+        "Failed to load database at \(databasePath): \(loadFailure.localizedDescription)"
+      )
+    }
     guard let vm = database.vms[id] else { throw PersistenceError.vmNotFound(id) }
     return vm
   }
@@ -143,7 +150,7 @@ actor PersistenceStore {
 
   /// Deletes all VM definitions from the database
   func deleteAllVMs() throws {
-    ensureLoaded()
+    try ensureLoadedForMutation()
     let count = database.vms.count
     database.vms.removeAll()
     try saveToDisk()
@@ -152,7 +159,7 @@ actor PersistenceStore {
 
   /// Updates just the state of a VM (convenience method)
   func updateVMState(_ id: UUID, state: VMState) throws {
-    ensureLoaded()
+    try ensureLoadedForMutation()
     guard var vm = database.vms[id] else { throw PersistenceError.vmNotFound(id) }
     vm.updateState(state)
     database.vms[id] = vm
@@ -173,6 +180,15 @@ actor PersistenceStore {
       return loadedDB
     } catch let error as DecodingError { throw PersistenceError.decodingFailed(error) } catch {
       throw PersistenceError.invalidData("Failed to read database at \(databasePath): \(error.localizedDescription)")
+    }
+  }
+
+  private func ensureLoadedForMutation() throws {
+    ensureLoaded()
+    if let loadFailure {
+      throw PersistenceError.invalidData(
+        "Failed to load existing database at \(databasePath): \(loadFailure.localizedDescription). Refusing to overwrite it"
+      )
     }
   }
 

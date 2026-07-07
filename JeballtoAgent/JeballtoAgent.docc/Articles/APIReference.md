@@ -418,9 +418,9 @@ Allocates a host port and starts the proxy. Idempotent. VM must be `RUNNING`.
 ```bash
 curl -X POST http://127.0.0.1:8011/v1/vms/$VM_ID/vnc \
   -H "Authorization: Bearer $TOKEN"
-# {"host": "127.0.0.1", "port": 5900, "status": "ready"}
+# {"host": "127.0.0.1", "port": 5901, "status": "ready"}
 
-open vnc://localhost:5900
+open vnc://localhost:5901
 ```
 
 ### Disable VNC Forwarding
@@ -559,7 +559,7 @@ curl -X POST http://127.0.0.1:8011/v1/images/pull \
   -d '{"reference":"ghcr.io/myorg/vms/dev-env:latest"}'
 ```
 
-Optional `timeout` field (seconds). No timeout by default.
+Optional `timeout` field (seconds, max 604800). No timeout by default.
 
 Set `async` to `true` to return immediately with an operation ID:
 
@@ -598,8 +598,8 @@ completed chunk blobs. `bytesTotal` is the compressed config plus compressed chu
 pull operation time. It is not Activity Monitor network throughput, because it includes manifest work, cache waits,
 decompression, disk writes, validation, and blob completion granularity.
 
-After cancellation, status is `cancelling` while cleanup is still running, then `cancelled` when the operation is
-fully stopped.
+During cancellation, status may be `cancelling` while cleanup is still running. The DELETE endpoint waits for cleanup
+and child-process termination, then returns `cancelled` when the operation is fully stopped.
 
 ### Push Image
 
@@ -608,6 +608,7 @@ POST /v1/images/push
 ```
 
 Pushes a VM bundle or existing local image. Use `source` with `vm:<uuid>` or `image:<uuid>`.
+Optional `timeout` field is in seconds, max 604800. No timeout by default.
 
 **Requirements:**
 
@@ -665,8 +666,8 @@ is an overall value where compression contributes the first half and upload cont
 because it includes blob existence checks, ORAS process overhead, registry latency, and only advances when blobs
 complete.
 
-After cancellation, status is `cancelling` while cleanup is still running, then `cancelled` when the operation is
-fully stopped.
+During cancellation, status may be `cancelling` while cleanup is still running. The DELETE endpoint waits for cleanup
+and child-process termination, then returns `cancelled` when the operation is fully stopped.
 
 ### List, Get, Delete Images
 
@@ -688,6 +689,44 @@ registry.example.com/repository/name@sha256:abc123...
 ```
 
 Registry must always be specified. References without a registry hostname are rejected.
+
+## Jeballtofiles
+
+Jeballtofiles are YAML or JSON blueprints for automated VM creation and provisioning. See <doc:JeballtofileReference>
+for the full file format and step reference.
+
+### Execute Blueprint
+
+```http
+POST /v1/jeballtofiles
+```
+
+Accepts `application/json`, `application/yaml`, or `application/x-yaml`. The request is validated before execution.
+On success, Jeballto creates a VM, starts the step executor, and returns `202 Accepted` with:
+
+```json
+{
+  "id": "execution-uuid",
+  "vmId": "vm-uuid",
+  "status": "running",
+  "currentStep": 0,
+  "totalSteps": 3,
+  "message": "Jeballtofile execution started"
+}
+```
+
+### Manage Executions
+
+```http
+GET /v1/jeballtofiles
+GET /v1/jeballtofiles/{executionId}
+POST /v1/jeballtofiles/{executionId}/cancel
+DELETE /v1/jeballtofiles/{executionId}
+```
+
+Status responses include `id`, `vmId`, `status`, `currentStep`, `totalSteps`, `stepResults`, and `error`.
+Cancellation is only accepted while an execution is `running`. Deletion is only accepted after an execution has
+completed, failed, or been cancelled.
 
 ## Registry Authentication
 
@@ -747,7 +786,9 @@ Returns current runtime configuration. Sensitive values (token, file paths) are 
 PATCH /v1/config
 ```
 
-Partial update - include only fields to change. Changes persist to disk and apply immediately, with two exceptions that require a restart: `api.port`, `api.host`, and `api.token`. Every other field hot-reloads.
+Partial update - include only fields to change. Writable fields persist to disk and apply immediately. API bind
+settings are returned by `GET /v1/config`, but they are not writable through this endpoint. The API token and file
+paths are intentionally excluded from the config response.
 
 ```bash
 # Change log level
@@ -887,5 +928,7 @@ All errors return:
 | `EXECUTE_TIMEOUT` | 504 | Command timed out |
 | `GATEWAY_TIMEOUT` | 504 | Operation timed out |
 | `INVALID_JSON` | 400 | JSON parse error |
+| `PAYLOAD_TOO_LARGE` | 413 | Request body exceeds 1 MB |
+| `TOO_MANY_REQUESTS` | 429 | Maximum concurrent request limit exceeded |
 | `CONFIRMATION_REQUIRED` | 400 | Missing `?confirm=true` query parameter |
 | `IMAGE_PUSH_FAILED` | 503 | Registry unreachable during pre-flight check |
