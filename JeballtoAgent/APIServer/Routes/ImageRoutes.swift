@@ -53,10 +53,129 @@ extension APIServer {
         statusCode: 400
       )
     }
-    await cancelAllImageOperationTasks()
+    await cancelActiveImageOperations()
     let (deleted, failed, errors) = await imageManager.wipeAllImages()
     let response = WipeAllResponse(deleted: deleted, failed: failed, errors: errors.isEmpty ? nil : errors)
     return HTTPResponse.json(response)
+  }
+
+  func handleListImagePullOperations(_ request: HTTPRequest) async -> HTTPResponse {
+    await handleListImageOperations(request, kind: .pull)
+  }
+
+  func handleListImagePushOperations(_ request: HTTPRequest) async -> HTTPResponse {
+    await handleListImageOperations(request, kind: .push)
+  }
+
+  private func handleListImageOperations(_ request: HTTPRequest, kind: ImageOperationKind) async -> HTTPResponse {
+    let activeOnly: Bool
+    do {
+      activeOnly = try imageOperationActiveOnlyFilter(from: request, defaultValue: true)
+    } catch let response as HTTPResponse {
+      return response
+    } catch {
+      return HTTPResponse.error("INVALID_REQUEST", message: error.localizedDescription, statusCode: 400)
+    }
+
+    let operations = await imageManager.listImageOperationStatuses(kind: kind, activeOnly: activeOnly)
+    return HTTPResponse.json(ImageOperationListResponse(operations: operations, activeOnly: activeOnly, type: kind))
+  }
+
+  func handleCancelImagePullOperations(_ request: HTTPRequest) async -> HTTPResponse {
+    await handleCancelImageOperations(kind: .pull)
+  }
+
+  func handleCancelImagePushOperations(_ request: HTTPRequest) async -> HTTPResponse {
+    await handleCancelImageOperations(kind: .push)
+  }
+
+  private func handleCancelImageOperations(kind: ImageOperationKind) async -> HTTPResponse {
+    let result = await cancelActiveImageOperations(kind: kind)
+
+    return HTTPResponse.json(ImageOperationCancelAllResponse(
+      cancelled: result.operations.count,
+      tasksCancelled: result.tasksCancelled,
+      operations: result.operations
+    ))
+  }
+
+  @discardableResult
+  func cancelActiveImageOperations(kind: ImageOperationKind? = nil) async -> (
+    tasksCancelled: Int,
+    operations: [ImageOperationStatus]
+  ) {
+    let activeOperations = await imageManager.listImageOperationStatuses(kind: kind, activeOnly: true)
+    var cancelledIds = Set<UUID>()
+    for operation in activeOperations {
+      if await imageManager.cancelImageOperation(operation.id) {
+        cancelledIds.insert(operation.id)
+      }
+    }
+
+    let tasksCancelled = await cancelAndWaitImageOperationTasks(cancelledIds)
+    for operationId in cancelledIds {
+      if let status = await imageManager.getImageOperationStatus(operationId), status.state.isTerminal == false {
+        await imageManager.failImageOperation(operationId, error: CancellationError())
+      }
+    }
+
+    var finalOperations: [ImageOperationStatus] = []
+    for operationId in cancelledIds {
+      if let status = await imageManager.getImageOperationStatus(operationId) {
+        finalOperations.append(status)
+      }
+    }
+    finalOperations.sort { $0.startedAt > $1.startedAt }
+
+    return (tasksCancelled: tasksCancelled, operations: finalOperations)
+  }
+
+  func handleGetImagePullOperation(_ request: HTTPRequest) async -> HTTPResponse {
+    await handleGetImageOperation(request, kind: .pull)
+  }
+
+  func handleGetImagePushOperation(_ request: HTTPRequest) async -> HTTPResponse {
+    await handleGetImageOperation(request, kind: .push)
+  }
+
+  private func handleGetImageOperation(_ request: HTTPRequest, kind: ImageOperationKind) async -> HTTPResponse {
+    guard let operationId = extractTypedOperationId(from: request.path, kind: kind) else {
+      return APIRouteErrorMapper.invalidID(resource: "image operation")
+    }
+
+    guard let status = await imageManager.getImageOperationStatus(operationId), status.kind == kind else {
+      return HTTPResponse.error(
+        "IMAGE_OPERATION_NOT_FOUND",
+        message: "Image \(kind.rawValue) operation not found",
+        statusCode: 404
+      )
+    }
+
+    return HTTPResponse.json(ImageOperationStatusResponse(from: status))
+  }
+
+  func handleCancelImagePullOperation(_ request: HTTPRequest) async -> HTTPResponse {
+    await handleCancelImageOperation(request, kind: .pull)
+  }
+
+  func handleCancelImagePushOperation(_ request: HTTPRequest) async -> HTTPResponse {
+    await handleCancelImageOperation(request, kind: .push)
+  }
+
+  private func handleCancelImageOperation(_ request: HTTPRequest, kind: ImageOperationKind) async -> HTTPResponse {
+    guard let operationId = extractTypedOperationId(from: request.path, kind: kind) else {
+      return APIRouteErrorMapper.invalidID(resource: "image operation")
+    }
+
+    guard let status = await imageManager.getImageOperationStatus(operationId), status.kind == kind else {
+      return HTTPResponse.error(
+        "IMAGE_OPERATION_NOT_FOUND",
+        message: "Image \(kind.rawValue) operation not found",
+        statusCode: 404
+      )
+    }
+
+    return await cancelImageOperation(operationId, currentStatus: status)
   }
 
   func handlePullImage(_ request: HTTPRequest) async -> HTTPResponse {
@@ -78,75 +197,36 @@ extension APIServer {
 
     let pullTimeout: TimeInterval? = pullRequest.timeout.map { TimeInterval($0) }
     if pullRequest.shouldRunAsync {
-      let operation = await imageManager.startImageOperation(kind: .pull, reference: pullRequest.reference)
-      let operationId = operation.id
-      let reference = pullRequest.reference
-      let progressSink = await imageManager.progressSink(for: operationId)
-      let server = self
-      startImageOperationTask(operationId) {
-        Task<Void, Never> { [server] in
-          let result: Result<ImageRecord, Error>
-          do {
-            let record = try await server.imageManager.pullImage(
-              reference: reference,
-              timeout: pullTimeout,
-              progressSink: progressSink
-            )
-            result = .success(record)
-          } catch is CancellationError {
-            logInfo("Async image pull cancelled for \(reference)", category: "APIServer")
-            result = .failure(CancellationError())
-          } catch {
-            logError("Async image pull failed for \(reference): \(error)", category: "APIServer")
-            result = .failure(error)
-          }
-          await server.finishImageOperationTask(operationId, result: result)
-        }
-      }
-
-      let response = ImagePullResponse(
-        reference: pullRequest.reference,
-        status: "started",
-        digest: nil,
-        image: nil,
-        message: "Image pull started",
-        operationId: operationId.uuidString,
-        statusUrl: "/v1/images/pull/\(operationId.uuidString)/status"
-      )
-      return HTTPResponse.json(response, statusCode: 202)
+      return await startAsyncPull(request: pullRequest, timeout: pullTimeout)
     }
 
+    return await runBlockingPull(request: pullRequest, timeout: pullTimeout)
+  }
+
+  private func runBlockingPull(request pullRequest: PullImageRequest, timeout: TimeInterval?) async -> HTTPResponse {
+    let operation = await imageManager.startImageOperation(kind: .pull, reference: pullRequest.reference)
+    let progressSink = await imageManager.progressSink(for: operation.id)
     do {
-      let record = try await imageManager.pullImage(reference: pullRequest.reference, timeout: pullTimeout)
-      let response = ImagePullResponse(
-        reference: record.reference,
-        status: "completed",
-        digest: record.digest,
-        image: ImageResponse(from: record),
-        message: nil
+      let record = try await imageManager.pullImage(
+        reference: pullRequest.reference,
+        timeout: timeout,
+        progressSink: progressSink
       )
-      return HTTPResponse.json(response)
+      await imageManager.completeImageOperation(operation.id, record: record)
+      guard let status = await imageManager.getImageOperationStatus(operation.id) else {
+        return HTTPResponse.error("IMAGE_OPERATION_NOT_FOUND", message: "Image operation not found", statusCode: 404)
+      }
+      return HTTPResponse.json(ImageOperationStatusResponse(from: status))
     } catch is CancellationError {
+      await imageManager.failImageOperation(operation.id, error: CancellationError())
       return HTTPResponse.error("IMAGE_PULL_CANCELLED", message: "Image pull cancelled", statusCode: 499)
     } catch let error as ImageManagerError {
+      await imageManager.failImageOperation(operation.id, error: error)
       return APIRouteErrorMapper.imageManager(error, defaultCode: "IMAGE_PULL_FAILED")
-    } catch { return HTTPResponse.error("IMAGE_PULL_FAILED", message: error.localizedDescription, statusCode: 500) }
-  }
-
-  func handleGetImagePullStatus(_ request: HTTPRequest) async -> HTTPResponse {
-    guard let operationId = extractImageOperationId(from: request.path, operation: "pull") else {
-      return APIRouteErrorMapper.invalidID(resource: "image operation")
+    } catch {
+      await imageManager.failImageOperation(operation.id, error: error)
+      return HTTPResponse.error("IMAGE_PULL_FAILED", message: error.localizedDescription, statusCode: 500)
     }
-
-    guard let status = await imageManager.getImageOperationStatus(operationId), status.kind == .pull else {
-      return HTTPResponse.error("IMAGE_OPERATION_NOT_FOUND", message: "Image pull operation not found", statusCode: 404)
-    }
-
-    return HTTPResponse.json(ImageOperationStatusResponse(from: status))
-  }
-
-  func handleCancelImagePull(_ request: HTTPRequest) async -> HTTPResponse {
-    await handleCancelImageOperation(request, kind: .pull)
   }
 
   func handlePushImage(_ request: HTTPRequest) async -> HTTPResponse {
@@ -176,19 +256,40 @@ extension APIServer {
       )
     }
 
-    do {
-      let pushTimeout: TimeInterval? = pushRequest.timeout.map { TimeInterval($0) }
-      if pushRequest.shouldRunAsync {
-        return await startAsyncPush(
-          request: pushRequest,
-          parsedSource: parsed,
-          sourceUUID: sourceUUID,
-          timeout: pushTimeout
-        )
-      }
+    let pushTimeout: TimeInterval? = pushRequest.timeout.map { TimeInterval($0) }
+    if pushRequest.shouldRunAsync {
+      return await startAsyncPush(
+        request: pushRequest,
+        parsedSource: parsed,
+        sourceUUID: sourceUUID,
+        timeout: pushTimeout
+      )
+    }
 
+    return await runBlockingPush(
+      request: pushRequest,
+      parsedSource: parsed,
+      sourceUUID: sourceUUID,
+      timeout: pushTimeout
+    )
+  }
+
+  private func runBlockingPush(
+    request pushRequest: PushImageRequest,
+    parsedSource: PushImageRequest.ParsedSource,
+    sourceUUID: UUID,
+    timeout: TimeInterval?
+  ) async -> HTTPResponse {
+    let operation = await imageManager.startImageOperation(
+      kind: .push,
+      reference: pushRequest.reference,
+      source: pushRequest.source
+    )
+    let progressSink = await imageManager.progressSink(for: operation.id)
+
+    do {
       let record: ImageRecord
-      switch parsed.type {
+      switch parsedSource.type {
       case .vm:
         let vmDefinition = try await vmManager.getVM(sourceUUID)
         let exportToken = try await vmManager.claimImageExport(sourceUUID)
@@ -196,7 +297,8 @@ extension APIServer {
           record = try await imageManager.pushImageFromVM(
             reference: pushRequest.reference,
             vmBundlePath: vmDefinition.paths.bundlePath,
-            timeout: pushTimeout
+            timeout: timeout,
+            progressSink: progressSink
           )
           await vmManager.releaseImageExport(sourceUUID, token: exportToken)
         } catch {
@@ -207,50 +309,71 @@ extension APIServer {
         record = try await imageManager.pushImage(
           reference: pushRequest.reference,
           imageId: sourceUUID,
-          timeout: pushTimeout
+          timeout: timeout,
+          progressSink: progressSink
         )
       }
 
-      let response = ImagePushResponse(
-        reference: record.reference,
-        status: "completed",
-        digest: record.digest,
-        image: ImageResponse(from: record),
-        message: nil
-      )
-      return HTTPResponse.json(response)
+      await imageManager.completeImageOperation(operation.id, record: record)
+      guard let status = await imageManager.getImageOperationStatus(operation.id) else {
+        return HTTPResponse.error("IMAGE_OPERATION_NOT_FOUND", message: "Image operation not found", statusCode: 404)
+      }
+      return HTTPResponse.json(ImageOperationStatusResponse(from: status))
     } catch is CancellationError {
+      await imageManager.failImageOperation(operation.id, error: CancellationError())
       return HTTPResponse.error("IMAGE_PUSH_CANCELLED", message: "Image push cancelled", statusCode: 499)
     } catch let error as VMManagerError {
+      await imageManager.failImageOperation(operation.id, error: error)
       return APIRouteErrorMapper.vmManager(
         error,
         defaultCode: "IMAGE_PUSH_FAILED",
         notFoundMessage: "Source VM not found"
       )
     } catch let error as ImageManagerError {
+      await imageManager.failImageOperation(operation.id, error: error)
       return APIRouteErrorMapper.imageManager(
         error,
         defaultCode: "IMAGE_PUSH_FAILED",
         notFoundCode: "IMAGE_NOT_FOUND",
         notFoundMessage: "Source image not found"
       )
-    } catch { return HTTPResponse.error("IMAGE_PUSH_FAILED", message: error.localizedDescription, statusCode: 500) }
+    } catch {
+      await imageManager.failImageOperation(operation.id, error: error)
+      return HTTPResponse.error("IMAGE_PUSH_FAILED", message: error.localizedDescription, statusCode: 500)
+    }
   }
 
-  func handleGetImagePushStatus(_ request: HTTPRequest) async -> HTTPResponse {
-    guard let operationId = extractImageOperationId(from: request.path, operation: "push") else {
-      return APIRouteErrorMapper.invalidID(resource: "image operation")
+  private func startAsyncPull(request pullRequest: PullImageRequest, timeout: TimeInterval?) async -> HTTPResponse {
+    let operation = await imageManager.startImageOperation(kind: .pull, reference: pullRequest.reference)
+    let operationId = operation.id
+    let reference = pullRequest.reference
+    let progressSink = await imageManager.progressSink(for: operationId)
+    let server = self
+    startImageOperationTask(operationId) {
+      Task<Void, Never> { [server] in
+        let result: Result<ImageRecord, Error>
+        do {
+          let record = try await server.imageManager.pullImage(
+            reference: reference,
+            timeout: timeout,
+            progressSink: progressSink
+          )
+          result = .success(record)
+        } catch is CancellationError {
+          logInfo("Async image pull cancelled for \(reference)", category: "APIServer")
+          result = .failure(CancellationError())
+        } catch {
+          logError("Async image pull failed for \(reference): \(error)", category: "APIServer")
+          result = .failure(error)
+        }
+        await server.finishImageOperationTask(operationId, result: result)
+      }
     }
 
-    guard let status = await imageManager.getImageOperationStatus(operationId), status.kind == .push else {
-      return HTTPResponse.error("IMAGE_OPERATION_NOT_FOUND", message: "Image push operation not found", statusCode: 404)
+    guard let status = await imageManager.getImageOperationStatus(operationId) else {
+      return HTTPResponse.error("IMAGE_OPERATION_NOT_FOUND", message: "Image operation not found", statusCode: 404)
     }
-
-    return HTTPResponse.json(ImageOperationStatusResponse(from: status))
-  }
-
-  func handleCancelImagePush(_ request: HTTPRequest) async -> HTTPResponse {
-    await handleCancelImageOperation(request, kind: .push)
+    return HTTPResponse.json(ImageOperationStatusResponse(from: status), statusCode: 202)
   }
 
   private func startAsyncPush(
@@ -326,23 +449,17 @@ extension APIServer {
               logError("Async image push failed for \(reference): \(error)", category: "APIServer")
               result = .failure(error)
             }
-            await server.finishImageOperationTask(operationId, result: result)
             await server.imageManager.releaseImageExport(sourceUUID, token: exportToken)
+            await server.finishImageOperationTask(operationId, result: result)
           }
         }
       }
       let operationId = operation.id
 
-      let response = ImagePushResponse(
-        reference: reference,
-        status: "started",
-        digest: nil,
-        image: nil,
-        message: "Image push started",
-        operationId: operationId.uuidString,
-        statusUrl: "/v1/images/push/\(operationId.uuidString)/status"
-      )
-      return HTTPResponse.json(response, statusCode: 202)
+      guard let status = await imageManager.getImageOperationStatus(operationId) else {
+        return HTTPResponse.error("IMAGE_OPERATION_NOT_FOUND", message: "Image operation not found", statusCode: 404)
+      }
+      return HTTPResponse.json(ImageOperationStatusResponse(from: status), statusCode: 202)
     } catch let error as VMManagerError {
       return APIRouteErrorMapper.vmManager(
         error,
@@ -361,23 +478,14 @@ extension APIServer {
     }
   }
 
-  private func handleCancelImageOperation(_ request: HTTPRequest, kind: ImageOperationKind) async -> HTTPResponse {
-    guard let operationId = extractImageOperationId(from: request.path, operation: kind.rawValue, includeStatus: false) else {
-      return APIRouteErrorMapper.invalidID(resource: "image operation")
-    }
-
-    guard let status = await imageManager.getImageOperationStatus(operationId), status.kind == kind else {
-      return HTTPResponse.error(
-        "IMAGE_OPERATION_NOT_FOUND",
-        message: "Image \(kind.rawValue) operation not found",
-        statusCode: 404
-      )
-    }
-
+  private func cancelImageOperation(
+    _ operationId: UUID,
+    currentStatus status: ImageOperationStatus
+  ) async -> HTTPResponse {
     guard status.state.isTerminal == false else {
       return HTTPResponse.error(
         "IMAGE_OPERATION_NOT_RUNNING",
-        message: "Image \(kind.rawValue) operation is already \(status.state.rawValue)",
+        message: "Image \(status.kind.rawValue) operation is already \(status.state.rawValue)",
         statusCode: 409
       )
     }
@@ -391,28 +499,36 @@ extension APIServer {
     guard let cancelled = await imageManager.getImageOperationStatus(operationId) else {
       return HTTPResponse.error(
         "IMAGE_OPERATION_NOT_FOUND",
-        message: "Image \(kind.rawValue) operation not found",
+        message: "Image operation not found",
         statusCode: 404
       )
     }
     return HTTPResponse.json(ImageOperationStatusResponse(from: cancelled))
   }
 
-  private func extractImageOperationId(from path: String, operation: String, includeStatus: Bool = true) -> UUID? {
+  private func extractTypedOperationId(from path: String, kind: ImageOperationKind) -> UUID? {
     let components = path.split(separator: "/")
-    guard components.count >= 4,
+    guard components.count == 5,
           components[0] == "v1",
           components[1] == "images",
-          components[2] == Substring(operation) else { return nil }
+          components[2] == Substring(kind.rawValue),
+          components[3] == "operations" else { return nil }
 
-    if includeStatus {
-      guard components.count == 5,
-            components[4] == "status" else { return nil }
-    } else {
-      guard components.count == 4 else { return nil }
+    return UUID(uuidString: String(components[4]))
+  }
+
+  private func imageOperationActiveOnlyFilter(from request: HTTPRequest, defaultValue: Bool) throws -> Bool {
+    guard let rawValue = request.queryParameters["activeOnly"], !rawValue.isEmpty else { return defaultValue }
+    switch rawValue.lowercased() {
+    case "true": return true
+    case "false": return false
+    default:
+      throw HTTPResponse.error(
+        "INVALID_ACTIVE_ONLY",
+        message: "activeOnly must be 'true' or 'false'",
+        statusCode: 400
+      )
     }
-
-    return UUID(uuidString: String(components[3]))
   }
 
   // MARK: - Registry Handlers

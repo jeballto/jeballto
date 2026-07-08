@@ -765,28 +765,35 @@ struct ImageListResponse: Codable {
   }
 }
 
-struct ImagePullResponse: Codable {
-  let reference: String
-  let status: String
-  let digest: String?
-  let image: ImageResponse?
-  let message: String?
-  var operationId: String? = nil
-  var statusUrl: String? = nil
+struct ImageOperationListResponse: Codable {
+  let operations: [ImageOperationStatusResponse]
+  let total: Int
+  let activeOnly: Bool
+  let type: String?
+
+  init(operations: [ImageOperationStatus], activeOnly: Bool, type: ImageOperationKind?) {
+    self.operations = operations.map { ImageOperationStatusResponse(from: $0) }
+    total = operations.count
+    self.activeOnly = activeOnly
+    self.type = type?.rawValue
+  }
 }
 
-struct ImagePushResponse: Codable {
-  let reference: String
-  let status: String
-  let digest: String?
-  let image: ImageResponse?
-  let message: String?
-  var operationId: String? = nil
-  var statusUrl: String? = nil
+struct ImageOperationCancelAllResponse: Codable {
+  let cancelled: Int
+  let tasksCancelled: Int
+  let operations: [ImageOperationStatusResponse]
+
+  init(cancelled: Int, tasksCancelled: Int, operations: [ImageOperationStatus]) {
+    self.cancelled = cancelled
+    self.tasksCancelled = tasksCancelled
+    self.operations = operations.map { ImageOperationStatusResponse(from: $0) }
+  }
 }
 
 struct ImageOperationStatusResponse: Codable {
   let operationId: String
+  let statusUrl: String
   let type: String
   let reference: String
   let source: String?
@@ -808,6 +815,7 @@ struct ImageOperationStatusResponse: Codable {
 
   init(from status: ImageOperationStatus) {
     operationId = status.id.uuidString
+    statusUrl = "/v1/images/\(status.kind.rawValue)/operations/\(status.id.uuidString)"
     type = status.kind.rawValue
     reference = status.reference
     source = status.source

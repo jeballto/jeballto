@@ -559,9 +559,11 @@ curl -X POST http://127.0.0.1:8011/v1/images/pull \
   -d '{"reference":"ghcr.io/myorg/vms/dev-env:latest"}'
 ```
 
-Optional `timeout` field (seconds, max 604800). No timeout by default.
+Optional `timeout` field (seconds, max 604800). No timeout by default. The endpoint always creates a pull operation.
+By default it blocks until the pull reaches a terminal status and returns an operation status response with `image`
+populated on success.
 
-Set `async` to `true` to return immediately with an operation ID:
+To return immediately with operation status, set `async` to `true`:
 
 ```bash
 curl -X POST http://127.0.0.1:8011/v1/images/pull \
@@ -573,13 +575,13 @@ curl -X POST http://127.0.0.1:8011/v1/images/pull \
 Poll progress with:
 
 ```http
-GET /v1/images/pull/{operationId}/status
+GET /v1/images/pull/operations/{operationId}
 ```
 
-Cancel a running async pull with:
+Cancel a running pull with:
 
 ```http
-DELETE /v1/images/pull/{operationId}
+DELETE /v1/images/pull/operations/{operationId}
 ```
 
 Async pull flow:
@@ -625,7 +627,10 @@ curl -X POST http://127.0.0.1:8011/v1/images/push \
   }'
 ```
 
-Set `async` to `true` to return immediately and poll progress:
+The endpoint always creates a push operation. By default it blocks until the push reaches a terminal status and
+returns an operation status response with `image` populated on success.
+
+To return immediately with operation status, set `async` to `true`:
 
 ```bash
 curl -X POST http://127.0.0.1:8011/v1/images/push \
@@ -639,13 +644,13 @@ curl -X POST http://127.0.0.1:8011/v1/images/push \
 ```
 
 ```http
-GET /v1/images/push/{operationId}/status
+GET /v1/images/push/operations/{operationId}
 ```
 
-Cancel a running async push with:
+Cancel a running push with:
 
 ```http
-DELETE /v1/images/push/{operationId}
+DELETE /v1/images/push/operations/{operationId}
 ```
 
 Async push flow:
@@ -668,6 +673,33 @@ complete.
 
 During cancellation, status may be `cancelling` while cleanup is still running. The DELETE endpoint waits for cleanup
 and child-process termination, then returns `cancelled` when the operation is fully stopped.
+
+### Image Operations
+
+Pull and push operation listing, status, and cancellation are scoped under each image action.
+
+```http
+POST   /v1/images/pull
+GET    /v1/images/pull/operations
+GET    /v1/images/pull/operations?activeOnly=false
+GET    /v1/images/pull/operations/{operationId}
+DELETE /v1/images/pull/operations/{operationId}
+DELETE /v1/images/pull/operations
+
+POST   /v1/images/push
+GET    /v1/images/push/operations
+GET    /v1/images/push/operations?activeOnly=false
+GET    /v1/images/push/operations/{operationId}
+DELETE /v1/images/push/operations/{operationId}
+DELETE /v1/images/push/operations
+```
+
+The list endpoints return active operations by default. Use `activeOnly=false` to include completed, failed, and
+cancelled operations.
+
+`DELETE /v1/images/{pull|push}/operations/{operationId}` cancels one running operation. The collection delete
+endpoints cancel all active operations of that action type. Cancellation waits for the background task and any child
+processes to stop before returning terminal operation status.
 
 ### List, Get, Delete Images
 

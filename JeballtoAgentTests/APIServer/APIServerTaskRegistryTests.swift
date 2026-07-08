@@ -84,16 +84,16 @@ struct APIServerTaskRegistryTests {
 
       let request = HTTPRequest(
         method: "DELETE",
-        path: "/v1/images/\(kind.rawValue)/\(operation.id.uuidString)",
+        path: "/v1/images/\(kind.rawValue)/operations/\(operation.id.uuidString)",
         headers: [:],
         body: nil,
         queryParameters: [:]
       )
-      let response = switch kind {
+      let response: HTTPResponse = switch kind {
       case .pull:
-        await server.handleCancelImagePull(request)
+        await server.handleCancelImagePullOperation(request)
       case .push:
-        await server.handleCancelImagePush(request)
+        await server.handleCancelImagePushOperation(request)
       }
 
       #expect(response.statusCode == 200)
@@ -149,9 +149,9 @@ struct APIServerTaskRegistryTests {
       let status = try #require(await server.imageManager.getImageOperationStatus(operation.id))
       #expect(status.state == .completed)
 
-      let cancelResponse = await server.handleCancelImagePull(HTTPRequest(
+      let cancelResponse = await server.handleCancelImagePullOperation(HTTPRequest(
         method: "DELETE",
-        path: "/v1/images/pull/\(operation.id.uuidString)",
+        path: "/v1/images/pull/operations/\(operation.id.uuidString)",
         headers: [:],
         body: nil,
         queryParameters: [:]
@@ -166,6 +166,10 @@ struct APIServerTaskRegistryTests {
       let server = makeTestAPIServer(root: root)
       let operation = await server.imageManager.startImageOperation(
         kind: .pull,
+        reference: "registry.example.com/vm/macos:latest"
+      )
+      let orphaned = await server.imageManager.startImageOperation(
+        kind: .push,
         reference: "registry.example.com/vm/macos:latest"
       )
       let task = server.startImageOperationTask(operation.id) {
@@ -195,7 +199,158 @@ struct APIServerTaskRegistryTests {
       await task.value
 
       let status = try #require(await server.imageManager.getImageOperationStatus(operation.id))
+      let orphanedStatus = try #require(await server.imageManager.getImageOperationStatus(orphaned.id))
       #expect(status.state == .cancelled)
+      #expect(orphanedStatus.state == .cancelled)
+      #expect(server.cancelImageOperationTask(operation.id) == false)
+    }
+  }
+
+  @Test
+  func listImageOperationsDefaultsToActiveOnTypedActionRoutes() async throws {
+    try await withTemporaryDirectory { root in
+      let server = makeTestAPIServer(root: root)
+      let pull = await server.imageManager.startImageOperation(
+        kind: .pull,
+        reference: "registry.example.com/vm/macos:latest"
+      )
+      let push = await server.imageManager.startImageOperation(
+        kind: .push,
+        reference: "registry.example.com/vm/macos:latest"
+      )
+      await server.imageManager.failImageOperation(push.id, error: CancellationError())
+
+      let activeResponse = await server.handleListImagePullOperations(HTTPRequest(
+        method: "GET",
+        path: "/v1/images/pull/operations",
+        headers: [:],
+        body: nil,
+        queryParameters: [:]
+      ))
+      #expect(activeResponse.statusCode == 200)
+      let activeList = try JSONDecoder().decode(ImageOperationListResponse.self, from: #require(activeResponse.body))
+      #expect(activeList.activeOnly)
+      #expect(activeList.total == 1)
+      #expect(activeList.type == "pull")
+      #expect(activeList.operations.map(\.operationId) == [pull.id.uuidString])
+
+      let pushResponse = await server.handleListImagePushOperations(HTTPRequest(
+        method: "GET",
+        path: "/v1/images/push/operations",
+        headers: [:],
+        body: nil,
+        queryParameters: ["activeOnly": "false"]
+      ))
+      #expect(pushResponse.statusCode == 200)
+      let pushList = try JSONDecoder().decode(ImageOperationListResponse.self, from: #require(pushResponse.body))
+      #expect(pushList.activeOnly == false)
+      #expect(pushList.type == "push")
+      #expect(pushList.total == 1)
+      #expect(pushList.operations.map(\.operationId) == [push.id.uuidString])
+    }
+  }
+
+  @Test
+  func cancelImageOperationsCancelsTasksAndOrphanStatuses() async throws {
+    try await withTemporaryDirectory { root in
+      let server = makeTestAPIServer(root: root)
+      let taskBacked = await server.imageManager.startImageOperation(
+        kind: .pull,
+        reference: "registry.example.com/vm/macos:latest"
+      )
+      let orphaned = await server.imageManager.startImageOperation(
+        kind: .pull,
+        reference: "registry.example.com/vm/macos:latest"
+      )
+      let task = server.startImageOperationTask(taskBacked.id) {
+        Task<Void, Never> {
+          do {
+            while true {
+              try await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+          } catch is CancellationError {
+            await server.finishImageOperationTask(taskBacked.id, result: .failure(CancellationError()))
+          } catch {
+            await server.finishImageOperationTask(taskBacked.id, result: .failure(error))
+          }
+        }
+      }
+
+      let response = await server.handleCancelImagePullOperations(HTTPRequest(
+        method: "DELETE",
+        path: "/v1/images/pull/operations",
+        headers: [:],
+        body: nil,
+        queryParameters: [:]
+      ))
+
+      #expect(response.statusCode == 200)
+      #expect(task.isCancelled)
+      let cancelResponse = try JSONDecoder().decode(
+        ImageOperationCancelAllResponse.self,
+        from: #require(response.body)
+      )
+      #expect(cancelResponse.cancelled == 2)
+      #expect(cancelResponse.tasksCancelled == 1)
+      #expect(Set(cancelResponse.operations.map(\.operationId)) == [
+        taskBacked.id.uuidString,
+        orphaned.id.uuidString,
+      ])
+      #expect(cancelResponse.operations.allSatisfy { $0.status == "cancelled" })
+
+      let taskBackedStatus = try #require(await server.imageManager.getImageOperationStatus(taskBacked.id))
+      let orphanedStatus = try #require(await server.imageManager.getImageOperationStatus(orphaned.id))
+      #expect(taskBackedStatus.state == .cancelled)
+      #expect(orphanedStatus.state == .cancelled)
+      #expect(server.cancelImageOperationTask(taskBacked.id) == false)
+    }
+  }
+
+  @Test
+  func imageOperationTypedRoutesGetAndCancelById() async throws {
+    try await withTemporaryDirectory { root in
+      let server = makeTestAPIServer(root: root)
+      let operation = await server.imageManager.startImageOperation(
+        kind: .push,
+        reference: "registry.example.com/vm/macos:latest"
+      )
+      let task = server.startImageOperationTask(operation.id) {
+        Task<Void, Never> {
+          do {
+            while true {
+              try await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+          } catch is CancellationError {
+            await server.finishImageOperationTask(operation.id, result: .failure(CancellationError()))
+          } catch {
+            await server.finishImageOperationTask(operation.id, result: .failure(error))
+          }
+        }
+      }
+
+      let statusResponse = await server.handleGetImagePushOperation(HTTPRequest(
+        method: "GET",
+        path: "/v1/images/push/operations/\(operation.id.uuidString)",
+        headers: [:],
+        body: nil,
+        queryParameters: [:]
+      ))
+      #expect(statusResponse.statusCode == 200)
+      let status = try JSONDecoder().decode(ImageOperationStatusResponse.self, from: #require(statusResponse.body))
+      #expect(status.operationId == operation.id.uuidString)
+      #expect(status.type == "push")
+
+      let cancelResponse = await server.handleCancelImagePushOperation(HTTPRequest(
+        method: "DELETE",
+        path: "/v1/images/push/operations/\(operation.id.uuidString)",
+        headers: [:],
+        body: nil,
+        queryParameters: [:]
+      ))
+      #expect(cancelResponse.statusCode == 200)
+      #expect(task.isCancelled)
+      let cancelled = try JSONDecoder().decode(ImageOperationStatusResponse.self, from: #require(cancelResponse.body))
+      #expect(cancelled.status == "cancelled")
       #expect(server.cancelImageOperationTask(operation.id) == false)
     }
   }

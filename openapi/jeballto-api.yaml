@@ -1258,11 +1258,13 @@ paths:
       summary: Pull image
       description: >
         Pull an OCI image from a registry. If the image already exists locally,
-        returns the existing record without re-pulling. By default this blocks
-        until pull completes. Set `async` to true to start the pull in the
-        background and poll `/images/pull/{operationId}/status`.
-        By default there is no timeout (unlimited). Use the optional `timeout`
-        field to set a limit in seconds.
+        returns the existing record without re-pulling. The request always
+        creates a pull operation record. When `async` is false or omitted, the
+        endpoint blocks until the pull reaches a terminal status and returns
+        the final operation status with `image` populated on success. When
+        `async` is true, the endpoint returns immediately with the started
+        operation status and a `statusUrl`. By default there is no timeout
+        (unlimited). Use the optional `timeout` field to set a limit in seconds.
       operationId: pullImage
       requestBody:
         required: true
@@ -1272,17 +1274,17 @@ paths:
               $ref: '#/components/schemas/PullImageRequest'
       responses:
         '200':
-          description: Image pulled (or already local)
+          description: Pull operation completed
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ImagePullResponse'
+                $ref: '#/components/schemas/ImageOperationStatusResponse'
         '202':
-          description: Image pull started asynchronously
+          description: Pull operation started
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ImagePullResponse'
+                $ref: '#/components/schemas/ImageOperationStatusResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -1304,21 +1306,99 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
-  /images/pull/{operationId}:
+  /images/pull/operations:
+    get:
+      tags:
+        - images
+      summary: List image pull operations
+      description: >
+        List image pull operations. By default this returns only active
+        operations, which is useful when a client lost an operation ID and needs
+        to recover.
+      operationId: listImagePullOperations
+      parameters:
+        - name: activeOnly
+          in: query
+          required: false
+          description: Whether to return only non-terminal operations
+          schema:
+            type: boolean
+            default: true
+      responses:
+        '200':
+          description: Image operation list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImageOperationListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
     delete:
       tags:
         - images
-      summary: Cancel image pull
+      summary: Cancel image pull operations
       description: >
-        Cancel a running asynchronous image pull operation. The request waits
-        for task cleanup and child-process termination before returning the
-        terminal operation status.
-      operationId: cancelImagePull
+        Cancel all currently active image pull operations. The request waits for
+        task cleanup and child-process termination before returning terminal
+        statuses for the operations that were cancelled.
+      operationId: cancelImagePullOperations
+      responses:
+        '200':
+          description: Image pull operations cancelled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImageOperationCancelAllResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /images/pull/operations/{operationId}:
+    get:
+      tags:
+        - images
+      summary: Get image pull operation
+      description: Get status and progress for an image pull operation.
+      operationId: getImagePullOperation
       parameters:
         - $ref: '#/components/parameters/imageOperationId'
       responses:
         '200':
-          description: Image pull cancelled
+          description: Image pull operation status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImageOperationStatusResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      tags:
+        - images
+      summary: Cancel image pull operation
+      description: >
+        Cancel a running image pull operation. The request waits for task
+        cleanup and child-process termination before returning the terminal
+        operation status.
+      operationId: cancelImagePullOperation
+      parameters:
+        - $ref: '#/components/parameters/imageOperationId'
+      responses:
+        '200':
+          description: Image pull operation cancelled
           content:
             application/json:
               schema:
@@ -1338,31 +1418,6 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
-  /images/pull/{operationId}/status:
-    get:
-      tags:
-        - images
-      summary: Get image pull status
-      description: Get progress for an asynchronous image pull operation.
-      operationId: getImagePullStatus
-      parameters:
-        - $ref: '#/components/parameters/imageOperationId'
-      responses:
-        '200':
-          description: Image pull operation status
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ImageOperationStatusResponse'
-        '400':
-          $ref: '#/components/responses/BadRequest'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '404':
-          $ref: '#/components/responses/NotFound'
-        '500':
-          $ref: '#/components/responses/InternalError'
-
   /images/push:
     post:
       tags:
@@ -1373,12 +1428,14 @@ paths:
         Use the `source` field with format 'vm:<uuid>' or 'image:<uuid>'.
         The VM must be stopped before pushing to ensure a consistent disk image.
         A connectivity check is performed before compression begins to fail fast
-        if the registry is unreachable.
-        The bundle is split into zstd-compressed chunks during transfer.
-        By default this blocks until push completes. Set `async` to true to
-        start the push in the background and poll
-        `/images/push/{operationId}/status`. By default there is no timeout
-        (unlimited). Use the optional `timeout` field to set a limit in seconds.
+        if the registry is unreachable. The bundle is split into
+        zstd-compressed chunks during transfer. The request always creates a
+        push operation record. When `async` is false or omitted, the endpoint
+        blocks until the push reaches a terminal status and returns the final
+        operation status with `image` populated on success. When `async` is
+        true, the endpoint returns immediately with the started operation status
+        and a `statusUrl`. By default there is no timeout (unlimited). Use the
+        optional `timeout` field to set a limit in seconds.
       operationId: pushImage
       requestBody:
         required: true
@@ -1388,17 +1445,17 @@ paths:
               $ref: '#/components/schemas/PushImageRequest'
       responses:
         '200':
-          description: Image pushed
+          description: Push operation completed
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ImagePushResponse'
+                $ref: '#/components/schemas/ImageOperationStatusResponse'
         '202':
-          description: Image push started asynchronously
+          description: Push operation started
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ImagePushResponse'
+                $ref: '#/components/schemas/ImageOperationStatusResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -1443,21 +1500,99 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
-  /images/push/{operationId}:
+  /images/push/operations:
+    get:
+      tags:
+        - images
+      summary: List image push operations
+      description: >
+        List image push operations. By default this returns only active
+        operations, which is useful when a client lost an operation ID and needs
+        to recover.
+      operationId: listImagePushOperations
+      parameters:
+        - name: activeOnly
+          in: query
+          required: false
+          description: Whether to return only non-terminal operations
+          schema:
+            type: boolean
+            default: true
+      responses:
+        '200':
+          description: Image operation list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImageOperationListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
     delete:
       tags:
         - images
-      summary: Cancel image push
+      summary: Cancel image push operations
       description: >
-        Cancel a running asynchronous image push operation. The request waits
-        for task cleanup and child-process termination before returning the
-        terminal operation status.
-      operationId: cancelImagePush
+        Cancel all currently active image push operations. The request waits for
+        task cleanup and child-process termination before returning terminal
+        statuses for the operations that were cancelled.
+      operationId: cancelImagePushOperations
+      responses:
+        '200':
+          description: Image push operations cancelled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImageOperationCancelAllResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /images/push/operations/{operationId}:
+    get:
+      tags:
+        - images
+      summary: Get image push operation
+      description: Get status and progress for an image push operation.
+      operationId: getImagePushOperation
       parameters:
         - $ref: '#/components/parameters/imageOperationId'
       responses:
         '200':
-          description: Image push cancelled
+          description: Image push operation status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImageOperationStatusResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      tags:
+        - images
+      summary: Cancel image push operation
+      description: >
+        Cancel a running image push operation. The request waits for task
+        cleanup and child-process termination before returning the terminal
+        operation status.
+      operationId: cancelImagePushOperation
+      parameters:
+        - $ref: '#/components/parameters/imageOperationId'
+      responses:
+        '200':
+          description: Image push operation cancelled
           content:
             application/json:
               schema:
@@ -1474,31 +1609,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-        '500':
-          $ref: '#/components/responses/InternalError'
-
-  /images/push/{operationId}/status:
-    get:
-      tags:
-        - images
-      summary: Get image push status
-      description: Get progress for an asynchronous image push operation.
-      operationId: getImagePushStatus
-      parameters:
-        - $ref: '#/components/parameters/imageOperationId'
-      responses:
-        '200':
-          description: Image push operation status
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ImageOperationStatusResponse'
-        '400':
-          $ref: '#/components/responses/BadRequest'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '404':
-          $ref: '#/components/responses/NotFound'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -2502,11 +2612,11 @@ components:
           example: 3600
         async:
           type: boolean
-          nullable: true
           default: false
           description: >
-            When true, return immediately with an operation ID and run the pull
-            in the background.
+            When true, return immediately after creating the pull operation.
+            When false or omitted, wait for completion and return the final
+            operation status.
 
     PushImageRequest:
       type: object
@@ -2536,11 +2646,11 @@ components:
           example: 7200
         async:
           type: boolean
-          nullable: true
           default: false
           description: >
-            When true, return immediately with an operation ID and run the push
-            in the background.
+            When true, return immediately after creating the push operation.
+            When false or omitted, wait for completion and return the final
+            operation status.
 
     RegistryLoginRequest:
       type: object
@@ -2635,76 +2745,55 @@ components:
           nullable: true
           description: Number of results skipped
 
-    ImagePullResponse:
+    ImageOperationListResponse:
       type: object
       required:
-        - reference
-        - status
+        - operations
+        - total
+        - activeOnly
       properties:
-        reference:
-          type: string
-          description: OCI image reference
-        status:
-          type: string
-          description: Pull status
-          example: completed
-        digest:
-          type: string
-          nullable: true
-          description: Image digest
-        image:
-          $ref: '#/components/schemas/ImageResponse'
-        message:
+        operations:
+          type: array
+          items:
+            $ref: '#/components/schemas/ImageOperationStatusResponse'
+        total:
+          type: integer
+          description: Number of operations returned
+        activeOnly:
+          type: boolean
+          description: Whether the response was filtered to active operations
+        type:
           type: string
           nullable: true
-          description: Status message
-        operationId:
-          type: string
-          format: uuid
-          nullable: true
-          description: Async operation ID, present when `async` is true
-        statusUrl:
-          type: string
-          nullable: true
-          description: Relative URL for polling async operation status
+          enum:
+            - pull
+            - push
+          description: Operation type filter, when provided
 
-    ImagePushResponse:
+    ImageOperationCancelAllResponse:
       type: object
       required:
-        - reference
-        - status
+        - cancelled
+        - tasksCancelled
+        - operations
       properties:
-        reference:
-          type: string
-          description: OCI image reference
-        status:
-          type: string
-          description: Push status
-          example: completed
-        digest:
-          type: string
-          nullable: true
-          description: Image digest
-        image:
-          $ref: '#/components/schemas/ImageResponse'
-        message:
-          type: string
-          nullable: true
-          description: Status message
-        operationId:
-          type: string
-          format: uuid
-          nullable: true
-          description: Async operation ID, present when `async` is true
-        statusUrl:
-          type: string
-          nullable: true
-          description: Relative URL for polling async operation status
+        cancelled:
+          type: integer
+          description: Number of active operations moved to cancellation
+        tasksCancelled:
+          type: integer
+          description: Number of in-memory async tasks cancelled and awaited
+        operations:
+          type: array
+          items:
+            $ref: '#/components/schemas/ImageOperationStatusResponse'
+          description: Terminal statuses for operations cancelled by the request
 
     ImageOperationStatusResponse:
       type: object
       required:
         - operationId
+        - statusUrl
         - type
         - reference
         - status
@@ -2717,6 +2806,9 @@ components:
           type: string
           format: uuid
           description: Async image operation identifier
+        statusUrl:
+          type: string
+          description: Relative URL for polling this operation status
         type:
           type: string
           enum:

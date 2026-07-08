@@ -248,6 +248,13 @@ actor ImageManager {
     await operationTracker.get(operationId)
   }
 
+  func listImageOperationStatuses(
+    kind: ImageOperationKind? = nil,
+    activeOnly: Bool = false
+  ) async -> [ImageOperationStatus] {
+    await operationTracker.list(kind: kind, activeOnly: activeOnly)
+  }
+
   func claimImageExport(_ id: UUID) throws -> UUID {
     guard !deletingImageIds.contains(id) else {
       throw ImageManagerError.imageInUse("Image \(id.uuidString) is being deleted")

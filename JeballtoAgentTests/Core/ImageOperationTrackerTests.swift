@@ -34,10 +34,14 @@ struct ImageOperationTrackerTests {
     await tracker.complete(started.id, record: record)
 
     let completed = try #require(await tracker.get(started.id))
+    let response = ImageOperationStatusResponse(from: completed)
     #expect(completed.state == .completed)
     #expect(completed.progress == 1.0)
     #expect(completed.digest == record.digest)
     #expect(completed.image == record)
+    #expect(response.status == "completed")
+    #expect(response.statusUrl == "/v1/images/pull/operations/\(started.id.uuidString)")
+    #expect(response.image?.id == record.id.uuidString)
   }
 
   @Test
@@ -70,6 +74,7 @@ struct ImageOperationTrackerTests {
     let object = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
 
     #expect(response.progress == 0.07)
+    #expect(response.statusUrl == "/v1/images/pull/operations/\(started.id.uuidString)")
     #expect(object["message"] == nil)
     #expect(object["phase"] == nil)
     #expect(object["phaseProgress"] == nil)
@@ -205,6 +210,39 @@ struct ImageOperationTrackerTests {
     let status = try #require(await tracker.get(started.id))
     #expect(status.state == .cancelled)
     #expect(status.digest == nil)
+  }
+
+  @Test
+  func completionAfterCancellationRequestDoesNotWinRace() async throws {
+    let tracker = ImageOperationTracker()
+    let started = await tracker.start(kind: .pull, reference: "registry.example.com/vm/macos:latest")
+    let record = ImageRecord(
+      reference: "registry.example.com/vm/macos:latest",
+      digest: "sha256:\(String(repeating: "c", count: 64))",
+      localPath: "/tmp/image.bundle"
+    )
+
+    await tracker.cancel(started.id)
+    await tracker.complete(started.id, record: record)
+
+    let cancelled = try #require(await tracker.get(started.id))
+    #expect(cancelled.state == .cancelled)
+    #expect(cancelled.digest == nil)
+    #expect(cancelled.completedAt != nil)
+  }
+
+  @Test
+  func listFiltersByTypeAndActiveState() async throws {
+    let tracker = ImageOperationTracker()
+    let pull = await tracker.start(kind: .pull, reference: "registry.example.com/vm/macos:latest")
+    let push = await tracker.start(kind: .push, reference: "registry.example.com/vm/macos:latest")
+    await tracker.fail(push.id, error: CancellationError())
+
+    let active = await tracker.list(activeOnly: true)
+    #expect(active.map(\.id) == [pull.id])
+
+    let pushes = await tracker.list(kind: .push, activeOnly: false)
+    #expect(pushes.map(\.id) == [push.id])
   }
 
   @Test
