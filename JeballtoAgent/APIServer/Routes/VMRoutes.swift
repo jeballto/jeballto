@@ -192,7 +192,7 @@ extension APIServer {
     }
 
     do {
-      await cancelAllImageOperationTasks()
+      await cancelActiveImageOperations()
       let (deleted, failed, errors) = try await vmManager.wipeAllVMs()
       let response = WipeAllResponse(deleted: deleted, failed: failed, errors: errors.isEmpty ? nil : errors)
       return HTTPResponse.json(response)

@@ -4,10 +4,6 @@ import Testing
 
 @Suite(.tags(.core))
 struct AsyncProcessRunnerTests {
-  private enum TestError: Error {
-    case afterLaunchFailed
-  }
-
   @Test
   func drainsStdoutAndStderrConcurrently() async throws {
     let process = Process()
@@ -69,7 +65,7 @@ struct AsyncProcessRunnerTests {
   func cancellationTerminatesProcessAndThrowsCancellation() async throws {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/bin/sh")
-    process.arguments = ["-c", "sleep 5"]
+    process.arguments = ["-c", "sleep 30"]
 
     let stdoutPipe = Pipe()
     let stderrPipe = Pipe()
@@ -82,50 +78,62 @@ struct AsyncProcessRunnerTests {
         stdoutPipe: stdoutPipe,
         stderrPipe: stderrPipe,
         options: AsyncProcessRunnerOptions(
-          timeout: 10,
+          timeout: nil,
           timeoutDescription: "sleep",
           maxOutputSize: 1024
         )
       )
     }
-    try await Task.sleep(nanoseconds: 50_000_000)
+
+    while !process.isRunning {
+      try await Task.sleep(nanoseconds: 1_000_000)
+    }
     task.cancel()
 
     await #expect(throws: CancellationError.self) {
-      try await task.value
+      _ = try await task.value
     }
-    #expect(!process.isRunning)
+    let processStopped = await waitUntilProcessStops(process)
+    #expect(processStopped)
   }
 
   @Test
   func afterLaunchFailureTerminatesProcess() async throws {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/bin/sh")
-    process.arguments = ["-c", "sleep 5"]
+    process.arguments = ["-c", "sleep 30"]
 
     let stdoutPipe = Pipe()
     let stderrPipe = Pipe()
     process.standardOutput = stdoutPipe
     process.standardError = stderrPipe
 
-    await #expect(throws: TestError.self) {
-      try await AsyncProcessRunner.run(
+    await #expect(throws: TestAfterLaunchError.self) {
+      _ = try await AsyncProcessRunner.run(
         process: process,
         stdoutPipe: stdoutPipe,
         stderrPipe: stderrPipe,
         options: AsyncProcessRunnerOptions(
-          timeout: 10,
+          timeout: nil,
           timeoutDescription: "sleep",
           maxOutputSize: 1024
         ),
-        afterLaunch: { _ in
-          throw TestError.afterLaunchFailed
-        }
+        afterLaunch: { _ in throw TestAfterLaunchError() }
       )
     }
-    let processStopped = await waitUntil {
-      !process.isRunning
-    }
+    let processStopped = await waitUntilProcessStops(process)
     #expect(processStopped)
   }
+}
+
+private struct TestAfterLaunchError: Error {}
+
+private func waitUntilProcessStops(_ process: Process) async -> Bool {
+  for _ in 0 ..< 100 {
+    if !process.isRunning {
+      return true
+    }
+    try? await Task.sleep(nanoseconds: 10_000_000)
+  }
+  return false
 }

@@ -162,6 +162,15 @@ actor ImageOperationTracker {
   func complete(_ id: UUID, record: ImageRecord) {
     guard var status = operations[id], status.state.isTerminal == false else { return }
     let now = Date()
+    if status.state == .cancelling {
+      status.state = .cancelled
+      status.error = CancellationError().localizedDescription
+      status.updatedAt = now
+      status.completedAt = now
+      operations[id] = status
+      trimCompletedOperationsIfNeeded()
+      return
+    }
     status.state = .completed
     status.progress = 1.0
     status.digest = record.digest
@@ -198,6 +207,14 @@ actor ImageOperationTracker {
 
   func get(_ id: UUID) -> ImageOperationStatus? {
     operations[id]
+  }
+
+  func list(kind: ImageOperationKind? = nil, activeOnly: Bool = false) -> [ImageOperationStatus] {
+    operations.values
+      .filter { status in
+        (kind == nil || status.kind == kind) && (!activeOnly || status.state.isTerminal == false)
+      }
+      .sorted { $0.startedAt > $1.startedAt }
   }
 
   func hasActiveOperation(source: String) -> Bool {

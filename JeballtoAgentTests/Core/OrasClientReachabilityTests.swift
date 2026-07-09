@@ -32,6 +32,29 @@ private class StubURLProtocol: URLProtocol {
   override func stopLoading() {}
 }
 
+private func waitForPid(atPath path: String) async throws -> pid_t {
+  for _ in 0 ..< 200 {
+    if let text = try? String(contentsOfFile: path, encoding: .utf8),
+       let pid = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines))
+    {
+      return pid
+    }
+    try await Task.sleep(nanoseconds: 5_000_000)
+  }
+  Issue.record("Timed out waiting for pid file")
+  throw CancellationError()
+}
+
+private func waitUntilProcessStops(_ pid: pid_t) async throws {
+  for _ in 0 ..< 200 {
+    if kill(pid, 0) == -1 {
+      return
+    }
+    try await Task.sleep(nanoseconds: 5_000_000)
+  }
+  Issue.record("Process \(pid) was still running")
+}
+
 private func makeStubSession() -> URLSession {
   let config = URLSessionConfiguration.ephemeral
   config.protocolClasses = [StubURLProtocol.self]
@@ -180,20 +203,20 @@ struct OrasClientReachabilityTests {
   }
 
   @Test
-  func fetchBlobCancellationTerminatesOrasProcess() async throws {
+  func fetchBlobCancellationTerminatesOrasProcessAndPreservesExistingOutput() async throws {
     try await withTemporaryDirectory(prefix: "oras-blob-cancel") { root in
-      let orasPath = "\(root)/oras"
-      let pidPath = "\(root)/oras.pid"
-      let outputPath = "\(root)/blob"
+      let orasPath = (root as NSString).appendingPathComponent("oras")
+      let outputPath = (root as NSString).appendingPathComponent("blob.zst")
+      let pidPath = (root as NSString).appendingPathComponent("oras.pid")
+      let existing = Data("existing blob\n".utf8)
+      try existing.write(to: URL(fileURLWithPath: outputPath))
       let script = """
       #!/bin/sh
-      echo $$ > "\(pidPath)"
+      echo "$$" > "\(pidPath)"
       sleep 30
       """
       try script.write(toFile: orasPath, atomically: true, encoding: .utf8)
       try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: orasPath)
-      let existingOutput = Data("existing blob".utf8)
-      try existingOutput.write(to: URL(fileURLWithPath: outputPath))
 
       let client = OrasClient(config: ImageConfig(
         imageStorageDir: root,
@@ -201,31 +224,23 @@ struct OrasClientReachabilityTests {
         defaultRegistry: nil,
         insecureRegistries: []
       ))
-      let reference = try ImageReference.parse("registry.example.com/repo:tag")
       let task = Task {
         try await client.fetchBlob(
-          reference: reference,
-          digest: "sha256:\(String(repeating: "a", count: 64))",
+          reference: ImageReference.parse("registry.example.com/repo:tag"),
+          digest: "sha256:\(String(repeating: "1", count: 64))",
           outputPath: outputPath
         )
       }
-      let processStarted = await waitUntil {
-        FileManager.default.fileExists(atPath: pidPath)
-      }
-      try #require(processStarted)
 
+      let pid = try await waitForPid(atPath: pidPath)
       task.cancel()
 
       await #expect(throws: CancellationError.self) {
         try await task.value
       }
-      let pidText = try String(contentsOfFile: pidPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
-      let pid = try #require(Int32(pidText))
-      let processStopped = await waitUntil {
-        kill(pid, 0) == -1
-      }
-      #expect(processStopped)
-      #expect(try Data(contentsOf: URL(fileURLWithPath: outputPath)) == existingOutput)
+      try await waitUntilProcessStops(pid)
+      let output = try Data(contentsOf: URL(fileURLWithPath: outputPath))
+      #expect(output == existing)
     }
   }
 

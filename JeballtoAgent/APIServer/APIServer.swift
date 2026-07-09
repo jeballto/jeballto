@@ -219,6 +219,38 @@ class APIServer {
       return await self?.handleListImages(request) ?? Self.serverUnavailableError
     }
 
+    httpServer.get("/v1/images/pull/operations") { [weak self] request in
+      return await self?.handleListImagePullOperations(request) ?? Self.serverUnavailableError
+    }
+
+    httpServer.delete("/v1/images/pull/operations") { [weak self] request in
+      return await self?.handleCancelImagePullOperations(request) ?? Self.serverUnavailableError
+    }
+
+    httpServer.get("/v1/images/pull/operations/{id}") { [weak self] request in
+      return await self?.handleGetImagePullOperation(request) ?? Self.serverUnavailableError
+    }
+
+    httpServer.delete("/v1/images/pull/operations/{id}") { [weak self] request in
+      return await self?.handleCancelImagePullOperation(request) ?? Self.serverUnavailableError
+    }
+
+    httpServer.get("/v1/images/push/operations") { [weak self] request in
+      return await self?.handleListImagePushOperations(request) ?? Self.serverUnavailableError
+    }
+
+    httpServer.delete("/v1/images/push/operations") { [weak self] request in
+      return await self?.handleCancelImagePushOperations(request) ?? Self.serverUnavailableError
+    }
+
+    httpServer.get("/v1/images/push/operations/{id}") { [weak self] request in
+      return await self?.handleGetImagePushOperation(request) ?? Self.serverUnavailableError
+    }
+
+    httpServer.delete("/v1/images/push/operations/{id}") { [weak self] request in
+      return await self?.handleCancelImagePushOperation(request) ?? Self.serverUnavailableError
+    }
+
     httpServer.get("/v1/images/{id}") { [weak self] request in
       return await self?.handleGetImage(request) ?? Self.serverUnavailableError
     }
@@ -235,24 +267,8 @@ class APIServer {
       return await self?.handlePullImage(request) ?? Self.serverUnavailableError
     }
 
-    httpServer.get("/v1/images/pull/{id}/status") { [weak self] request in
-      return await self?.handleGetImagePullStatus(request) ?? Self.serverUnavailableError
-    }
-
-    httpServer.delete("/v1/images/pull/{id}") { [weak self] request in
-      return await self?.handleCancelImagePull(request) ?? Self.serverUnavailableError
-    }
-
     httpServer.post("/v1/images/push") { [weak self] request in
       return await self?.handlePushImage(request) ?? Self.serverUnavailableError
-    }
-
-    httpServer.get("/v1/images/push/{id}/status") { [weak self] request in
-      return await self?.handleGetImagePushStatus(request) ?? Self.serverUnavailableError
-    }
-
-    httpServer.delete("/v1/images/push/{id}") { [weak self] request in
-      return await self?.handleCancelImagePush(request) ?? Self.serverUnavailableError
     }
 
     httpServer.post("/v1/registries/login") { [weak self] request in
@@ -421,15 +437,23 @@ class APIServer {
 
   @discardableResult
   func cancelAndWaitImageOperationTask(_ operationId: UUID) async -> Bool {
-    let task: Task<Void, Never>?
-    stateLock.lock()
-    task = _imageOperationTasks.removeValue(forKey: operationId)
-    stateLock.unlock()
-
-    guard let task else { return false }
+    guard let task = drainImageOperationTask(operationId) else { return false }
     task.cancel()
     await task.value
     return true
+  }
+
+  @discardableResult
+  func cancelAndWaitImageOperationTasks(_ operationIds: Set<UUID>) async -> Int {
+    let tasks = drainImageOperationTasks(operationIds: operationIds)
+
+    for task in tasks.values {
+      task.cancel()
+    }
+    for task in tasks.values {
+      await task.value
+    }
+    return tasks.count
   }
 
   @discardableResult
@@ -453,6 +477,24 @@ class APIServer {
     defer { stateLock.unlock() }
     let tasks = _imageOperationTasks
     _imageOperationTasks.removeAll()
+    return tasks
+  }
+
+  private func drainImageOperationTask(_ operationId: UUID) -> Task<Void, Never>? {
+    stateLock.lock()
+    defer { stateLock.unlock() }
+    return _imageOperationTasks.removeValue(forKey: operationId)
+  }
+
+  private func drainImageOperationTasks(operationIds: Set<UUID>) -> [UUID: Task<Void, Never>] {
+    stateLock.lock()
+    defer { stateLock.unlock() }
+    var tasks: [UUID: Task<Void, Never>] = [:]
+    for operationId in operationIds {
+      if let task = _imageOperationTasks.removeValue(forKey: operationId) {
+        tasks[operationId] = task
+      }
+    }
     return tasks
   }
 

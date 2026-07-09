@@ -248,6 +248,13 @@ actor ImageManager {
     await operationTracker.get(operationId)
   }
 
+  func listImageOperationStatuses(
+    kind: ImageOperationKind? = nil,
+    activeOnly: Bool = false
+  ) async -> [ImageOperationStatus] {
+    await operationTracker.list(kind: kind, activeOnly: activeOnly)
+  }
+
   func claimImageExport(_ id: UUID) throws -> UUID {
     guard !deletingImageIds.contains(id) else {
       throw ImageManagerError.imageInUse("Image \(id.uuidString) is being deleted")
@@ -458,6 +465,25 @@ actor ImageManager {
     }
   }
 
+  /// Checks that a push destination reference is valid and its registry is reachable.
+  func checkPushDestinationReachable(reference: String) async throws {
+    let parsed: ImageReference
+    do {
+      parsed = try ImageReference.parse(reference)
+    } catch {
+      throw ImageManagerError.invalidReference(error.localizedDescription)
+    }
+
+    let insecure = parsed.isInsecureAllowed(insecureRegistries: config.images.insecureRegistries)
+    do {
+      try await orasClient.checkRegistryReachable(registryHost: parsed.registry, insecure: insecure)
+    } catch {
+      throw ImageManagerError.registryUnreachable(
+        "Cannot reach registry \(parsed.registry): \(error.localizedDescription)"
+      )
+    }
+  }
+
   // MARK: - Delete
 
   func deleteImage(id: UUID) async throws {
@@ -482,8 +508,10 @@ actor ImageManager {
 
     logInfo("Deleting image \(id): \(record.reference)", category: "ImageManager")
 
-    // Only remove local files if this image owns them (not a VM bundle or shared path)
-    let isSharedPath = record.metadata["sourceType"] == "vm" || record.metadata["sourceImageId"] != nil
+    // Legacy pushed records may point at source VM or image paths. New pushed records set ownsLocalPath=true.
+    let ownsLocalPath = record.metadata["ownsLocalPath"] == "true"
+    let isSharedPath = !ownsLocalPath &&
+      (record.metadata["sourceType"] == "vm" || record.metadata["sourceImageId"] != nil)
     if !isSharedPath, FileManager.default.fileExists(atPath: record.localPath) {
       do {
         try FileManager.default.removeItem(atPath: record.localPath)
@@ -623,15 +651,19 @@ actor ImageManager {
     )
 
     let imageId = UUID()
+    let localDir = "\(config.images.imageStorageDir)/\(imageId.uuidString).bundle"
+    try copyBundleForImageRecord(from: vmBundlePath, to: localDir)
     let record = ImageRecord(
       id: imageId,
       reference: parsed.fullReference,
       digest: pushResult.digest,
-      localPath: vmBundlePath,
-      size: directorySize(atPath: vmBundlePath),
+      localPath: localDir,
+      size: directorySize(atPath: localDir),
       pushedAt: Date(),
       metadata: [
         "sourceType": "vm",
+        "sourceVmBundlePath": vmBundlePath,
+        "ownsLocalPath": "true",
         "imageFormat": "chunked-zstd",
         "artifactType": jeballtoImageArtifactType,
         "compression": "zstd",
@@ -639,7 +671,19 @@ actor ImageManager {
       ]
     )
 
-    try await imageStore.addImage(record)
+    let storedRecord: ImageRecord
+    do {
+      storedRecord = try await imageStore.addImageIfReferenceAbsent(record)
+    } catch {
+      try? FileManager.default.removeItem(atPath: localDir)
+      throw error
+    }
+    if storedRecord.id != record.id {
+      try? FileManager.default.removeItem(atPath: localDir)
+      eventBus.publish(.imagePushed(reference: parsed.fullReference))
+      logInfo("Image already registered after push: \(parsed.fullReference)", category: "ImageManager")
+      return storedRecord
+    }
 
     eventBus.publish(.imagePushed(reference: parsed.fullReference))
     logInfo("Image pushed: \(parsed.fullReference) (digest: \(pushResult.digest))", category: "ImageManager")
@@ -671,16 +715,19 @@ actor ImageManager {
     )
 
     let newId = UUID()
+    let localDir = "\(config.images.imageStorageDir)/\(newId.uuidString).bundle"
+    try copyBundleForImageRecord(from: existing.localPath, to: localDir)
     let record = ImageRecord(
       id: newId,
       reference: parsed.fullReference,
       digest: pushResult.digest,
-      localPath: existing.localPath,
-      size: existing.size,
+      localPath: localDir,
+      size: directorySize(atPath: localDir),
       pulledAt: existing.pulledAt,
       pushedAt: Date(),
       metadata: [
         "sourceImageId": sourceImageId.uuidString,
+        "ownsLocalPath": "true",
         "imageFormat": "chunked-zstd",
         "artifactType": jeballtoImageArtifactType,
         "compression": "zstd",
@@ -688,7 +735,19 @@ actor ImageManager {
       ]
     )
 
-    try await imageStore.addImage(record)
+    let storedRecord: ImageRecord
+    do {
+      storedRecord = try await imageStore.addImageIfReferenceAbsent(record)
+    } catch {
+      try? FileManager.default.removeItem(atPath: localDir)
+      throw error
+    }
+    if storedRecord.id != record.id {
+      try? FileManager.default.removeItem(atPath: localDir)
+      eventBus.publish(.imagePushed(reference: parsed.fullReference))
+      logInfo("Image already registered after re-push: \(parsed.fullReference)", category: "ImageManager")
+      return storedRecord
+    }
 
     eventBus.publish(.imagePushed(reference: parsed.fullReference))
     logInfo("Image re-pushed: \(parsed.fullReference) (digest: \(pushResult.digest))", category: "ImageManager")
@@ -1222,6 +1281,19 @@ actor ImageManager {
       try FileManager.default.removeItem(atPath: destinationPath)
     }
     try FileManager.default.copyItem(atPath: sourcePath, toPath: destinationPath)
+  }
+
+  private func copyBundleForImageRecord(from sourcePath: String, to destinationPath: String) throws {
+    let parent = (destinationPath as NSString).deletingLastPathComponent
+    try FileManager.default.createDirectory(atPath: parent, withIntermediateDirectories: true)
+    if FileManager.default.fileExists(atPath: destinationPath) {
+      try FileManager.default.removeItem(atPath: destinationPath)
+    }
+    do {
+      try FileManager.default.copyItem(atPath: sourcePath, toPath: destinationPath)
+    } catch {
+      throw ImageManagerError.pushFailed("Failed to create local image copy at \(destinationPath): \(error)")
+    }
   }
 
   private nonisolated static func fileSize(atPath path: String) throws -> UInt64 {
