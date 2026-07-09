@@ -391,6 +391,12 @@ extension APIServer {
       case .vm:
         let vmDefinition = try await vmManager.getVM(sourceUUID)
         let exportToken = try await vmManager.claimImageExport(sourceUUID)
+        do {
+          try await imageManager.checkPushDestinationReachable(reference: reference)
+        } catch {
+          await vmManager.releaseImageExport(sourceUUID, token: exportToken)
+          throw error
+        }
         let vmBundlePath = vmDefinition.paths.bundlePath
         operation = await imageManager.startImageOperation(kind: .push, reference: reference, source: source)
         let operationId = operation.id
@@ -422,6 +428,7 @@ extension APIServer {
         let exportToken = try await imageManager.claimImageExport(sourceUUID)
         do {
           _ = try await imageManager.getImage(id: sourceUUID)
+          try await imageManager.checkPushDestinationReachable(reference: reference)
           operation = await imageManager.startImageOperation(kind: .push, reference: reference, source: source)
         } catch {
           await imageManager.releaseImageExport(sourceUUID, token: exportToken)

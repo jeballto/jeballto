@@ -192,6 +192,43 @@ struct APIServerImageOperationRouteTests {
       try await server.vmManager.deleteVM(definition.id)
     }
   }
+
+  @Test
+  func asyncPushFailsBeforeOperationCreationWhenRegistryPreflightFails() async throws {
+    try await withTemporaryDirectory { root in
+      let registryPort = UInt16.random(in: 28000 ... 30000)
+      let registryHost = "127.0.0.1:\(registryPort)"
+      let registryServer = SimpleHTTPServer(port: registryPort, host: "127.0.0.1")
+      registryServer.get("/v2/") { _ in HTTPResponse(statusCode: 500) }
+      try registryServer.start()
+      defer { registryServer.stop() }
+      try await Task.sleep(nanoseconds: 50_000_000)
+
+      let server = makeTestAPIServer(root: root) { config in
+        config.images = ImageConfig(
+          imageStorageDir: config.images.imageStorageDir,
+          orasPath: "/usr/bin/false",
+          defaultRegistry: nil,
+          insecureRegistries: [registryHost]
+        )
+      }
+      let definition = try await server.vmManager.createVM(name: "push-preflight-vm", resources: .default)
+      let body = Data(
+        #"{"source":"vm:\#(definition.id.uuidString)","reference":"\#(registryHost)/repo:tag","async":true}"#.utf8
+      )
+
+      let response = await server.handlePushImage(
+        HTTPRequest(method: "POST", path: "/v1/images/push", headers: [:], body: body, queryParameters: [:])
+      )
+      let error = try decodedError(response)
+      let operations = await server.imageManager.listImageOperationStatuses(kind: .push, activeOnly: false)
+
+      #expect(response.statusCode == 503)
+      #expect(error.error.code == "IMAGE_PUSH_FAILED")
+      #expect(operations.isEmpty)
+      try await server.vmManager.deleteVM(definition.id)
+    }
+  }
 }
 
 private func waitForPid(atPath path: String) async throws -> pid_t {

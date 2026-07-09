@@ -3,7 +3,7 @@ import Foundation
 import Testing
 @testable import JeballtoAgent
 
-@Suite(.tags(.core))
+@Suite(.tags(.core), .serialized)
 struct ImageManagerCleanupTests {
   @Test
   func startupCleanupRemovesStaleImageStorageArtifacts() throws {
@@ -125,6 +125,117 @@ struct ImageManagerCleanupTests {
       #expect(imageConfig.maxParallelImageDiskWrites == 2)
       #expect(imageConfig.insecureRegistries == ["registry.example.com"])
       #expect(imageConfig.orasPath == "\(root)/oras")
+    }
+  }
+
+  @Test
+  func pushedImageRecordsOwnDurableLocalCopiesAndReuseReference() async throws {
+    try await withTemporaryDirectory(prefix: "image-manager-push-record") { root in
+      let registryPort = UInt16.random(in: 28000 ... 30000)
+      let registryHost = "127.0.0.1:\(registryPort)"
+      let registryServer = SimpleHTTPServer(port: registryPort, host: "127.0.0.1")
+      registryServer.get("/v2/") { _ in HTTPResponse(statusCode: 200) }
+      try registryServer.start()
+      defer { registryServer.stop() }
+      try await Task.sleep(nanoseconds: 50_000_000)
+
+      let orasPath = "\(root)/oras"
+      let zstdPath = "\(root)/zstd"
+      try makeFakeOras(at: orasPath)
+      try makeFakeZstd(at: zstdPath)
+
+      let bundlePath = "\(root)/source.bundle"
+      try makeFakeBundle(at: bundlePath)
+
+      var config = Config.default
+      config.images = ImageConfig(
+        imageStorageDir: "\(root)/images",
+        orasPath: orasPath,
+        zstdPath: zstdPath,
+        defaultRegistry: nil,
+        insecureRegistries: [registryHost]
+      )
+      config.storage.imageIndexPath = "\(root)/images.json"
+      let manager = ImageManager(
+        imageStore: ImageStore(storagePath: config.images.imageStorageDir, indexPath: config.storage.imageIndexPath),
+        orasClient: OrasClient(config: config.images),
+        eventBus: EventBus(),
+        config: config
+      )
+      let reference = "\(registryHost)/repo:tag"
+
+      let first = try await manager.pushImageFromVM(reference: reference, vmBundlePath: bundlePath, timeout: 5)
+      let second = try await manager.pushImageFromVM(reference: reference, vmBundlePath: bundlePath, timeout: 5)
+      let images = await manager.listImages()
+
+      #expect(first.id == second.id)
+      #expect(images.count == 1)
+      #expect(first.localPath != bundlePath)
+      #expect(FileManager.default.fileExists(atPath: first.localPath))
+
+      try FileManager.default.removeItem(atPath: bundlePath)
+      try ImageManager.validateRunnableVMBundle(atPath: first.localPath)
+
+      try await manager.deleteImage(id: first.id)
+      #expect(FileManager.default.fileExists(atPath: first.localPath) == false)
+    }
+  }
+
+  @Test
+  func repushedImageRecordSurvivesSourceImageDeletion() async throws {
+    try await withTemporaryDirectory(prefix: "image-manager-repush-record") { root in
+      let registryPort = UInt16.random(in: 28000 ... 30000)
+      let registryHost = "127.0.0.1:\(registryPort)"
+      let registryServer = SimpleHTTPServer(port: registryPort, host: "127.0.0.1")
+      registryServer.get("/v2/") { _ in HTTPResponse(statusCode: 200) }
+      try registryServer.start()
+      defer { registryServer.stop() }
+      try await Task.sleep(nanoseconds: 50_000_000)
+
+      let orasPath = "\(root)/oras"
+      let zstdPath = "\(root)/zstd"
+      try makeFakeOras(at: orasPath)
+      try makeFakeZstd(at: zstdPath)
+
+      let bundlePath = "\(root)/source.bundle"
+      try makeFakeBundle(at: bundlePath)
+
+      var config = Config.default
+      config.images = ImageConfig(
+        imageStorageDir: "\(root)/images",
+        orasPath: orasPath,
+        zstdPath: zstdPath,
+        defaultRegistry: nil,
+        insecureRegistries: [registryHost]
+      )
+      config.storage.imageIndexPath = "\(root)/images.json"
+      let manager = ImageManager(
+        imageStore: ImageStore(storagePath: config.images.imageStorageDir, indexPath: config.storage.imageIndexPath),
+        orasClient: OrasClient(config: config.images),
+        eventBus: EventBus(),
+        config: config
+      )
+
+      let source = try await manager.pushImageFromVM(
+        reference: "\(registryHost)/repo:source",
+        vmBundlePath: bundlePath,
+        timeout: 5
+      )
+      let repushed = try await manager.pushImage(
+        reference: "\(registryHost)/repo:repushed",
+        imageId: source.id,
+        timeout: 5
+      )
+
+      #expect(repushed.localPath != source.localPath)
+      #expect(FileManager.default.fileExists(atPath: repushed.localPath))
+
+      try await manager.deleteImage(id: source.id)
+      try ImageManager.validateRunnableVMBundle(atPath: repushed.localPath)
+      #expect(FileManager.default.fileExists(atPath: source.localPath) == false)
+
+      try await manager.deleteImage(id: repushed.id)
+      #expect(FileManager.default.fileExists(atPath: repushed.localPath) == false)
     }
   }
 
@@ -393,6 +504,57 @@ private actor AsyncTestSignal {
       continuations.append(continuation)
     }
   }
+}
+
+private func makeFakeOras(at path: String) throws {
+  let script = """
+  #!/bin/sh
+  if [ "$1" = "blob" ] && [ "$2" = "fetch" ]; then
+    echo "404 not found" >&2
+    exit 1
+  fi
+  if [ "$1" = "blob" ] && [ "$2" = "push" ]; then
+    exit 0
+  fi
+  if [ "$1" = "manifest" ] && [ "$2" = "push" ]; then
+    printf '{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":1}\\n'
+    exit 0
+  fi
+  exit 0
+  """
+  try script.write(toFile: path, atomically: true, encoding: .utf8)
+  try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path)
+}
+
+private func makeFakeZstd(at path: String) throws {
+  let script = """
+  #!/bin/sh
+  output=""
+  previous=""
+  for argument in "$@"; do
+    if [ "$previous" = "-o" ]; then
+      output="$argument"
+      break
+    fi
+    previous="$argument"
+  done
+  if [ -z "$output" ]; then
+    exit 1
+  fi
+  mkdir -p "$(dirname "$output")"
+  cat > "$output"
+  """
+  try script.write(toFile: path, atomically: true, encoding: .utf8)
+  try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path)
+}
+
+private func makeFakeBundle(at path: String) throws {
+  try FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
+  try Data("aux".utf8).write(to: URL(fileURLWithPath: "\(path)/AuxiliaryStorage"))
+  try Data("hardware".utf8).write(to: URL(fileURLWithPath: "\(path)/HardwareModel"))
+  try Data("machine".utf8).write(to: URL(fileURLWithPath: "\(path)/MachineIdentifier"))
+  try Data(repeating: 0x41, count: 4096).write(to: URL(fileURLWithPath: "\(path)/Disk.img"))
+  try Data(path.utf8).write(to: URL(fileURLWithPath: "\(path)/FixtureIdentity"))
 }
 
 private actor BlobCacheRecorder {

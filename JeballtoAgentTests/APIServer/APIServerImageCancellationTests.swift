@@ -45,10 +45,38 @@ struct APIServerImageCancellationTests {
         queryParameters: [:]
       ))
       #expect(cancelResponse.statusCode == 200)
-      let cancelStatus = try JSONDecoder().decode(ImageOperationStatusResponse.self, from: #require(cancelResponse.body))
+      let cancelStatus = try JSONDecoder().decode(
+        ImageOperationStatusResponse.self,
+        from: #require(cancelResponse.body)
+      )
       #expect(cancelStatus.status == "cancelled")
 
       try await waitUntilProcessStops(pid)
+    }
+  }
+
+  @Test
+  func wipingVMsCancelsOrphanImageOperations() async throws {
+    try await withTemporaryDirectory(prefix: "api-image-wipe-cancel") { root in
+      let server = makeTestAPIServer(root: root)
+      let operation = await server.imageManager.startImageOperation(
+        kind: .push,
+        reference: "registry.example.com/repo:tag",
+        source: "vm:\(UUID().uuidString)"
+      )
+
+      let response = await server.handleWipeAllVMs(HTTPRequest(
+        method: "DELETE",
+        path: "/v1/vms",
+        headers: [:],
+        body: nil,
+        queryParameters: ["confirm": "true"]
+      ))
+      let status = try #require(await server.imageManager.getImageOperationStatus(operation.id))
+
+      #expect(response.statusCode == 200)
+      #expect(status.state == .cancelled)
+      #expect(status.completedAt != nil)
     }
   }
 }
