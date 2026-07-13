@@ -4,11 +4,16 @@
 
 `VMInstance` wraps a single `VZVirtualMachine` and is isolated to `@MainActor` because the Virtualization framework requires all `VZVirtualMachine` operations to run on the main queue.
 
-Callers from actor-isolated contexts use `await MainActor.run { ... }` to cross the isolation boundary.
+Actor-isolated callers use `await MainActor.run { ... }` for synchronous property access. Asynchronous lifecycle
+methods are called directly with `await`.
 
-After installation completes, `VMInstaller` calls `adoptVirtualMachine(_:delegate:)` to hand off the running `VZVirtualMachine` to the `VMInstance` that was created alongside it. This avoids a stop-restart cycle immediately after installation.
+During installation, `VMInstaller` owns a separate transient `VZVirtualMachine`. Finalization detaches its delegate,
+waits until that runtime releases the VM files, validates the completed bundle, and records the VM as `stopped`.
+The next explicit start creates a fresh runtime in `VMInstance`.
 
-State transitions are validated by `VMStateMachine` before any lifecycle operation proceeds. An invalid transition throws rather than silently proceeding.
+Normal lifecycle transitions are validated by `VMStateMachine` before the operation proceeds. An invalid transition
+throws rather than silently proceeding. Explicit failure and restart recovery may use `forceState(_:)` to reconcile
+an observed runtime or persisted state.
 
 ## Topics
 
@@ -27,4 +32,3 @@ State transitions are validated by `VMStateMachine` before any lifecycle operati
 ### Virtual Machine Access
 
 - ``virtualMachine``
-- ``adoptVirtualMachine(_:delegate:)``

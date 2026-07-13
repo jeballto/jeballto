@@ -24,9 +24,16 @@ vars:
   DESTINATION: "platform=macOS,arch=arm64"
   XCODE_PROJECT_SCHEME: '-project "{{.PROJECT}}" -scheme "{{.SCHEME}}"'
   XCODE_BUILD_FLAGS: '{{.XCODE_PROJECT_SCHEME}} -derivedDataPath "{{.DERIVED_DATA}}"'
-  XCODE_TEST_FLAGS: '{{.XCODE_BUILD_FLAGS}} {{.TEST_ARGS}}'
   XCODE_DOCBUILD_FLAGS: '{{.XCODE_PROJECT_SCHEME}} -scmProvider system -destination "{{.DESTINATION}}" -derivedDataPath "{{.DOCS_DERIVED_DATA}}"'
-  TEST_ARGS: '-destination "{{.DESTINATION}}" -only-testing:JeballtoAgentTests'
+  TEST_ARGS: >-
+    -destination "{{.DESTINATION}}"
+    -only-testing:JeballtoAgentTests
+    -parallel-testing-enabled NO
+    -test-timeouts-enabled YES
+    -default-test-execution-time-allowance 30
+    -maximum-test-execution-time-allowance 60
+    SWT_EXPERIMENTAL_MAXIMUM_PARALLELIZATION_WIDTH=4
+  XCODE_TEST_FLAGS: '{{.XCODE_BUILD_FLAGS}} {{.TEST_ARGS}}'
   # Versions
   ORAS_VERSION: "1.3.2"
   ZSTD_VERSION: "1.5.7"
@@ -172,9 +179,9 @@ tasks:
       - 'xcodebuild {{.XCODE_BUILD_FLAGS}} -configuration Debug | xcbeautify'
 
   build:release:
-    desc: Build Release configuration
+    desc: Build unsigned Release configuration for validation
     cmds:
-      - 'xcodebuild {{.XCODE_BUILD_FLAGS}} -configuration Release | xcbeautify'
+      - 'xcodebuild {{.XCODE_BUILD_FLAGS}} -configuration Release CODE_SIGNING_ALLOWED=NO | xcbeautify'
 
   build:archive:
     desc: Create a release archive
@@ -189,13 +196,35 @@ tasks:
   test:
     desc: Run unit tests
     cmds:
-      - 'xcodebuild test {{.XCODE_TEST_FLAGS}} | xcbeautify'
+      - mkdir -p "{{.DERIVED_DATA}}"
+      - |
+        set -o pipefail
+        LOG="{{.DERIVED_DATA}}/xcodebuild-test.log"
+        xcodebuild test {{.XCODE_TEST_FLAGS}} 2>&1 | tee "$LOG" | xcbeautify
+        if ! grep -q "Test run started." "$LOG"; then
+          echo "error: Swift Testing did not start"
+          exit 1
+        fi
+        if ! grep -Eq "Test run with [1-9][0-9]* tests? .* passed" "$LOG"; then
+          echo "error: Swift Testing did not report a positive passing test count"
+          exit 1
+        fi
 
   test:verbose:
     desc: Run unit tests, keep full xcodebuild log, and print prettified output
     cmds:
       - mkdir -p "{{.DERIVED_DATA}}"
-      - 'xcodebuild test {{.XCODE_TEST_FLAGS}} 2>&1 | tee "{{.DERIVED_DATA}}/xcodebuild-test.log" | xcbeautify'
+      - |
+        set -o pipefail
+        xcodebuild test {{.XCODE_TEST_FLAGS}} 2>&1 | tee "{{.DERIVED_DATA}}/xcodebuild-test.log" | xcbeautify
+        if ! grep -q "Test run started." "{{.DERIVED_DATA}}/xcodebuild-test.log"; then
+          echo "error: Swift Testing did not start"
+          exit 1
+        fi
+        if ! grep -Eq "Test run with [1-9][0-9]* tests? .* passed" "{{.DERIVED_DATA}}/xcodebuild-test.log"; then
+          echo "error: Swift Testing did not report a positive passing test count"
+          exit 1
+        fi
       - 'echo "Raw xcodebuild log: {{.DERIVED_DATA}}/xcodebuild-test.log"'
 
   # ─── Docs ─────────────────────────────────────────────────────────────────────
@@ -470,12 +499,15 @@ tasks:
     cmds:
       - |
         SCHEMA_DST="${BUILT_PRODUCTS_DIR}/${PRODUCT_NAME}.app/Contents/Resources/jeballto-api.yaml"
+        SCHEMA_TMP="$(mktemp)"
+        cp "{{.OPENAPI_SRC}}" "$SCHEMA_TMP"
         if [ -n "${MARKETING_VERSION:-}" ]; then
-          /usr/bin/sed -i '' "s/^  version: .*/  version: ${MARKETING_VERSION}/" "{{.OPENAPI_SRC}}"
+          /usr/bin/sed -i '' "s/^  version: .*/  version: ${MARKETING_VERSION}/" "$SCHEMA_TMP"
           echo "Stamped OpenAPI with version ${MARKETING_VERSION}"
         fi
         mkdir -p "$(dirname "$SCHEMA_DST")"
-        cp "{{.OPENAPI_SRC}}" "$SCHEMA_DST"
+        cp "$SCHEMA_TMP" "$SCHEMA_DST"
+        rm -f "$SCHEMA_TMP"
         echo "Copied OpenAPI schema to app bundle"
 
   xcode:copy-tools:

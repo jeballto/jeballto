@@ -4,23 +4,24 @@
 
 > FOR AGENT - this section is project description for AI agents. Update when architecture changes to keep state current.
 
-Headless API-first macOS VM manager. Apple Silicon only. Apple Virtualization framework. REST API on localhost:8011. Max 2 concurrent VMs.
+Headless API-first macOS VM manager. Apple Silicon only. Apple Virtualization framework. REST API binds to
+`0.0.0.0:8011` by default. Jeballto allows at most 2 capacity-consuming VMs.
 
 ### Source layout
 
 ```
 JeballtoAgent/
-  APIServer/          - HTTP server + routes (VMRoutes, ExecuteRoutes, ImageRoutes, InstallRoutes, JeballtofileRoutes, ScreenshotRoutes, SystemRoutes, InfraRoutes)
+  APIServer/          - HTTP server, mutation admission gate, DTOs, and route groups
   VMManager/          - VMManager actor, VMInstance @MainActor, VMInstaller
   StateMachine/       - VMState (11 states), VMStateMachine (NSRecursiveLock)
   EventBus/           - EventBus class, type-safe pub/sub, ~40 event types
   Networking/         - NetworkManager actor, PortForwardingManager actor, TCPProxy
   Persistence/        - PersistenceStore actor, VMDefinition struct
-  ImageManager/       - ImageManager actor, ImageStore actor, OrasClient (oras CLI wrapper), ImageReference
+  ImageManager/       - ImageManager/ImageStore actors, ORAS/zstd wrappers, OCI parsing, registry Keychain storage
   Execution/          - CommandExecutor (SSH), JeballtofileExecutor, KeystrokeInjector, KeystrokeParser
-  GUI/                - StatusBarManager, GUIManager @MainActor, UpdaterManager (Sparkle)
+  GUI/                - StatusBarManager and GUIManager @MainActor, UpdaterManager (Sparkle)
   AVFAdapter/         - AVFConfiguration, AVFDelegate
-  Common/             - Config, Logger, Utils, AppVersion, ChildProcessTracker
+  Common/             - Config, Logger, secrets, process helpers, keyed/serial gates, single-instance lock
   JeballtoAgent.swift - @main NSApplicationDelegate, entry point
 openapi/jeballto-api.yaml         - OpenAPI 3.0.3 spec (source of truth for API, v0.3.5)
 JeballtoAgent.docc/Articles/      - DocC docs (Architecture, APIReference, JeballtofileReference, DevelopmentGuide, GettingStarted, Troubleshooting)
@@ -28,16 +29,18 @@ JeballtoAgent.docc/Articles/      - DocC docs (Architecture, APIReference, Jebal
 
 ### Manager concurrency quick ref
 
-- `VMManager` - ACTOR, async most methods. Sync exceptions: `runningVMCount()`, `activeVMCount()`, `getVMInstance()`, `getVMState()`, `getInstallationStatus()`. `activeVMCount()` includes capacity-consuming states and actor-owned reservations.
+- `VMManager` - ACTOR, async most methods. Sync exceptions include `runningVMCount()`, `activeVMCount()`,
+  `getVMInstance()`, and `getVMState()`. `activeVMCount()` includes capacity-consuming states and actor-owned reservations.
 - `PersistenceStore` - ACTOR, ALL methods SYNC. Call `ensureLoaded()` first in every public method
-- `ImageManager` - ACTOR, all async
-- `NetworkManager` - ACTOR, all SYNC
+- `ImageManager` - ACTOR with mixed sync/async declarations; external calls always cross the actor boundary
+- `NetworkManager` - ACTOR; MAC allocation methods are sync, NAT resolution is async
 - `PortForwardingManager` - ACTOR, all SYNC
 - `EventBus` - regular CLASS, DispatchQueue-based, all SYNC, NOT actor
 - `VMInstance` - `@MainActor`, lifecycle methods (`start`/`stop`/`pause`/`resume`/`save`) ASYNC
 - `VMStateMachine` - CLASS, `NSRecursiveLock`, `@unchecked Sendable`
-- `APIServer` - regular CLASS, `NSLock` (`stateLock`) guards install tasks + jeballtofile executor dicts
-- `StatusBarManager` - regular CLASS, `NSMenuDelegate`, `menuNeedsUpdate()` is SYNC - never call async inside
+- `APIServer` - regular CLASS. `NSLock` guards config snapshots, image task handles, and Jeballtofile executors.
+  `APIMutationGate` drains ordinary mutations before destructive maintenance.
+- `StatusBarManager` - `@MainActor` CLASS and `NSMenuDelegate`; `menuNeedsUpdate()` is SYNC - never call async inside
 
 ### VM states (11) and valid transitions
 
@@ -50,24 +53,25 @@ JeballtoAgent.docc/Articles/      - DocC docs (Architecture, APIReference, Jebal
 - `pausing` -> paused, error
 - `paused` -> resuming, starting, stopping, error
 - `resuming` -> running, error
-- `error` -> stopped, deleted
+- `error` -> created, stopped, deleted
 - `deleted` - terminal, no transitions
 - `isOperational` = running|paused; `isTerminal` = deleted only
 
 ### VMDefinition fields
 
-- `id` (UUID), `name`, `state` (VMState), `ephemeral` (Bool)
+- `id` (UUID), `name`, `state` (VMState), `ephemeral` (Bool), `hasBooted` (Bool)
 - `resources`: cpuCount (Int), memorySize (UInt64 bytes), diskSize (UInt64 bytes)
   - defaults: 4 CPU, 4GB RAM, 64GB disk; bounds: 1-32 CPU, 2GB-128GB RAM, 20GB-8TB disk
 - `network`: macAddress, sshPort (Int?), vncPort (Int?), natIP (String?)
-- `paths`: bundlePath, diskImagePath, auxiliaryStoragePath, hardwareModelPath, machineIdentifierPath, saveFilePath (String? only when paused)
-- `metadata` ([String:String]), `createdAt`, `updatedAt`
+- `paths`: bundlePath, diskImagePath, auxiliaryStoragePath, hardwareModelPath, machineIdentifierPath, saveFilePath
+  (the path is configured for each VM; the file exists only for a durable shutdown save)
+- `installation` (VMInstallation?), `lifetimeSeconds`, `expiresAt`
+- `metadata` ([String:String], including pending disk-resize transaction markers), `createdAt`, `updatedAt`
 
 ### API endpoints
 
 ```
 GET  /v1/health                                   - health check
-POST /v1/system/reset                             - reset local state
 GET  /v1/vms                                      - list VMs (limit, offset)
 POST /v1/vms                                      - create VM
 GET  /v1/vms/{id}                                 - get VM
@@ -77,17 +81,22 @@ PATCH /v1/vms/{id}                                - update VM resources/name
 POST /v1/vms/{id}/start|stop|pause|resume|clone   - lifecycle
 POST /v1/vms/{id}/install                         - start macOS install (auto-downloads IPSW)
 GET  /v1/vms/{id}/install/status                  - install progress
+GET  /v1/vms/{id}/state|events                    - state and retained events
+GET|POST|DELETE /v1/vms/{id}/ssh                  - inspect/enable/disable SSH forwarding
+GET|POST|DELETE /v1/vms/{id}/vnc                  - inspect/enable/disable VNC forwarding
+GET|POST|DELETE /v1/vms/{id}/gui                  - inspect/open/close GUI
 POST /v1/vms/{id}/execute                         - SSH command execution
 POST /v1/vms/{id}/keystrokes                      - GUI keystroke injection
 GET  /v1/vms/{id}/screenshot                      - GUI screenshot
-GET  /v1/images                                   - list local OCI images
-POST /v1/images/pull                              - pull OCI image (via oras)
-GET  /v1/images/pull/{id}/status                  - async pull progress
-DELETE /v1/images/pull/{id}                       - cancel async pull
-POST /v1/images/push                              - push VM as OCI image
-GET  /v1/images/push/{id}/status                  - async push progress
-DELETE /v1/images/push/{id}                       - cancel async push
+GET  /v1/images[/{id}]                            - list/get local OCI images
+DELETE /v1/images                                 - wipe all local images
 DELETE /v1/images/{id}                            - delete image
+POST /v1/images/pull                              - pull OCI image (via oras)
+POST /v1/images/push                              - push VM as OCI image
+GET|DELETE /v1/images/pull/operations             - list/cancel all pull operations
+GET|DELETE /v1/images/pull/operations/{id}        - inspect/cancel one pull operation
+GET|DELETE /v1/images/push/operations             - list/cancel all push operations
+GET|DELETE /v1/images/push/operations/{id}        - inspect/cancel one push operation
 POST /v1/registries/login                         - configure registry credentials
 POST /v1/registries/logout                        - remove registry credentials
 POST /v1/jeballtofiles                            - run blueprint
@@ -97,28 +106,35 @@ POST /v1/jeballtofiles/{id}/cancel                - cancel blueprint execution
 DELETE /v1/jeballtofiles/{id}                     - delete blueprint execution
 GET  /v1/config                                   - get config
 PATCH /v1/config                                  - update config
+GET  /v1/system/capabilities                      - host/runtime capabilities
+POST /v1/system/reset                             - soft/hard local reset
 GET  /v1/auth/verify                              - verify auth token
 ```
 
 ### Key request/response types (APIServer/DTOs/APIModels.swift)
 
-- `CreateVMRequest`: name, resources (VMResourcesDTO?), image (String?), ephemeral (Bool?)
+- `CreateVMRequest`: name, resources, image, ephemeral, lifetimeSeconds
+- `CloneVMRequest`: name, resources, ephemeral, lifetimeSeconds
 - `VMResourcesDTO`: cpuCount, memorySize, diskSize (all optional; `FlexibleByteSize` accepts "4GB" string or raw UInt64)
 - `CommandExecuteRequest`: command, user, password, timeout (Int?)
-- `VMResponse`: id, name, state, ephemeral, resources, network (VMNetworkResponse?), guiOpen, uptime, createdAt, updatedAt
+- `VMResponse`: id, name, state, ephemeral, resources, network, guiOpen, uptime, lifetimeSeconds, expiresAt,
+  createdAt, updatedAt
 - `VMNetworkResponse`: macAddress, sshPort, vncPort, natIP
 - `HealthResponse`: status, version, vmsTotal, vmsRunning, uptime
 - `InstallStatusResponse`: vmId, status, progress, phaseProgress, message, phase, bytesDownloaded, bytesTotal, downloadSpeed
-- `ImageOperationStatusResponse`: operationId, type, reference, source, status, stage, progress, stageProgress, averageSpeedMBps, chunksCompleted, chunksTotal, bytesCompleted, bytesTotal, startedAt, updatedAt, completedAt, digest, image, error
-- `ErrorResponse`: error.code, error.message, error.details
+- `ImageResponse`: id, reference, digest, localPath, size, resources, formatVersion, pulledAt, pushedAt, metadata
+- `ImageOperationStatusResponse`: operationId, statusUrl, type, reference, source, status, stage, progress,
+  stageProgress, averageSpeedMBps, chunksCompleted, chunksTotal, bytesCompleted, bytesTotal, startedAt, updatedAt,
+  completedAt, digest, image, errorCode, error
+- `ErrorResponse`: error.code, error.message
 
 ### EventBus event types (VMEvent enum)
 
 VM lifecycle: `stateChanged(vmId,from,to)`, `vmCreated`, `vmDeleted`, `vmStarting`, `vmRunning`, `vmStopping`, `vmStopped`, `vmPaused`, `vmResumed`, `errorOccurred`, `vmCloned`, `vmResourcesUpdated`
 
-Networking: `sshPortAssigned`, `sshPortReleased`, `vncPortAssigned`, `vncPortReleased`
+Networking: `sshPortAssigned`, `sshPortReleased`, `sshReady`, `vncPortAssigned`, `vncPortReleased`
 
-Install: `installStarted`, `installProgress(vmId,progress,phaseProgress,message,phase,bytesDownloaded,bytesTotal,downloadSpeed)`, `installCompleted`, `installFailed`
+Install: `installStarted`, `installProgress(vmId,progress,phaseProgress,message,phase,bytesDownloaded,bytesTotal,downloadSpeed)`, `installCompleted`, `installCancelled`, `installFailed`
 
 GUI: `guiOpened`, `guiClosed`
 
@@ -129,17 +145,23 @@ Jeballtofiles: `jeballtofileStarted`, `jeballtofileStepStarted`, `jeballtofileSt
 ### Key error enums
 
 - `VMStateMachineError`: `invalidTransition(from,to)`, `terminalStateReached`, `alreadyInTargetState`
-- `CommandExecutorError`: `sshNotConfigured`, `timeout(command,seconds)`, `processLaunchFailed`, `askpassScriptFailed`
-- `PersistenceError`: `fileNotFound`, `invalidData`, `encodingFailed`, `decodingFailed`, `vmNotFound(UUID)`, `vmAlreadyExists(UUID)`, `directoryCreationFailed`
-- `ImageManagerError`: `imageNotFound`, `imageNotFoundById`, `pullFailed`, `pushFailed`, `deleteFailed`, `invalidReference`, `registryUnreachable`
+- `CommandExecutorError`: `sshNotConfigured`, input validation cases, `timeout(command,seconds)`,
+  `processLaunchFailed`, `askpassScriptFailed`
+- `PersistenceError`: `fileNotFound`, `invalidData`, `encodingFailed`, `writeFailed`, `decodingFailed`,
+  `vmNotFound(UUID)`, `vmAlreadyExists(UUID)`, `directoryCreationFailed`
+- `ImageManagerError`: `imageNotFound`, `imageNotFoundById`, `pullFailed`, `pushFailed`, `deleteFailed`,
+  `pushCommitOutcomeUnknown`, `pushPartiallyCommitted`, `invalidReference`, `invalidImage`,
+  `unsupportedImageFormat`, `registryUnavailable`, `timeout`, `imageInUse`
 
 ### Config (loaded from config.json)
 
-- api: port=8011, host="0.0.0.0", token=UUID, enableHTTPS=false, maxConcurrentRequests=100
+- api: port=8011, host="0.0.0.0", token resolved from Keychain, maxConcurrentRequests=100
 - storage: vmStorageDir, databasePath=vms.json, imageIndexPath=images.json
 - logging: level="info", enableFileLogging=true, retentionDays=7, maxTotalSize="2GB", timezone=nil (IANA identifier, nil=system TZ)
 - networking: sshPortRange=2222-2223, autoEnableSSHForwarding=true, vncPortRange=5901-5902
-- images: imageStorageDir, orasPath (nil=bundled binary), maxParallelImageBlobTransfers=16, maxParallelImageCompressions=4, maxParallelImageDecompressions=2, maxParallelImageDiskWrites=1, defaultRegistry (nil), insecureRegistries=[]
+- images: imageStorageDir, orasPath/zstdPath (nil=bundled binary), maxParallelImageBlobTransfers=16,
+  maxParallelImageCompressions=4, maxParallelImageDecompressions=2, maxParallelImageDiskWrites=1,
+  defaultRegistry=nil, insecureRegistries=[]
 
 ### Key paths
 
@@ -147,18 +169,38 @@ Jeballtofiles: `jeballtofileStarted`, `jeballtofileStepStarted`, `jeballtofileSt
 - Image index: `~/Library/Application Support/Jeballto/images.json`
 - Config: `~/Library/Application Support/Jeballto/config.json`
 - Logs: `~/Library/Logs/Jeballto/`
+- API token and OCI registry credentials: application-owned macOS Keychain items
 
 ### OCI images
 
-Via `oras` CLI (not Docker). VMs stored as OCI artifacts (.bundle dirs). `ImageReference` parses `registry/repo:tag@sha256:digest`.
+Via `oras` CLI (not Docker). VMs are stored as OCI artifacts (`.bundle` directories). `ImageReference` parses
+`registry/repo:tag@sha256:digest`. Registry login validates credentials through ORAS, then stores them in Jeballto's
+own Keychain service. Every registry command uses an isolated temporary ORAS registry config and does not inherit
+Docker or standalone ORAS login state. `insecureRegistries` uses plain HTTP and can expose credentials and artifacts.
+
+The current artifact contract is **Jeballto VM Bundle Format v1**. The config blob contains required integer
+`formatVersion: 1`. Stable family media types are `application/vnd.jeballto.vm.bundle`,
+`application/vnd.jeballto.vm.bundle.config+json`, and `application/vnd.jeballto.vm.bundle.chunk+zstd`. Media types do
+not select the format version. Missing versions are legacy unversioned artifacts, not v0, and unknown versions are
+rejected before chunk-layer download. Additive optional fields may remain in v1, but incompatible config or chunk
+semantics require the next integer version. `ImageResponse.formatVersion` exposes the required stored validated
+version. Incompatible pre-1.0 local index records are rejected. Async operation failures expose stable `errorCode`
+separately from the human-readable `error`.
 
 ### Jeballtofiles (blueprints)
 
-Declarative JSON/YAML. Step types: create, install, wait, execute (SSH), keystrokes. `JeballtofileExecutor` runs sequentially, publishes step events, supports cancellation. Cancellation marks the current step and execution as `cancelled` and publishes `JEBALLTOFILE_CANCELLED`.
+Declarative JSON/YAML. Step types: install, start, stop, gui-open, gui-close, keystrokes, execute (SSH), wait.
+`JeballtofileExecutor` runs sequentially, publishes step events, and supports cancellation. Cancellation immediately
+marks the current step and execution as `cancelled`, requests cooperative task cancellation, and publishes
+`JEBALLTOFILE_CANCELLED`.
 
 ### SSH execution
 
-`CommandExecutor` retries 20x on exit 255 (connection refused) with 3s delay. Timeout -> `CommandExecutorError.timeout`. Max 5MB stdout/stderr, max 64KB command length. Child process output is drained via `AsyncProcessRunner` to avoid stdout/stderr pipe deadlocks.
+`CommandExecutor` retries only when `retryOnSSHFailure` is enabled and exit 255 contains a recognized transient SSH
+connection error. Retries wait up to 3 seconds and share the caller's overall timeout, with no fixed attempt count.
+The public execute endpoint fails fast; Jeballtofile execute enables retry. Timeout becomes
+`CommandExecutorError.timeout`. Max 5 MiB stdout/stderr, 65,536 UTF-8 bytes per command. Child process output is
+drained via `AsyncProcessRunner` to avoid pipe deadlocks.
 
 ## Versioning Policy
 
@@ -170,9 +212,11 @@ While the project version is below 1.0.0, there is NO backward compatibility req
 
 Never use em dashes anywhere: code, comments, commit messages, PR descriptions, or any output. Use hyphens (-) or commas instead.
 
-### Never block `applicationDidFinishLaunching`
+### Never block app launch
 
-`applicationDidFinishLaunching` in `JeballtoAgent.swift` is the critical startup path. StatusBarManager and UpdaterManager must be initialized first, synchronously. Any new functionality added to app launch MUST be deferred via `DispatchQueue.main.async` or `Task`. Blocking this method causes the status bar to get stuck on "Starting..." indefinitely.
+`run()` initializes StatusBarManager and UpdaterManager synchronously before entering the app event loop, then defers
+configuration and service startup in a `Task`. Keep `applicationDidFinishLaunching` non-blocking and do not move slow
+work in front of the event loop. Blocking app launch leaves the status bar stuck on "Starting...".
 
 ### Never commit session artifacts
 
@@ -202,32 +246,39 @@ BEFORE writing any code that calls a method on another class, ALWAYS check that 
 
 **Actor/class reference:**
 
-- `VMManager` - ACTOR. Most methods async (`vmCount`, `createVM`, `startVM`, etc). Sync exceptions: `runningVMCount()`, `activeVMCount()`, `getVMInstance()`, `getVMState()`, `getInstallationStatus()`.
+- `VMManager` - ACTOR. Most methods async (`vmCount`, `createVM`, `startVM`, etc). Sync exceptions include
+  `runningVMCount()`, `activeVMCount()`, `getVMInstance()`, and `getVMState()`.
 - `PersistenceStore` - ACTOR but ALL methods SYNC. Crossing actor boundary still requires `await`. All public methods must call `ensureLoaded()` first.
-- `ImageManager` - ACTOR with ALL methods async.
+- `ImageManager` - ACTOR with mixed sync/async declarations. Calls from outside the actor still require `await`.
 - `PortForwardingManager` - ACTOR but ALL methods SYNC.
-- `NetworkManager` - ACTOR but ALL methods SYNC.
+- `NetworkManager` - ACTOR. MAC allocation methods are sync; NAT resolution is async.
 - `EventBus` - regular CLASS with DispatchQueue-based thread safety. All methods SYNC. NOT an actor.
-- `GUIManager` - `@MainActor`. All methods SYNC.
+- `GUIManager` - `@MainActor`. Most UI methods are sync; event-drain helpers are async.
 - `VMInstance` - `@MainActor`. Lifecycle methods (`start`, `stop`, `pause`, `resume`, `save`) are ASYNC.
 - `VMStateMachine` - CLASS with `NSRecursiveLock`, `@unchecked Sendable`. Thread-safe by lock.
-- `StatusBarManager` - regular CLASS (not `@MainActor`). Implements `NSMenuDelegate`. `menuNeedsUpdate()` is SYNC - never call async methods directly inside it.
-- `APIServer` - regular CLASS. `start()` and `stop()` are SYNC. Holds references to actors. Uses `NSLock` (`stateLock`) for thread-safe dictionary access.
+- `StatusBarManager` - `@MainActor` CLASS implementing `NSMenuDelegate`. `menuNeedsUpdate()` is synchronous, so cache
+  actor-owned values and refresh them from a separate `Task`.
+- `APIServer` - regular CLASS. `start()` is sync and throwing; `stop()` is async. Holds references to actors. Uses
+  `NSLock` for its synchronous registries and an actor for mutation admission.
 
 **Rules:**
 
 - `NSMenuDelegate.menuNeedsUpdate()` is synchronous - NEVER call async functions in it. Cache async results and refresh in a background `Task`.
-- `VMManager.startVM`, `VMManager.resumeVM`, and `VMManager.installVM` must reserve VM capacity before the first `await` and release that reservation with `defer`.
+- `VMManager.startVM`, `VMManager.resumeVM`, and installation entry points must reserve VM capacity before the first
+  suspension and release that reservation with `defer`.
 - `NSApplicationDelegate` methods run on main thread.
 - When `guard-let` or `if-let` unwraps an optional into a local constant, do NOT re-unwrap it with another `if-let` - the local is already non-optional.
-- To call `@MainActor` code from a non-isolated async context: `await MainActor.run { ... }`
-- To call `@MainActor` init from non-MainActor sync context: use `Task { @MainActor in ... }` or move to `applicationDidFinishLaunching`.
+- Use `await MainActor.run { ... }` for synchronous `@MainActor` work from a non-isolated async context. Call an
+  async `@MainActor` method directly with `await`.
+- To call `@MainActor` init from non-MainActor sync context: use `Task { @MainActor in ... }` or initialize it on the
+  main thread before starting deferred work.
 - Actor-isolated sync methods still require `await` when called from outside the actor - crossing actor boundary is always async even if the method body is sync.
 - All background tasks should use `Task<Void, Never>` for explicit error handling.
 
 ## Architecture
 
-- VM lifecycle has 11 states with 1:1 `VZVirtualMachine` mapping
+- VM lifecycle has 11 product states that combine `VZVirtualMachine` runtime states with installation, error, and
+  persistence lifecycle states
 - Custom `EventBus` for type-safe pub/sub (not `NotificationCenter`)
 - State transitions validated via state machine
 - OpenAPI 3.0.3 spec in `openapi/jeballto-api.yaml` must match implementation exactly
@@ -235,7 +286,8 @@ BEFORE writing any code that calls a method on another class, ALWAYS check that 
 
 ### VM lifecycle state recovery pattern
 
-Every lifecycle method (start, stop, pause, resume, save) MUST follow this pattern:
+Every VZ-backed lifecycle path (start, stop, pause, resume, save) MUST follow this pattern. Idempotent and explicit
+error-recovery branches may return or reconcile before entering the VZ operation.
 
 1. Transition to intermediate state (`.starting`, `.stopping`, `.pausing`, `.resuming`)
 2. Wrap the VZ operation in `do/catch`
@@ -246,16 +298,18 @@ Never leave a VM stuck in an intermediate state on failure. The `.error` state i
 
 ### Shutdown
 
-`applicationShouldTerminate` has a 30-second timeout. If `cleanupForShutdown()` does not complete within 30 seconds, the app proceeds with termination. Ephemeral VMs are stopped and deleted; non-ephemeral running VMs are paused and saved for resume.
+`applicationShouldTerminate` has a 30-second timeout. If `cleanupForShutdown()` does not complete within 30 seconds,
+the app proceeds with termination. Ephemeral VMs are stopped and deleted; non-ephemeral running and in-memory paused
+VMs are saved for explicit resume.
 
 ## Testing
 
 - Test should be changed accordingly if any changes to code are made
-- Every new funciotnality should be covered by tests
-- In this repo tests are lower level and fast without: live networking, no VM boot or install, no GUI window dependency
-- High livel tests like E2E are kept in other repository
-- Test coverage should be resonable, to protect our code base from bugs but not to be paranoid and to not create too much boilerplate code
-- Check avaible skills when writing tests, you can find ones useful for testing
+- Every new functionality should be covered by tests
+- In this repo tests are lower level and fast, without live networking, VM boot/install, or GUI window dependencies
+- High-level tests such as E2E are kept in another repository
+- Test coverage should be reasonable, protecting the codebase without excessive boilerplate
+- Check available skills when writing tests
 
 ## Code Style
 

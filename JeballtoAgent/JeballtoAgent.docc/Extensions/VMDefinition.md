@@ -15,8 +15,17 @@ All `update*` mutating methods set `updatedAt` to `Date()` automatically. Caller
 - ``id``
 - ``name``
 - ``state``
+- ``ephemeral``
+- ``hasBooted``
+- ``lifetimeSeconds``
+- ``expiresAt``
 - ``createdAt``
 - ``updatedAt``
+
+### Installation
+
+- ``installation``
+- ``VMInstallation``
 
 ### Resources
 

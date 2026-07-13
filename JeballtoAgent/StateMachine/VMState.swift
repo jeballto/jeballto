@@ -1,8 +1,8 @@
 import Foundation
 
-/// VM state - maps 1:1 with VZVirtualMachine states plus lifecycle states
-enum VMState: String, Codable, CaseIterable {
-  /// Created with disk and config files but macOS not yet installed.
+/// Durable VM lifecycle state, including states that have no direct Virtualization framework equivalent.
+enum VMState: String, Codable, CaseIterable, Sendable {
+  /// Definition and empty bundle created, but installation artifacts and macOS are not present yet.
   case created
   /// macOS installation in progress. VM is booted into the installer.
   case installing
@@ -14,20 +14,20 @@ enum VMState: String, Codable, CaseIterable {
   case running
   /// Shutdown in progress.
   case stopping
-  /// State save in progress.
+  /// Pause operation in progress.
   case pausing
-  /// VM state saved to disk. Can be resumed from exactly this point.
+  /// VM execution is paused. A save file exists only for shutdown recovery pauses.
   case paused
-  /// Restoring VM from saved state.
+  /// Resuming live paused execution or restoring a shutdown recovery save.
   case resuming
-  /// VM encountered an unrecoverable error. Can transition to stopped or deleted.
+  /// VM encountered an error. Recovery returns an installed VM to stopped or an incomplete install to created.
   case error
   /// VM files removed. Terminal state - no further transitions are possible.
   case deleted
 }
 
 /// Represents a validated state transition for logging and event publishing.
-struct VMStateTransition: Equatable {
+struct VMStateTransition: Equatable, Sendable {
   let from: VMState
   let to: VMState
 }
@@ -44,7 +44,7 @@ extension VMState {
     case .pausing: [.paused, .error]
     case .paused: [.resuming, .starting, .stopping, .error]
     case .resuming: [.running, .error]
-    case .error: [.stopped, .deleted]
+    case .error: [.created, .stopped, .deleted]
     case .deleted: []
     }
   }

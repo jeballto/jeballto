@@ -29,10 +29,11 @@ struct ImageReference: Equatable, Sendable {
   /// Reconstructs the full reference string
   var fullReference: String {
     var ref = "\(registry)/\(repository)"
+    if let tag {
+      ref += ":\(tag)"
+    }
     if let digest {
       ref += "@\(digest)"
-    } else if let tag {
-      ref += ":\(tag)"
     }
     return ref
   }
@@ -44,6 +45,30 @@ struct ImageReference: Equatable, Sendable {
   private static let tagPattern = "^[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}$"
   private static let digestPattern = "^sha256:[a-f0-9]{64}$"
 
+  static func isValidRegistry(_ registry: String) -> Bool {
+    guard registry == registry.lowercased(),
+          registry.utf8.count <= 259,
+          registry.range(of: registryPattern, options: .regularExpression) != nil else
+    {
+      return false
+    }
+    if let colon = registry.lastIndex(of: ":") {
+      let portValue = registry[registry.index(after: colon)...]
+      guard let port = Int(portValue), (1 ... 65535).contains(port) else { return false }
+    }
+    let host = registry.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)[0]
+    guard host.utf8.count <= 253 else { return false }
+    return host.split(separator: ".", omittingEmptySubsequences: false).allSatisfy { label in
+      guard label.isEmpty == false, label.utf8.count <= 63,
+            let first = label.utf8.first, let last = label.utf8.last,
+            Self.isASCIIAlphanumeric(first), Self.isASCIIAlphanumeric(last) else
+      {
+        return false
+      }
+      return label.utf8.allSatisfy { Self.isASCIIAlphanumeric($0) || $0 == 0x2D }
+    }
+  }
+
   /// Parses an OCI image reference string into its components.
   ///
   /// Supported formats:
@@ -51,10 +76,24 @@ struct ImageReference: Equatable, Sendable {
   /// - `registry/repo@sha256:...`
   /// - `registry/repo` (no tag or digest)
   /// - `registry:port/repo:tag`
-  static func parse(_ reference: String) throws -> ImageReference {
-    let trimmed = reference.trimmingCharacters(in: .whitespaces)
+  static func parse(_ reference: String, defaultRegistry: String? = nil) throws -> ImageReference {
+    guard reference.utf8.count <= 1024 else {
+      throw ImageReferenceError.invalidFormat("Reference exceeds the 1024-byte limit")
+    }
+    var trimmed = reference.trimmingCharacters(in: .whitespaces)
     guard !trimmed.isEmpty else {
       throw ImageReferenceError.invalidFormat("Reference is empty")
+    }
+    let firstComponent = trimmed.split(separator: "/", maxSplits: 1).first.map(String.init) ?? ""
+    let hasExplicitRegistry = firstComponent.contains(".") || firstComponent.contains(":")
+      || firstComponent == "localhost"
+    if trimmed.contains("/") == false || hasExplicitRegistry == false {
+      guard let defaultRegistry, defaultRegistry.isEmpty == false else {
+        throw ImageReferenceError.invalidFormat(
+          "Reference must include a registry, or images.defaultRegistry must be configured"
+        )
+      }
+      trimmed = "\(defaultRegistry)/\(trimmed)"
     }
 
     // Split on @ for digest
@@ -69,19 +108,12 @@ struct ImageReference: Equatable, Sendable {
 
     // Split remaining into registry/repository and optional tag
     var tag: String?
-    if digest == nil {
-      // Only parse tag if no digest. Find the last colon that is NOT part of a port number.
-      // Registry ports look like: registry.example.com:5000/repo
-      // Tags look like: registry.example.com/repo:tag
-      // Strategy: split on first slash to separate registry from repo path,
-      // then look for colon in the repo path for the tag.
-      if let firstSlash = remaining.firstIndex(of: "/") {
-        let repoAndTag = String(remaining[remaining.index(after: firstSlash)...])
-        if let lastColon = repoAndTag.lastIndex(of: ":") {
-          tag = String(repoAndTag[repoAndTag.index(after: lastColon)...])
-          let repoWithoutTag = String(repoAndTag[..<lastColon])
-          remaining = String(remaining[...firstSlash]) + repoWithoutTag
-        }
+    if let firstSlash = remaining.firstIndex(of: "/") {
+      let repoAndTag = String(remaining[remaining.index(after: firstSlash)...])
+      if let lastColon = repoAndTag.lastIndex(of: ":") {
+        tag = String(repoAndTag[repoAndTag.index(after: lastColon)...])
+        let repoWithoutTag = String(repoAndTag[..<lastColon])
+        remaining = String(remaining[...firstSlash]) + repoWithoutTag
       }
     }
 
@@ -90,7 +122,7 @@ struct ImageReference: Equatable, Sendable {
       throw ImageReferenceError.invalidFormat("Reference must contain registry and repository separated by /")
     }
 
-    let registry = String(remaining[..<firstSlash])
+    let registry = String(remaining[..<firstSlash]).lowercased()
     let repository = String(remaining[remaining.index(after: firstSlash)...])
 
     guard !registry.isEmpty else {
@@ -99,9 +131,12 @@ struct ImageReference: Equatable, Sendable {
     guard !repository.isEmpty else {
       throw ImageReferenceError.invalidRepository("Repository is empty")
     }
+    guard repository.utf8.count <= 255 else {
+      throw ImageReferenceError.invalidRepository("Repository exceeds the 255-byte OCI limit")
+    }
 
     // Validate registry
-    guard registry.range(of: registryPattern, options: .regularExpression) != nil else {
+    guard Self.isValidRegistry(registry) else {
       throw ImageReferenceError.invalidRegistry("'\(registry)' does not match expected hostname[:port] format")
     }
 
@@ -132,5 +167,42 @@ struct ImageReference: Equatable, Sendable {
   /// Checks if the registry is in the insecure registries list
   func isInsecureAllowed(insecureRegistries: [String]) -> Bool {
     insecureRegistries.contains(registry)
+  }
+
+  private static func isASCIIAlphanumeric(_ byte: UInt8) -> Bool {
+    (0x30 ... 0x39).contains(byte) || (0x61 ... 0x7A).contains(byte)
+  }
+}
+
+enum RegistryCredentialValidator {
+  static let maximumUsernameLength = 1024
+  static let maximumPasswordLength = 16384
+
+  static func loginError(registry: String, username: String, password: String) -> String? {
+    if let registryError = registryError(registry) {
+      return registryError
+    }
+    guard username.isEmpty == false else { return "Username is required" }
+    guard password.isEmpty == false else { return "Password is required" }
+    guard username.utf8.count <= maximumUsernameLength else {
+      return "Username is too long (max \(maximumUsernameLength) UTF-8 bytes)"
+    }
+    guard password.utf8.count <= maximumPasswordLength else {
+      return "Password is too long (max \(maximumPasswordLength) UTF-8 bytes)"
+    }
+    guard username.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) == false else {
+      return "Username must not contain control characters"
+    }
+    guard password.unicodeScalars.contains(where: { $0.value == 0 || $0.value == 10 || $0.value == 13 }) == false else {
+      return "Password must not contain NUL, carriage return, or newline characters"
+    }
+    return nil
+  }
+
+  static func registryError(_ registry: String) -> String? {
+    guard ImageReference.isValidRegistry(registry) else {
+      return "Registry must be a lowercase hostname with an optional port between 1 and 65535"
+    }
+    return nil
   }
 }

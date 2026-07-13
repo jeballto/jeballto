@@ -4,7 +4,7 @@ import Virtualization
 /// Wrapper for VZVirtualMachine with state machine and lifecycle management
 /// Isolated to @MainActor to ensure thread-safe access to all mutable state,
 /// since VZVirtualMachine itself requires main-thread access.
-@MainActor class VMInstance {
+@MainActor final class VMInstance {
   /// VM definition containing configuration and metadata
   var definition: VMDefinition
 
@@ -14,6 +14,11 @@ import Virtualization
 
   /// The underlying VZVirtualMachine instance
   private(set) var virtualMachine: VZVirtualMachine?
+
+  var runtimeConsumesCapacity: Bool {
+    guard let virtualMachine else { return false }
+    return virtualMachine.state != .stopped && virtualMachine.state != .error
+  }
 
   /// Delegate for VM events
   private var delegate: AVFDelegate?
@@ -31,33 +36,6 @@ import Virtualization
   }
 
   // MARK: - Lifecycle Management
-
-  /// Adopts an existing VZVirtualMachine (e.g., from installer)
-  /// - Parameter vm: The running VZVirtualMachine to adopt
-  /// - Parameter existingDelegate: Optional existing delegate to reuse
-  func adoptVirtualMachine(_ vm: VZVirtualMachine, delegate existingDelegate: AVFDelegate? = nil) {
-    guard virtualMachine == nil else {
-      logWarning("VM \(definition.id) already has a virtual machine", category: "VMInstance")
-      return
-    }
-
-    let vmDelegate: AVFDelegate
-    if let existingDelegate {
-      vmDelegate = existingDelegate
-      vmDelegate.onError = { [weak self] error in Task { [weak self] in self?.handleError(error) } }
-      vmDelegate.onStop = { [weak self] in Task { [weak self] in self?.handleStop() } }
-      logInfo("VM \(definition.id) adopted VM with existing delegate", category: "VMInstance")
-    } else {
-      vmDelegate = AVFDelegate(vmId: definition.id, eventBus: eventBus)
-      vmDelegate.onError = { [weak self] error in Task { [weak self] in self?.handleError(error) } }
-      vmDelegate.onStop = { [weak self] in Task { [weak self] in self?.handleStop() } }
-      vm.delegate = vmDelegate
-      logInfo("VM \(definition.id) adopted VM with new delegate", category: "VMInstance")
-    }
-
-    virtualMachine = vm
-    delegate = vmDelegate
-  }
 
   /// Initializes the VZVirtualMachine instance with configuration
   /// See: https://developer.apple.com/documentation/virtualization/vzvirtualmachine/3656724-init
@@ -90,8 +68,12 @@ import Virtualization
     )
     let vm = runtime.virtualMachine
     let vmDelegate = runtime.delegate
-    vmDelegate.onError = { [weak self] error in Task { [weak self] in self?.handleError(error) } }
-    vmDelegate.onStop = { [weak self] in Task { [weak self] in self?.handleStop() } }
+    vmDelegate.onError = { [weak self] error in
+      Task<Void, Never> { [weak self] in self?.handleError(error) }
+    }
+    vmDelegate.onStop = { [weak self] in
+      Task<Void, Never> { [weak self] in self?.handleStop() }
+    }
 
     virtualMachine = vm
     delegate = vmDelegate
@@ -108,34 +90,63 @@ import Virtualization
     guard let vm = virtualMachine else { throw VMInstanceError.notInitialized }
 
     let vmState = vm.state
+    let initialState = stateMachine.currentState
     logInfo(
       "start() - stateMachine:\(stateMachine.currentState.rawValue) VZ:\(vmState.rawValue)",
       category: "VMInstance"
     )
 
-    // Sync state machine if VZ is already running
+    // Reconcile only lifecycle states that can legitimately observe a completed start or resume.
     if vmState == .running {
-      if stateMachine.currentState != .running {
-        logWarning("State machine out of sync, forcing to RUNNING", category: "VMInstance")
-        stateMachine.forceState(.running)
-        definition.updateState(.running)
+      switch stateMachine.currentState {
+      case .running:
+        return
+      case .starting:
+        try transition(to: .running)
+        definition.markBooted()
         eventBus.publish(.vmRunning(vmId: definition.id))
+        return
+      case .resuming:
+        try transition(to: .running)
+        definition.markBooted()
+        eventBus.publish(.vmResumed(vmId: definition.id))
+        return
+      default:
+        let error = VMInstanceError.invalidState(
+          "Logical state \(stateMachine.currentState.rawValue) does not match running virtualization runtime"
+        )
+        recordFailureIfNeeded(error)
+        throw error
       }
-      return
     }
 
-    if stateMachine.currentState == .running { return }
+    if stateMachine.currentState == .running {
+      let error = VMInstanceError.invalidState(
+        "Logical state is running but virtualization runtime is \(vmState.rawValue)"
+      )
+      recordFailureIfNeeded(error)
+      throw error
+    }
+    guard vmState != .paused else {
+      throw VMInstanceError.invalidState("A paused VM must be resumed, not started")
+    }
+
+    let saveFilePath = definition.paths.saveFilePath
+    let shouldRestoreSavedState = Self.shouldRestoreSavedState(
+      initialState: initialState,
+      saveFileExists: FileManager.default.fileExists(atPath: saveFilePath)
+    )
 
     // Transition to STARTING
     guard stateMachine.canTransition(to: .starting) else {
       throw VMInstanceError.invalidState("Cannot start VM from state \(stateMachine.currentState.rawValue)")
     }
-    try stateMachine.transition(to: .starting)
-    definition.updateState(.starting)
+    try transition(to: .starting)
     eventBus.publish(.vmStarting(vmId: definition.id))
 
-    // Restore from save file if available
-    if let saveFilePath = definition.paths.saveFilePath, FileManager.default.fileExists(atPath: saveFilePath) {
+    // A save file is meaningful only while the logical VM is PAUSED. A leftover file must never
+    // rewind a normal STOPPED boot.
+    if shouldRestoreSavedState {
       logInfo("Restoring VM \(definition.id) from saved state", category: "VMInstance")
       try await restoreFromSave(vm: vm, saveFileURL: URL(fileURLWithPath: saveFilePath))
       return
@@ -143,63 +154,147 @@ import Virtualization
 
     // Start VM
     logInfo("Starting VM \(definition.id)", category: "VMInstance")
-    let startTime = Date()
+    let startUptime = ProcessInfo.processInfo.systemUptime
     do {
       try await vm.start()
-      let durationStr = String(format: "%.1f", Date().timeIntervalSince(startTime))
+      let durationStr = String(format: "%.1f", ProcessInfo.processInfo.systemUptime - startUptime)
       logDebug("VM \(definition.id) started in \(durationStr)s", category: "VMInstance")
+      try transition(to: .running)
+      definition.markBooted()
+      eventBus.publish(.vmRunning(vmId: definition.id))
     } catch {
-      let durationStr = String(format: "%.1f", Date().timeIntervalSince(startTime))
+      let durationStr = String(format: "%.1f", ProcessInfo.processInfo.systemUptime - startUptime)
       logError(
         "VM \(definition.id) start failed after \(durationStr)s: \(error.localizedDescription)",
         category: "VMInstance"
       )
-      stateMachine.forceState(.error)
-      definition.updateState(.error)
-      eventBus.publish(.errorOccurred(vmId: definition.id, error: error.localizedDescription))
+      recordFailureIfNeeded(error)
       throw error
     }
-
-    try stateMachine.transition(to: .running)
-    definition.updateState(.running)
-    eventBus.publish(.vmRunning(vmId: definition.id))
 
     logInfo("VM \(definition.id) is now running", category: "VMInstance")
   }
 
   // MARK: - Stop
 
-  /// Stops the virtual machine gracefully
+  /// Stops the virtual machine runtime without requesting an in-guest shutdown
   /// See: https://developer.apple.com/documentation/virtualization/vzvirtualmachine/3656731-stop
   func stop() async throws {
-    guard let vm = virtualMachine else { throw VMInstanceError.notInitialized }
+    guard let vm = virtualMachine else {
+      if stateMachine.currentState == .paused {
+        try discardSavedStateAndStop()
+        return
+      }
+      throw VMInstanceError.notInitialized
+    }
 
     guard stateMachine.canTransition(to: .stopping) else {
       throw VMInstanceError.invalidState("Cannot stop VM from state \(stateMachine.currentState.rawValue)")
     }
-    try stateMachine.transition(to: .stopping)
-    definition.updateState(.stopping)
+    try transition(to: .stopping)
     eventBus.publish(.vmStopping(vmId: definition.id))
 
     logInfo("Stopping VM \(definition.id)", category: "VMInstance")
 
     do {
       try await vm.stop()
+
+      if stateMachine.currentState == .stopped {
+        clearVirtualMachine()
+        try removeSavedStateIfPresent(context: "after VM stop")
+        logInfo("VM \(definition.id) stop completed by delegate", category: "VMInstance")
+        return
+      }
+      guard stateMachine.currentState == .stopping else {
+        throw VMInstanceError.invalidState(
+          "VM stop completed but lifecycle entered \(stateMachine.currentState.rawValue)"
+        )
+      }
+
+      clearVirtualMachine()
+      try transition(to: .stopped)
+      eventBus.publish(.vmStopped(vmId: definition.id))
+      try removeSavedStateIfPresent(context: "after VM stop")
     } catch {
       logError("Error stopping VM \(definition.id): \(error)", category: "VMInstance")
-      stateMachine.forceState(.error)
-      definition.updateState(.error)
-      eventBus.publish(.errorOccurred(vmId: definition.id, error: error.localizedDescription))
+      recordFailureIfNeeded(error)
       throw error
     }
 
-    clearVirtualMachine()
-
-    try stateMachine.transition(to: .stopped)
-    definition.updateState(.stopped)
-    eventBus.publish(.vmStopped(vmId: definition.id))
-
     logInfo("VM \(definition.id) is now stopped", category: "VMInstance")
+  }
+
+  /// Stops the underlying runtime for forced cleanup without claiming success before AVF confirms it.
+  /// This is intentionally separate from logical state recovery: a failed AVF stop must never be
+  /// represented as a stopped VM while the runtime may still own its files.
+  func forceStopRuntime() async throws {
+    let initialLogicalState = stateMachine.currentState
+    guard let vm = virtualMachine else {
+      switch stateMachine.currentState {
+      case .paused:
+        try discardSavedStateAndStop()
+        return
+      case .created, .stopped, .error, .deleted:
+        return
+      default:
+        throw VMInstanceError.notInitialized
+      }
+    }
+
+    if vm.state == .stopped || vm.state == .error {
+      clearVirtualMachine()
+      if stateMachine.currentState != .deleted {
+        forceState(.stopped)
+        eventBus.publish(.vmStopped(vmId: definition.id))
+      }
+      try removeSavedStateIfPresent(context: "after forced VM stop")
+      return
+    }
+
+    guard vm.canStop else {
+      throw VMInstanceError.invalidState(
+        "Virtualization runtime cannot stop from state \(vm.state.rawValue)"
+      )
+    }
+
+    do {
+      try await vm.stop()
+    } catch {
+      logError("Forced stop failed for VM \(definition.id): \(error)", category: "VMInstance")
+      recordFailureIfNeeded(error)
+      throw error
+    }
+
+    if stateMachine.currentState == .stopped {
+      clearVirtualMachine()
+      try removeSavedStateIfPresent(context: "after forced VM stop")
+      return
+    }
+    if stateMachine.currentState == .deleted {
+      clearVirtualMachine()
+      return
+    }
+    guard stateMachine.currentState != .error || initialLogicalState == .error else {
+      clearVirtualMachine()
+      throw VMInstanceError.invalidState("Virtualization runtime reported an error while stopping")
+    }
+
+    clearVirtualMachine()
+    forceState(.stopped)
+    eventBus.publish(.vmStopped(vmId: definition.id))
+    try removeSavedStateIfPresent(context: "after forced VM stop")
+  }
+
+  /// Discards a persisted pause snapshot when no AVF runtime exists, then records a normal stop.
+  private func discardSavedStateAndStop() throws {
+    guard virtualMachine == nil, stateMachine.currentState == .paused else {
+      throw VMInstanceError.invalidState("Saved-state discard requires a runtime-free paused VM")
+    }
+    try removeSavedStateIfPresent(context: "while stopping a restored paused VM")
+    try transition(to: .stopping)
+    eventBus.publish(.vmStopping(vmId: definition.id))
+    try transition(to: .stopped)
+    eventBus.publish(.vmStopped(vmId: definition.id))
   }
 
   // MARK: - Pause & Resume
@@ -213,23 +308,18 @@ import Virtualization
     guard stateMachine.canTransition(to: .pausing) else {
       throw VMInstanceError.invalidState("Cannot pause VM from state \(stateMachine.currentState.rawValue)")
     }
-    try stateMachine.transition(to: .pausing)
-    definition.updateState(.pausing)
+    try transition(to: .pausing)
 
     logInfo("Pausing VM \(definition.id)", category: "VMInstance")
     do {
       try await vm.pause()
+      try transition(to: .paused)
+      eventBus.publish(.vmPaused(vmId: definition.id))
     } catch {
       logError("Error pausing VM \(definition.id): \(error)", category: "VMInstance")
-      stateMachine.forceState(.error)
-      definition.updateState(.error)
-      eventBus.publish(.errorOccurred(vmId: definition.id, error: error.localizedDescription))
+      recordFailureIfNeeded(error)
       throw error
     }
-
-    try stateMachine.transition(to: .paused)
-    definition.updateState(.paused)
-    eventBus.publish(.vmPaused(vmId: definition.id))
 
     logInfo("VM \(definition.id) is now paused", category: "VMInstance")
   }
@@ -242,23 +332,19 @@ import Virtualization
     guard stateMachine.canTransition(to: .resuming) else {
       throw VMInstanceError.invalidState("Cannot resume VM from state \(stateMachine.currentState.rawValue)")
     }
-    try stateMachine.transition(to: .resuming)
-    definition.updateState(.resuming)
+    try transition(to: .resuming)
 
     logInfo("Resuming VM \(definition.id)", category: "VMInstance")
     do {
       try await vm.resume()
+      try transition(to: .running)
+      definition.markBooted()
+      eventBus.publish(.vmResumed(vmId: definition.id))
     } catch {
       logError("Error resuming VM \(definition.id): \(error)", category: "VMInstance")
-      stateMachine.forceState(.error)
-      definition.updateState(.error)
-      eventBus.publish(.errorOccurred(vmId: definition.id, error: error.localizedDescription))
+      recordFailureIfNeeded(error)
       throw error
     }
-
-    try stateMachine.transition(to: .running)
-    definition.updateState(.running)
-    eventBus.publish(.vmResumed(vmId: definition.id))
 
     logInfo("VM \(definition.id) resumed", category: "VMInstance")
   }
@@ -267,9 +353,8 @@ import Virtualization
   func resumeFromSave() async throws {
     guard let vm = virtualMachine else { throw VMInstanceError.notInitialized }
 
-    guard let saveFilePath = definition.paths.saveFilePath,
-          FileManager.default.fileExists(atPath: saveFilePath) else
-    {
+    let saveFilePath = definition.paths.saveFilePath
+    guard FileManager.default.fileExists(atPath: saveFilePath) else {
       throw VMInstanceError.invalidConfiguration("No save file found for resume")
     }
 
@@ -279,25 +364,22 @@ import Virtualization
     guard stateMachine.canTransition(to: .resuming) else {
       throw VMInstanceError.invalidState("Cannot resume VM from state \(stateMachine.currentState.rawValue)")
     }
-    try stateMachine.transition(to: .resuming)
-    definition.updateState(.resuming)
+    try transition(to: .resuming)
 
     do {
       try await vm.restoreMachineStateFrom(url: saveFileURL)
       try await vm.resume()
-      try stateMachine.transition(to: .running)
-      definition.updateState(.running)
+      try transition(to: .running)
+      definition.markBooted()
     } catch {
       logError("Error resuming VM \(definition.id) from save: \(error)", category: "VMInstance")
-      stateMachine.forceState(.error)
-      definition.updateState(.error)
-      eventBus.publish(.errorOccurred(vmId: definition.id, error: error.localizedDescription))
+      recordFailureIfNeeded(error)
       throw error
     }
 
     eventBus.publish(.vmRunning(vmId: definition.id))
 
-    try? FileManager.default.removeItem(at: saveFileURL)
+    removeConsumedSavedState(at: saveFileURL)
     logInfo("VM \(definition.id) restored from save file and running", category: "VMInstance")
   }
 
@@ -307,35 +389,82 @@ import Virtualization
   func save() async throws {
     guard let vm = virtualMachine else { throw VMInstanceError.notInitialized }
 
-    guard let saveFilePath = definition.paths.saveFilePath else {
-      throw VMInstanceError.invalidConfiguration("Save file path not configured")
-    }
-
+    let saveFilePath = definition.paths.saveFilePath
     let saveFileURL = URL(fileURLWithPath: saveFilePath)
     logInfo("Saving VM \(definition.id) state", category: "VMInstance")
+
+    guard vm.state == .running, vm.canPause else {
+      throw VMInstanceError.invalidState(
+        "VM runtime must be running and pausable before saving (current: \(vm.state.rawValue))"
+      )
+    }
 
     guard stateMachine.canTransition(to: .pausing) else {
       throw VMInstanceError.invalidState("Cannot save VM from state \(stateMachine.currentState.rawValue)")
     }
-    try stateMachine.transition(to: .pausing)
-    definition.updateState(.pausing)
+    try removeSavedStateIfPresent(context: "before VM save")
+    try transition(to: .pausing)
 
     do {
       try await vm.pause()
       try await vm.saveMachineStateTo(url: saveFileURL)
-      try stateMachine.transition(to: .paused)
-      definition.updateState(.paused)
+      try transition(to: .paused)
     } catch {
-      logError("Error saving VM \(definition.id): \(error)", category: "VMInstance")
-      stateMachine.forceState(.error)
-      definition.updateState(.error)
-      eventBus.publish(.errorOccurred(vmId: definition.id, error: error.localizedDescription))
-      throw error
+      let saveError = error
+      var cleanupDescription: String?
+      do {
+        try removeSavedStateIfPresent(context: "after failed VM save")
+      } catch {
+        cleanupDescription = error.localizedDescription
+      }
+      let detail = cleanupDescription.map { "; partial save cleanup also failed: \($0)" } ?? ""
+      logError("Error saving VM \(definition.id): \(saveError)\(detail)", category: "VMInstance")
+      recordFailureIfNeeded(saveError, detail: detail)
+      if let cleanupDescription {
+        throw VMInstanceError.savedStateCleanupFailed(
+          "Save failed: \(saveError.localizedDescription); partial state cleanup failed: \(cleanupDescription)"
+        )
+      }
+      throw saveError
     }
 
     eventBus.publish(.vmPaused(vmId: definition.id))
 
     logDebug("VM \(definition.id) state saved successfully", category: "VMInstance")
+  }
+
+  /// Saves an already-paused live runtime during agent shutdown.
+  func savePausedRuntime() async throws {
+    guard let vm = virtualMachine else { throw VMInstanceError.notInitialized }
+    let saveFilePath = definition.paths.saveFilePath
+    guard vm.state == .paused, stateMachine.currentState == .paused else {
+      throw VMInstanceError.invalidState(
+        "VM runtime and lifecycle must both be paused before saving an existing pause"
+      )
+    }
+
+    let saveFileURL = URL(fileURLWithPath: saveFilePath)
+    try removeSavedStateIfPresent(context: "before paused VM save")
+    do {
+      try await vm.saveMachineStateTo(url: saveFileURL)
+    } catch {
+      let saveError = error
+      var cleanupDescription: String?
+      do {
+        try removeSavedStateIfPresent(context: "after failed paused VM save")
+      } catch {
+        cleanupDescription = error.localizedDescription
+      }
+      let detail = cleanupDescription.map { "; partial save cleanup also failed: \($0)" } ?? ""
+      recordFailureIfNeeded(saveError, detail: detail)
+      if let cleanupDescription {
+        throw VMInstanceError.savedStateCleanupFailed(
+          "Paused save failed: \(saveError.localizedDescription); partial state cleanup failed: \(cleanupDescription)"
+        )
+      }
+      throw saveError
+    }
+    logDebug("Paused VM \(definition.id) state saved successfully", category: "VMInstance")
   }
 
   // MARK: - Private: Restore from save
@@ -349,23 +478,19 @@ import Virtualization
     // being masked by forceState.
     do {
       try await vm.restoreMachineStateFrom(url: saveFileURL)
-      try stateMachine.transition(to: .paused)
-      definition.updateState(.paused)
-      try stateMachine.transition(to: .resuming)
-      definition.updateState(.resuming)
+      try transition(to: .paused)
+      try transition(to: .resuming)
       try await vm.resume()
-      try stateMachine.transition(to: .running)
-      definition.updateState(.running)
+      try transition(to: .running)
+      definition.markBooted()
     } catch {
       logError("Error restoring VM \(definition.id) from save: \(error)", category: "VMInstance")
-      stateMachine.forceState(.error)
-      definition.updateState(.error)
-      eventBus.publish(.errorOccurred(vmId: definition.id, error: error.localizedDescription))
+      recordFailureIfNeeded(error)
       throw error
     }
 
     eventBus.publish(.vmRunning(vmId: definition.id))
-    try? FileManager.default.removeItem(at: saveFileURL)
+    removeConsumedSavedState(at: saveFileURL)
     logInfo("VM \(definition.id) restored and running", category: "VMInstance")
   }
 
@@ -381,10 +506,20 @@ import Virtualization
   // MARK: - Error Handling
 
   private func handleError(_ error: Error) {
+    guard stateMachine.currentState != .deleted else {
+      clearVirtualMachine()
+      logInfo("Ignoring late error callback for deleted VM \(definition.id)", category: "VMInstance")
+      return
+    }
     logError("VM \(definition.id) error: \(error.localizedDescription)", category: "VMInstance")
-    stateMachine.forceState(.error)
-    definition.updateState(.error)
-    eventBus.publish(.errorOccurred(vmId: definition.id, error: error.localizedDescription))
+    recordFailureIfNeeded(error)
+    clearVirtualMachine()
+  }
+
+  private func recordFailureIfNeeded(_ error: Error, detail: String = "") {
+    guard stateMachine.currentState != .error, stateMachine.currentState != .deleted else { return }
+    forceState(.error)
+    eventBus.publish(.errorOccurred(vmId: definition.id, error: error.localizedDescription + detail))
   }
 
   private func handleStop() {
@@ -395,28 +530,103 @@ import Virtualization
       category: "VMInstance"
     )
 
-    // VZVirtualMachine cannot be restarted after stopping - clear for fresh init on next start
-    clearVirtualMachine()
-
     do {
-      try stateMachine.transition(to: .stopped)
-      definition.updateState(.stopped)
+      switch stateMachine.currentState {
+      case .running:
+        try transition(to: .stopping)
+        eventBus.publish(.vmStopping(vmId: definition.id))
+      case .stopping:
+        break
+      case .error, .deleted:
+        clearVirtualMachine()
+        logInfo(
+          "Ignoring late stop callback while VM is \(stateMachine.currentState.rawValue)",
+          category: "VMInstance"
+        )
+        return
+      default:
+        let error = VMInstanceError.invalidState(
+          "Unexpected guest stop while VM was \(stateMachine.currentState.rawValue)"
+        )
+        recordFailureIfNeeded(error)
+        clearVirtualMachine()
+        return
+      }
+
+      // A stopped VZVirtualMachine cannot be restarted. Recreate it on the next start.
+      clearVirtualMachine()
+      try transition(to: .stopped)
       eventBus.publish(.vmStopped(vmId: definition.id))
     } catch {
-      logDebug("Forcing STOPPED state: \(error)", category: "VMInstance")
-      stateMachine.forceState(.stopped)
-      definition.updateState(.stopped)
-      eventBus.publish(.vmStopped(vmId: definition.id))
+      logError("Failed to finalize guest stop for VM \(definition.id): \(error)", category: "VMInstance")
+      recordFailureIfNeeded(error)
     }
   }
 
   // MARK: - Cleanup
+
+  static func shouldRestoreSavedState(initialState: VMState, saveFileExists: Bool) -> Bool {
+    initialState == .paused && saveFileExists
+  }
+
+  func transitionLifecycle(to state: VMState) throws {
+    try transition(to: state)
+  }
+
+  func forceLifecycleState(_ state: VMState) {
+    forceState(state)
+  }
+
+  func recordLifecycleError(_ error: Error) {
+    handleError(error)
+  }
+
+  private func transition(to state: VMState) throws {
+    let previous = stateMachine.currentState
+    try stateMachine.transition(to: state)
+    definition.updateState(state)
+    eventBus.publish(.stateChanged(vmId: definition.id, from: previous, to: state))
+  }
+
+  private func forceState(_ state: VMState) {
+    let previous = stateMachine.currentState
+    stateMachine.forceState(state)
+    definition.updateState(state)
+    if previous != state {
+      eventBus.publish(.stateChanged(vmId: definition.id, from: previous, to: state))
+    }
+  }
 
   /// Clears the VZVirtualMachine and associated objects
   private func clearVirtualMachine() {
     virtualMachine = nil
     delegate = nil
     avfConfiguration = nil
+  }
+
+  private func removeSavedStateIfPresent(context: String) throws {
+    let saveFilePath = definition.paths.saveFilePath
+    guard FileManager.default.fileExists(atPath: saveFilePath) else { return }
+    do {
+      try FileManager.default.removeItem(atPath: saveFilePath)
+    } catch {
+      throw VMInstanceError.savedStateCleanupFailed(
+        "Failed to remove saved state \(saveFilePath) \(context): \(error.localizedDescription)"
+      )
+    }
+  }
+
+  private func removeConsumedSavedState(at url: URL) {
+    guard FileManager.default.fileExists(atPath: url.path) else { return }
+    do {
+      try FileManager.default.removeItem(at: url)
+    } catch {
+      logError(
+        "VM \(definition.id) resumed but consumed save file could not be removed at \(url.path): "
+          + error.localizedDescription,
+        category: "VMInstance"
+      )
+    }
   }
 
   /// Cleans up all resources
@@ -432,12 +642,14 @@ enum VMInstanceError: Error, LocalizedError {
   case notInitialized
   case invalidState(String)
   case invalidConfiguration(String)
+  case savedStateCleanupFailed(String)
 
   var errorDescription: String? {
     switch self {
     case .notInitialized: "VM instance not initialized"
     case .invalidState(let message): "Invalid state: \(message)"
     case .invalidConfiguration(let message): "Invalid configuration: \(message)"
+    case .savedStateCleanupFailed(let message): message
     }
   }
 }

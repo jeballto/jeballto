@@ -1,7 +1,14 @@
 import Foundation
 
+private struct ImageOperationTaskHandle: Sendable {
+  let cancel: @Sendable () -> Void
+  let wait: @Sendable () async -> Void
+}
+
 /// Main API server coordinating HTTP server and route handlers
-class APIServer {
+/// Shared between Network callbacks and structured background tasks. Mutable registries and
+/// configuration are protected by `stateLock`; managers provide their own actor isolation.
+final class APIServer: @unchecked Sendable {
   // MARK: - Constants
 
   private static let serverUnavailableError = HTTPResponse.error(
@@ -9,6 +16,7 @@ class APIServer {
     message: "Server unavailable",
     statusCode: 500
   )
+  static let maximumRetainedTerminalJeballtofileExecutions = 100
 
   // MARK: - Properties
 
@@ -18,29 +26,54 @@ class APIServer {
   let imageManager: ImageManager
   let eventBus: EventBus
   let capabilityProvider: @Sendable () -> VirtualizationCapabilities
+  let configPath: String
+  let systemResetEnvironment: SystemResetEnvironment
 
-  /// Lock protecting mutable state accessed from async route handlers
+  /// Locks protecting independent mutable state accessed from async route handlers.
   private let stateLock = NSLock()
+  private let configLock = NSLock()
+  private let lifecycleLock = NSLock()
+  private let mutationGate = APIMutationGate()
   private var _config: Config
-  /// Active install per VM: a unique token (stamped by claim) plus the Task. The token lets a
-  /// completing task check that it is still the current claim before removing its entry.
-  private var _installationTasks: [UUID: (token: UUID, task: Task<Void, Never>)] = [:]
-  private var _imageOperationTasks: [UUID: Task<Void, Never>] = [:]
+  private var _configRevision: UInt64 = 0
+  private var _imageOperationTasks: [UUID: ImageOperationTaskHandle] = [:]
+  private var _acceptsImageOperationTasks = true
   private var _jeballtofileExecutors: [UUID: JeballtofileExecutor] = [:]
+  private var _terminalJeballtofileExecutionOrder: [UUID] = []
+  private var _startUptime: TimeInterval?
 
   /// Thread-safe access to config
   var config: Config {
-    get { stateLock.lock(); defer { stateLock.unlock() }; return _config }
-    set { stateLock.lock(); defer { stateLock.unlock() }; _config = newValue }
+    configLock.withLock { _config }
   }
 
-  // Mutating access to _installationTasks and _jeballtofileExecutors is via the helpers
+  func commitConfiguration(_ build: (Config) throws -> Config) throws -> (config: Config, revision: UInt64) {
+    try configLock.withLock {
+      let newConfig = try build(_config)
+      try newConfig.save(to: configPath)
+      _config = newConfig
+      _configRevision &+= 1
+      return (newConfig, _configRevision)
+    }
+  }
+
+  func configurationSnapshot() -> (config: Config, revision: UInt64) {
+    configLock.withLock { (_config, _configRevision) }
+  }
+
+  var registeredRouteSignatures: Set<HTTPRouteSignature> {
+    httpServer.registeredRouteSignatures
+  }
+
+  // Mutating access to _jeballtofileExecutors is via the helpers
   // below (claim/release/get/snapshot). Exposing these as var-computed properties is unsafe:
   // `dict[key] = value` on a computed property lowers to get -> mutate-copy -> set, which
   // releases the lock between the read and the write and drops concurrent insertions.
 
-  /// Server start time for uptime calculation
-  let startTime: Date
+  /// Monotonic server start time for uptime calculation.
+  var startUptime: TimeInterval? {
+    lifecycleLock.withLock { _startUptime }
+  }
 
   init(
     vmManager: VMManager,
@@ -48,6 +81,8 @@ class APIServer {
     imageManager: ImageManager,
     eventBus: EventBus,
     config: Config,
+    configPath: String = Config.defaultConfigPath(),
+    systemResetEnvironment: SystemResetEnvironment = .live,
     capabilityProvider: @escaping @Sendable () -> VirtualizationCapabilities = { VirtualizationCapabilities() }
   ) {
     httpServer = SimpleHTTPServer(
@@ -59,16 +94,29 @@ class APIServer {
     self.portForwardingManager = portForwardingManager
     self.imageManager = imageManager
     self.eventBus = eventBus
+    self.configPath = configPath
+    self.systemResetEnvironment = systemResetEnvironment
     self.capabilityProvider = capabilityProvider
     _config = config
-    startTime = Date()
+    let mutationGate = mutationGate
+    httpServer.requestAdmissionHandler = { request in
+      guard Self.isMutatingRequest(request), Self.isExclusiveMaintenanceRequest(request) == false else {
+        return .allowed
+      }
+      guard let leaseId = await mutationGate.acquireMutation() else {
+        return .rejected(HTTPResponse.error(
+          "MAINTENANCE_IN_PROGRESS",
+          message: "The agent is performing destructive maintenance",
+          statusCode: 503
+        ))
+      }
+      return .leased {
+        await mutationGate.releaseMutation(leaseId)
+      }
+    }
 
     // Set authentication token
     httpServer.authToken = config.api.token
-    vmManager.installCancellationHandler = { [weak self] vmId in
-      self?.cancelInstallationTask(vmId) ?? false
-    }
-
     // Register all routes
     registerRoutes()
   }
@@ -77,11 +125,19 @@ class APIServer {
 
   func start() throws {
     try httpServer.start()
+    lifecycleLock.withLock {
+      _startUptime = ProcessInfo.processInfo.systemUptime
+    }
     logInfo("API server started on \(config.api.host):\(config.api.port)", category: "APIServer")
   }
 
-  func stop() {
-    httpServer.stop()
+  func stop() async {
+    httpServer.stopAccepting()
+    await suspendAndCancelImageOperationTasks()
+    await cancelAndWaitAllBackgroundTasks()
+    await httpServer.stopAndWait()
+    // Catch work registered by a handler that was already entering route code when shutdown began.
+    await cancelAndWaitAllBackgroundTasks()
     logInfo("API server stopped", category: "APIServer")
   }
 
@@ -227,11 +283,11 @@ class APIServer {
       return await self?.handleCancelImagePullOperations(request) ?? Self.serverUnavailableError
     }
 
-    httpServer.get("/v1/images/pull/operations/{id}") { [weak self] request in
+    httpServer.get("/v1/images/pull/operations/{operationId}") { [weak self] request in
       return await self?.handleGetImagePullOperation(request) ?? Self.serverUnavailableError
     }
 
-    httpServer.delete("/v1/images/pull/operations/{id}") { [weak self] request in
+    httpServer.delete("/v1/images/pull/operations/{operationId}") { [weak self] request in
       return await self?.handleCancelImagePullOperation(request) ?? Self.serverUnavailableError
     }
 
@@ -243,11 +299,11 @@ class APIServer {
       return await self?.handleCancelImagePushOperations(request) ?? Self.serverUnavailableError
     }
 
-    httpServer.get("/v1/images/push/operations/{id}") { [weak self] request in
+    httpServer.get("/v1/images/push/operations/{operationId}") { [weak self] request in
       return await self?.handleGetImagePushOperation(request) ?? Self.serverUnavailableError
     }
 
-    httpServer.delete("/v1/images/push/operations/{id}") { [weak self] request in
+    httpServer.delete("/v1/images/push/operations/{operationId}") { [weak self] request in
       return await self?.handleCancelImagePushOperation(request) ?? Self.serverUnavailableError
     }
 
@@ -289,15 +345,15 @@ class APIServer {
       return await self?.handleListJeballtofiles(request) ?? Self.serverUnavailableError
     }
 
-    httpServer.get("/v1/jeballtofiles/{id}") { [weak self] request in
+    httpServer.get("/v1/jeballtofiles/{executionId}") { [weak self] request in
       return await self?.handleGetJeballtofileStatus(request) ?? Self.serverUnavailableError
     }
 
-    httpServer.post("/v1/jeballtofiles/{id}/cancel") { [weak self] request in
+    httpServer.post("/v1/jeballtofiles/{executionId}/cancel") { [weak self] request in
       return await self?.handleCancelJeballtofile(request) ?? Self.serverUnavailableError
     }
 
-    httpServer.delete("/v1/jeballtofiles/{id}") { [weak self] request in
+    httpServer.delete("/v1/jeballtofiles/{executionId}") { [weak self] request in
       return await self?.handleDeleteJeballtofile(request) ?? Self.serverUnavailableError
     }
   }
@@ -362,10 +418,6 @@ class APIServer {
     return nil
   }
 
-  func updateVMDefinition(_ vmId: UUID, definition: VMDefinition) async throws {
-    try await vmManager.updateVMDefinition(vmId, definition: definition)
-  }
-
   func extractResourceId(from path: String) -> UUID? {
     let components = path.split(separator: "/")
     guard components.count >= 3 else { return nil }
@@ -374,50 +426,124 @@ class APIServer {
     return UUID(uuidString: idString)
   }
 
-  /// Atomically reserves an installation slot for `vmId` and runs `start` inside the lock
-  /// to produce the Task, so the task and its release token are assigned together. Returns
-  /// nil (without calling `start`) if a non-cancelled task already owns the slot.
-  ///
-  /// `start` is passed a release token it must forward to `releaseInstallationTask` when
-  /// the task body finishes, so only the owning task can evict its own entry.
-  func claimInstallationTask(_ vmId: UUID, start: (UUID) -> Task<Void, Never>) -> Task<Void, Never>? {
-    stateLock.lock()
-    defer { stateLock.unlock() }
-    if let existing = _installationTasks[vmId], !existing.task.isCancelled {
-      return nil
-    }
-    let token = UUID()
-    let task = start(token)
-    _installationTasks[vmId] = (token, task)
-    return task
+  func invalidQueryParameter(_ error: Error) -> HTTPResponse {
+    HTTPResponse.error(
+      "INVALID_QUERY_PARAMETER",
+      message: error.localizedDescription,
+      statusCode: 400
+    )
   }
 
-  /// Atomically removes an installation task entry. Only removes if the stored token matches,
-  /// so a stale completion from a superseded task cannot evict the currently-claimed task.
-  func releaseInstallationTask(_ vmId: UUID, token: UUID) {
-    stateLock.lock()
-    defer { stateLock.unlock() }
-    if _installationTasks[vmId]?.token == token {
-      _installationTasks.removeValue(forKey: vmId)
-    }
+  func beginExclusiveMaintenance() async -> Bool {
+    guard await mutationGate.beginMaintenance() else { return false }
+    await suspendAndCancelImageOperationTasks()
+    return true
+  }
+
+  func waitForActiveMutationsToDrain() async {
+    await mutationGate.waitUntilDrained()
+  }
+
+  func endExclusiveMaintenance() async {
+    resumeImageOperationTasks()
+    await mutationGate.endMaintenance()
+  }
+
+  private static func isMutatingRequest(_ request: HTTPRequest) -> Bool {
+    request.method == "POST" || request.method == "PATCH" || request.method == "DELETE"
+  }
+
+  private static func isExclusiveMaintenanceRequest(_ request: HTTPRequest) -> Bool {
+    request.method == "POST" && request.path == "/v1/system/reset"
+      || request.method == "DELETE" && (request.path == "/v1/vms" || request.path == "/v1/images")
   }
 
   /// Atomically inserts a Jeballtofile executor.
   func setJeballtofileExecutor(_ executionId: UUID, executor: JeballtofileExecutor) {
     stateLock.lock()
     defer { stateLock.unlock() }
+    _terminalJeballtofileExecutionOrder.removeAll { $0 == executionId }
     _jeballtofileExecutors[executionId] = executor
+  }
+
+  /// Marks a fully-finished execution as eligible for bounded history retention.
+  /// The executor calls this only after its task exits, so cancellation cleanup remains drainable.
+  func recordTerminalJeballtofileExecutor(_ executionId: UUID) {
+    stateLock.lock()
+    defer { stateLock.unlock() }
+    guard let executor = _jeballtofileExecutors[executionId],
+          executor.execution.status != .running,
+          _terminalJeballtofileExecutionOrder.contains(executionId) == false else { return }
+
+    _terminalJeballtofileExecutionOrder.append(executionId)
+    trimTerminalJeballtofileExecutionsIfNeeded()
+  }
+
+  private func trimTerminalJeballtofileExecutionsIfNeeded() {
+    let overflow = _terminalJeballtofileExecutionOrder.count
+      - Self.maximumRetainedTerminalJeballtofileExecutions
+    guard overflow > 0 else { return }
+
+    let expiredIds = _terminalJeballtofileExecutionOrder.prefix(overflow)
+    for executionId in expiredIds {
+      _jeballtofileExecutors.removeValue(forKey: executionId)
+    }
+    _terminalJeballtofileExecutionOrder.removeFirst(overflow)
   }
 
   /// Starts and stores the background task for an async image operation while holding the state lock.
   @discardableResult
-  func startImageOperationTask(_ operationId: UUID, start: () -> Task<Void, Never>) -> Task<Void, Never> {
+  func startImageOperationTask<Success: Sendable>(
+    _ operationId: UUID,
+    start: () -> Task<Success, Never>
+  ) -> Task<Success, Never>? {
     stateLock.lock()
     defer { stateLock.unlock() }
+    guard _acceptsImageOperationTasks else { return nil }
     let task = start()
-    _imageOperationTasks[operationId] = task
+    _imageOperationTasks[operationId] = ImageOperationTaskHandle(
+      cancel: { task.cancel() },
+      wait: { _ = await task.value }
+    )
     return task
   }
+
+  private func suspendAndCancelImageOperationTasks() async {
+    let tasks = stateLock.withLock { () -> [UUID: ImageOperationTaskHandle] in
+      _acceptsImageOperationTasks = false
+      return _imageOperationTasks
+    }
+    for task in tasks.values {
+      task.cancel()
+    }
+    for operationId in tasks.keys {
+      await imageManager.cancelImageOperation(operationId)
+    }
+    for task in tasks.values {
+      await task.wait()
+    }
+    stateLock.withLock {
+      for operationId in tasks.keys {
+        _imageOperationTasks.removeValue(forKey: operationId)
+      }
+    }
+  }
+
+  private func resumeImageOperationTasks() {
+    stateLock.withLock {
+      _acceptsImageOperationTasks = true
+    }
+  }
+
+  #if DEBUG
+  func suspendImageOperationTaskRegistrationForTesting() async {
+    await suspendAndCancelImageOperationTasks()
+  }
+
+  func resumeImageOperationTaskRegistrationForTesting() {
+    resumeImageOperationTasks()
+  }
+  #endif
 
   /// Removes the stored background task after completion.
   func releaseImageOperationTask(_ operationId: UUID) {
@@ -428,37 +554,35 @@ class APIServer {
 
   @discardableResult
   func cancelImageOperationTask(_ operationId: UUID) -> Bool {
-    stateLock.lock()
-    defer { stateLock.unlock() }
-    guard let task = _imageOperationTasks.removeValue(forKey: operationId) else { return false }
+    guard let task = imageOperationTask(operationId) else { return false }
     task.cancel()
     return true
   }
 
   @discardableResult
   func cancelAndWaitImageOperationTask(_ operationId: UUID) async -> Bool {
-    guard let task = drainImageOperationTask(operationId) else { return false }
+    guard let task = imageOperationTask(operationId) else { return false }
     task.cancel()
-    await task.value
+    await task.wait()
     return true
   }
 
   @discardableResult
   func cancelAndWaitImageOperationTasks(_ operationIds: Set<UUID>) async -> Int {
-    let tasks = drainImageOperationTasks(operationIds: operationIds)
+    let tasks = imageOperationTasks(operationIds: operationIds)
 
     for task in tasks.values {
       task.cancel()
     }
     for task in tasks.values {
-      await task.value
+      await task.wait()
     }
     return tasks.count
   }
 
   @discardableResult
   func cancelAllImageOperationTasks() async -> Int {
-    let tasks = drainImageOperationTasks()
+    let tasks = imageOperationTasks()
 
     for task in tasks.values {
       task.cancel()
@@ -467,31 +591,29 @@ class APIServer {
       await imageManager.cancelImageOperation(operationId)
     }
     for task in tasks.values {
-      await task.value
+      await task.wait()
     }
     return tasks.count
   }
 
-  private func drainImageOperationTasks() -> [UUID: Task<Void, Never>] {
+  private func imageOperationTasks() -> [UUID: ImageOperationTaskHandle] {
     stateLock.lock()
     defer { stateLock.unlock() }
-    let tasks = _imageOperationTasks
-    _imageOperationTasks.removeAll()
-    return tasks
+    return _imageOperationTasks
   }
 
-  private func drainImageOperationTask(_ operationId: UUID) -> Task<Void, Never>? {
+  private func imageOperationTask(_ operationId: UUID) -> ImageOperationTaskHandle? {
     stateLock.lock()
     defer { stateLock.unlock() }
-    return _imageOperationTasks.removeValue(forKey: operationId)
+    return _imageOperationTasks[operationId]
   }
 
-  private func drainImageOperationTasks(operationIds: Set<UUID>) -> [UUID: Task<Void, Never>] {
+  private func imageOperationTasks(operationIds: Set<UUID>) -> [UUID: ImageOperationTaskHandle] {
     stateLock.lock()
     defer { stateLock.unlock() }
-    var tasks: [UUID: Task<Void, Never>] = [:]
+    var tasks: [UUID: ImageOperationTaskHandle] = [:]
     for operationId in operationIds {
-      if let task = _imageOperationTasks.removeValue(forKey: operationId) {
+      if let task = _imageOperationTasks[operationId] {
         tasks[operationId] = task
       }
     }
@@ -508,11 +630,15 @@ class APIServer {
     releaseImageOperationTask(operationId)
   }
 
-  /// Atomically removes a Jeballtofile executor.
-  func removeJeballtofileExecutor(_ executionId: UUID) {
+  /// Atomically removes the expected Jeballtofile executor.
+  @discardableResult
+  func removeJeballtofileExecutor(_ executionId: UUID, expected: JeballtofileExecutor) -> Bool {
     stateLock.lock()
     defer { stateLock.unlock() }
+    guard _jeballtofileExecutors[executionId] === expected else { return false }
     _jeballtofileExecutors.removeValue(forKey: executionId)
+    _terminalJeballtofileExecutionOrder.removeAll { $0 == executionId }
+    return true
   }
 
   @discardableResult
@@ -532,6 +658,7 @@ class APIServer {
     defer { stateLock.unlock() }
     let executors = _jeballtofileExecutors
     _jeballtofileExecutors.removeAll()
+    _terminalJeballtofileExecutionOrder.removeAll()
     return executors
   }
 
@@ -542,19 +669,70 @@ class APIServer {
     return _jeballtofileExecutors[executionId]
   }
 
-  /// Returns a snapshot of all active executors.
+  /// Returns a snapshot of active executors and retained terminal history.
   func listJeballtofileExecutors() -> [JeballtofileExecutor] {
     stateLock.lock()
     defer { stateLock.unlock() }
     return Array(_jeballtofileExecutors.values)
   }
 
-  @discardableResult
-  func cancelInstallationTask(_ vmId: UUID) -> Bool {
-    stateLock.lock()
-    defer { stateLock.unlock() }
-    guard let task = _installationTasks.removeValue(forKey: vmId) else { return false }
-    task.task.cancel()
+  func cancelAndWaitAllBackgroundTasks() async {
+    let installs = await vmManager.cancelAllInstallations()
+    let images = await cancelAllImageOperationTasks()
+    let jeballtofiles = await cancelAllJeballtofileExecutors()
+    logInfo(
+      "Cancelled background tasks: installs=\(installs), images=\(images), jeballtofiles=\(jeballtofiles)",
+      category: "APIServer"
+    )
+  }
+}
+
+actor APIMutationGate {
+  private var maintenanceInProgress = false
+  private var activeMutations: Set<UUID> = []
+  private var drainWaiters: [CheckedContinuation<Void, Never>] = []
+
+  func acquireMutation() -> UUID? {
+    guard maintenanceInProgress == false else { return nil }
+    let id = UUID()
+    activeMutations.insert(id)
+    return id
+  }
+
+  func releaseMutation(_ id: UUID) {
+    activeMutations.remove(id)
+    resumeDrainWaitersIfNeeded()
+  }
+
+  func beginMaintenance() -> Bool {
+    guard maintenanceInProgress == false else { return false }
+    maintenanceInProgress = true
     return true
+  }
+
+  func waitUntilDrained() async {
+    guard activeMutations.isEmpty == false else { return }
+    await withCheckedContinuation { continuation in
+      drainWaiters.append(continuation)
+    }
+  }
+
+  func endMaintenance() {
+    maintenanceInProgress = false
+  }
+
+  #if DEBUG
+  func hasDrainWaiterForTesting() -> Bool {
+    drainWaiters.isEmpty == false
+  }
+  #endif
+
+  private func resumeDrainWaitersIfNeeded() {
+    guard activeMutations.isEmpty else { return }
+    let waiters = drainWaiters
+    drainWaiters.removeAll()
+    for waiter in waiters {
+      waiter.resume()
+    }
   }
 }

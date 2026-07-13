@@ -26,7 +26,10 @@ final class AVFConfiguration {
 enum AVFError: Error, LocalizedError {
   case invalidHardwareModel
   case invalidMachineIdentifier
+  case invalidMACAddress(String)
   case diskImageNotFound(String)
+  case storageAttachmentFailed(String, String)
+  case platformIdentityReadFailed(String, String)
   case configurationValidationFailed(Error)
   case missingInstallationRequirements
   case insufficientResources(String)
@@ -38,8 +41,14 @@ enum AVFError: Error, LocalizedError {
       "Invalid hardware model data"
     case .invalidMachineIdentifier:
       "Invalid machine identifier data"
+    case .invalidMACAddress(let address):
+      "Invalid VM MAC address: \(address)"
     case .diskImageNotFound(let path):
       "Disk image not found at: \(path)"
+    case .storageAttachmentFailed(let path, let message):
+      "Failed to attach disk image at \(path): \(message)"
+    case .platformIdentityReadFailed(let path, let message):
+      "Failed to read VM platform identity at \(path): \(message)"
     case .configurationValidationFailed(let error):
       "Configuration validation failed: \(error.localizedDescription)"
     case .missingInstallationRequirements:

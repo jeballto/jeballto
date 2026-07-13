@@ -20,10 +20,21 @@ struct ByteSizeAndFlexibleByteSizeTests {
     #expect(parsed == input.expected)
   }
 
-  @Test(arguments: ["", "500", "5PB", "GB", "-1GB", "0GB", "abcMB"])
+  @Test(arguments: [
+    "", "500", "5PB", "GB", "-1GB", "0GB", "abcMB", "1e1GB", "+1GB", ".5GB", "1.GB",
+    "0.0000001MB",
+  ])
   func byteSizeParserRejectsInvalidValues(_ value: String) {
     #expect(throws: ByteSizeParseError.self) {
       _ = try ByteSize.parse(value)
+    }
+  }
+
+  @Test
+  func byteSizeParserDoesNotRoundFractionalBytes() throws {
+    #expect(try ByteSize.parse("0.5MB") == 524_288)
+    #expect(throws: ByteSizeParseError.self) {
+      _ = try ByteSize.parse("0.1MB")
     }
   }
 
@@ -52,8 +63,10 @@ struct ByteSizeAndFlexibleByteSizeTests {
 
   @Test
   func byteSizeParserRejectsOverflowValues() {
-    #expect(throws: ByteSizeParseError.self) {
-      _ = try ByteSize.parse("18446744073709551616TB")
+    for value in ["16777216TB", "1e308TB", "1e309TB", "18446744073709551616TB"] {
+      #expect(throws: ByteSizeParseError.self) {
+        _ = try ByteSize.parse(value)
+      }
     }
   }
 

@@ -23,6 +23,15 @@ struct RequestValidationTests {
   }
 
   @Test
+  func createVMRequestRejectsEmptyImageInsteadOfTreatingItAsAbsent() {
+    let request = CreateVMRequest(name: "dev-vm", resources: nil, image: "")
+    let validation = request.validate()
+
+    #expect(validation.valid == false)
+    #expect(validation.error == "image must not be empty; omit it to create a blank VM")
+  }
+
+  @Test
   func cloneVMRequestRejectsInvalidName() {
     let request = CloneVMRequest(name: "", resources: nil)
     let validation = request.validate()
@@ -44,6 +53,13 @@ struct RequestValidationTests {
     InstallVMRequest(source: "http://example.com/file.ipsw"),
     InstallVMRequest(source: "file://relative/path.ipsw"),
     InstallVMRequest(source: "relative/path.ipsw"),
+    InstallVMRequest(source: ""),
+    InstallVMRequest(source: "https:///missing-host.ipsw"),
+    InstallVMRequest(source: "https://user:password@example.com/file.ipsw"),
+    InstallVMRequest(source: "https://example.com/file.ipsw#fragment"),
+    InstallVMRequest(source: "file://remote-host/tmp/file.ipsw"),
+    InstallVMRequest(source: "file:///tmp/file.ipsw?query=true"),
+    InstallVMRequest(source: "ftp://example.com/file.ipsw"),
   ])
   func installVMRequestRejectsUnsupportedSources(_ request: InstallVMRequest) {
     #expect(request.validate().valid == false)
@@ -51,11 +67,18 @@ struct RequestValidationTests {
 
   @Test
   func installVMRequestNormalizesFileScheme() {
-    let fromFile = InstallVMRequest(source: "file:///tmp/test.ipsw")
+    let fromFile = InstallVMRequest(source: "file:///tmp/test%20image.ipsw")
     let fromHttps = InstallVMRequest(source: "https://example.com/test.ipsw")
 
-    #expect(fromFile.effectiveIPSWSource == "/tmp/test.ipsw")
+    #expect(fromFile.effectiveIPSWSource == "/tmp/test image.ipsw")
     #expect(fromHttps.effectiveIPSWSource == "https://example.com/test.ipsw")
+  }
+
+  @Test
+  func installVMRequestRejectsOversizedAndControlledSources() {
+    let oversized = "/" + String(repeating: "a", count: IPSWSourceValidator.maximumSourceLength)
+    #expect(InstallVMRequest(source: oversized).validate().valid == false)
+    #expect(InstallVMRequest(source: "/tmp/test\nimage.ipsw").validate().valid == false)
   }
 
   @Test
@@ -70,7 +93,7 @@ struct RequestValidationTests {
     #expect(timeoutTooHigh.validate().valid == false)
     #expect(emptyCommand.validate().valid == false)
     #expect(valid.effectiveUser == "admin")
-    #expect(valid.effectivePassword == "admin")
+    #expect(valid.effectivePassword == nil)
     #expect(valid.effectiveTimeout == 60)
   }
 
@@ -83,12 +106,55 @@ struct RequestValidationTests {
   }
 
   @Test
+  func commandExecuteMeasuresCommandLimitInUTF8Bytes() {
+    let command = String(repeating: "é", count: CommandExecutor.maxCommandLength / 2 + 1)
+    let request = CommandExecuteRequest(command: command, user: nil, password: nil, timeout: nil)
+
+    #expect(command.count < CommandExecutor.maxCommandLength)
+    #expect(request.validate().valid == false)
+    #expect(request.validate().error?.contains("UTF-8 bytes") == true)
+  }
+
+  @Test(arguments: ["line\nbreak", "carriage\rreturn", "nul\0value"])
+  func commandExecuteRejectsPasswordCharactersAskpassCannotRepresent(_ password: String) {
+    let request = CommandExecuteRequest(command: "true", user: nil, password: password, timeout: nil)
+
+    #expect(request.validate().valid == false)
+  }
+
+  @Test
+  func commandExecuteRejectsOverlongPassword() {
+    let password = String(repeating: "p", count: CommandExecutor.maxPasswordLength + 1)
+    let request = CommandExecuteRequest(command: "true", user: nil, password: password, timeout: nil)
+
+    #expect(request.validate().valid == false)
+    #expect(request.validate().error?.contains("UTF-8 bytes") == true)
+  }
+
+  @Test(arguments: ["-oProxyCommand=whoami", "admin@example.com", "name with spaces", ".hidden"])
+  func commandExecuteRejectsUnsafeSSHUsernames(_ username: String) {
+    let request = CommandExecuteRequest(command: "true", user: username, password: nil, timeout: nil)
+
+    #expect(request.validate().valid == false)
+  }
+
+  @Test(arguments: ["admin", "build.bot-1", "_automation", "1234"])
+  func commandExecuteAcceptsSafeSSHUsernames(_ username: String) {
+    let request = CommandExecuteRequest(command: "true", user: username, password: nil, timeout: nil)
+
+    #expect(request.validate().valid)
+  }
+
+  @Test
   func keystrokesRequestValidation() {
     #expect(KeystrokesRequest(keystrokes: ["a", "<enter>"]).validate().valid)
     #expect(KeystrokesRequest(keystrokes: []).validate().valid == false)
 
     let veryLong = String(repeating: "a", count: 10001)
     #expect(KeystrokesRequest(keystrokes: [veryLong]).validate().valid == false)
+
+    let aggregateTooLong = [String(repeating: "a", count: 6000), String(repeating: "b", count: 5000)]
+    #expect(KeystrokesRequest(keystrokes: aggregateTooLong).validate().valid == false)
   }
 
   @Test
@@ -103,8 +169,11 @@ struct RequestValidationTests {
 
     #expect(valid.validate().valid)
     #expect(invalidRef.validate().valid == false)
+    #expect(invalidRef.validationFailureCode == "INVALID_REFERENCE")
     #expect(invalidTimeout.validate().valid == false)
+    #expect(invalidTimeout.validationFailureCode == "INVALID_REQUEST")
     #expect(timeoutTooHigh.validate().valid == false)
+    #expect(timeoutTooHigh.validationFailureCode == "INVALID_REQUEST")
   }
 
   @Test
@@ -172,6 +241,13 @@ struct RequestValidationTests {
     #expect(logoutInvalid.validate().valid == false)
   }
 
+  @Test(arguments: ["line\nbreak", "tab\tvalue", "nul\0value"])
+  func registryLoginRejectsControlCharactersInUsername(_ username: String) {
+    let request = RegistryLoginRequest(registry: "registry.example.com", username: username, password: "password")
+
+    #expect(request.validate().valid == false)
+  }
+
   @Test
   func updateConfigImageParallelismValidation() throws {
     let validJSON = """
@@ -223,6 +299,20 @@ struct RequestValidationTests {
   }
 
   @Test
+  func configResponseEncodesUnsetNullableValuesAsNull() throws {
+    var config = Config.default
+    config.logging.timezone = nil
+    config.images.defaultRegistry = nil
+    let data = try JSONEncoder().encode(ConfigResponse(from: config))
+    let json = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    let logging = try #require(json["logging"] as? [String: Any])
+    let images = try #require(json["images"] as? [String: Any])
+
+    #expect(logging["timezone"] is NSNull)
+    #expect(images["defaultRegistry"] is NSNull)
+  }
+
+  @Test
   func updateConfigRequestValidation() {
     let valid = UpdateConfigRequest(
       logging: LoggingConfigUpdate(level: "info", retentionDays: 7, maxTotalSize: "2GB", timezone: "Europe/Warsaw"),
@@ -269,15 +359,28 @@ struct RequestValidationTests {
     #expect(invalidPortRange.validate().valid == false)
   }
 
-  @Test
-  func updateConfigRejectsRequestsWithoutSupportedSections() throws {
-    let apiOnlyJSON = #"{"api":{"host":"127.0.0.1"}}"#
-    let request = try JSONDecoder().decode(UpdateConfigRequest.self, from: Data(apiOnlyJSON.utf8))
+  @Test(arguments: [
+    #"{}"#,
+    #"{"unsupported":true}"#,
+    #"{"api":{"host":"127.0.0.1"}}"#,
+    #"{"logging":null}"#,
+    #"{"logging":{}}"#,
+    #"{"logging":{"unknown":"debug"}}"#,
+    #"{"networking":{}}"#,
+    #"{"networking":{"unknown":true}}"#,
+    #"{"images":{}}"#,
+    #"{"images":{"unknown":4}}"#,
+    #"{"logging":{"level":null}}"#,
+    #"{"networking":{"autoEnableSSHForwarding":null}}"#,
+    #"{"images":{"maxParallelImageBlobTransfers":null}}"#,
+  ])
+  func updateConfigRejectsRequestsWithoutEffectiveSupportedFields(_ json: String) throws {
+    let request = try JSONDecoder().decode(UpdateConfigRequest.self, from: Data(json.utf8))
 
     let validation = request.validate()
 
     #expect(validation.valid == false)
-    #expect(validation.error?.contains("logging, networking, or images") == true)
+    #expect(validation.error?.contains("supported config field") == true)
   }
 
   @Test
@@ -287,11 +390,13 @@ struct RequestValidationTests {
 
     let clear = try JSONDecoder().decode(UpdateConfigRequest.self, from: Data(clearJSON.utf8))
     let missing = try JSONDecoder().decode(UpdateConfigRequest.self, from: Data(missingJSON.utf8))
+    let clearLogging = try #require(clear.logging)
+    let clearImages = try #require(clear.images)
+    let clearedTimezone = try #require(clearLogging.timezone)
+    let clearedDefaultRegistry = try #require(clearImages.defaultRegistry)
 
-    #expect(clear.logging?.timezone != nil)
-    #expect(clear.logging?.timezone! == nil)
-    #expect(clear.images?.defaultRegistry != nil)
-    #expect(clear.images?.defaultRegistry! == nil)
+    #expect(clearedTimezone == nil)
+    #expect(clearedDefaultRegistry == nil)
     #expect(missing.logging?.timezone == nil)
     #expect(missing.images?.defaultRegistry == nil)
     #expect(clear.validate().valid)
@@ -412,6 +517,22 @@ struct RequestValidationTests {
   }
 
   @Test
+  func cloneVMRequestDecodesAndValidatesLifetime() throws {
+    let valid = try JSONDecoder().decode(
+      CloneVMRequest.self,
+      from: Data(#"{"name":"clone","lifetimeSeconds":3600}"#.utf8)
+    )
+    let invalid = try JSONDecoder().decode(
+      CloneVMRequest.self,
+      from: Data(#"{"name":"clone","lifetimeSeconds":0}"#.utf8)
+    )
+
+    #expect(valid.lifetimeSeconds == 3600)
+    #expect(valid.validate().valid)
+    #expect(invalid.validate().valid == false)
+  }
+
+  @Test
   func vmResponseIncludesEphemeralField() {
     let id = UUID()
     let definition = VMDefinition(
@@ -439,6 +560,25 @@ struct RequestValidationTests {
     let response = VMResponse(from: definition)
 
     #expect(response.ephemeral == false)
+  }
+
+  @Test
+  func vmResponseEncodesRequiredNullableFieldsAsNull() throws {
+    let id = UUID()
+    let definition = VMDefinition(
+      id: id,
+      name: "normal-vm",
+      resources: .default,
+      paths: VMPaths.forVM(id: id, baseDir: "/tmp/test")
+    )
+    let data = try JSONEncoder().encode(VMResponse(from: definition))
+    let json = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+
+    #expect(json["uptime"] is NSNull)
+    #expect(json["lifetimeSeconds"] is NSNull)
+    #expect(json["expiresAt"] is NSNull)
+    #expect(json["network"] != nil)
+    #expect(json["guiOpen"] != nil)
   }
 
   // MARK: - UpdateVMRequest
@@ -570,11 +710,13 @@ struct RequestValidationTests {
 
     #expect(request.validate().valid == false)
   }
+}
 
-  // MARK: - VMResourcesResponse formatting
+extension RequestValidationTests {
+  // MARK: - VMResourcesResponse
 
   @Test
-  func vmResourcesResponseFormatsWholeGB() {
+  func vmResourcesResponseReturnsExactBytes() {
     let resources = VMResources(
       cpuCount: 4,
       memorySize: 8 * 1024 * 1024 * 1024,
@@ -582,22 +724,22 @@ struct RequestValidationTests {
     )
     let response = VMResourcesResponse(from: resources)
 
-    #expect(response.memorySize == "8GB")
-    #expect(response.diskSize == "64GB")
+    #expect(response.memorySize == 8 * 1024 * 1024 * 1024)
+    #expect(response.diskSize == 64 * 1024 * 1024 * 1024)
     #expect(response.cpuCount == 4)
   }
 
   @Test
-  func vmResourcesResponseFormatsFractionalGB() {
+  func vmResourcesResponseDoesNotRoundByteValues() {
     let resources = VMResources(
       cpuCount: 2,
-      memorySize: UInt64(4.5 * 1024 * 1024 * 1024),
-      diskSize: UInt64(32.5 * 1024 * 1024 * 1024)
+      memorySize: 4 * 1024 * 1024 * 1024 + 1,
+      diskSize: 32 * 1024 * 1024 * 1024 + 7
     )
     let response = VMResourcesResponse(from: resources)
 
-    #expect(response.memorySize == "4.5GB")
-    #expect(response.diskSize == "32.5GB")
+    #expect(response.memorySize == resources.memorySize)
+    #expect(response.diskSize == resources.diskSize)
   }
 
   @Test
@@ -611,10 +753,9 @@ struct RequestValidationTests {
     let data = try JSONEncoder().encode(response)
     let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
 
-    // Verify new key names are used (not memoryGB/diskGB)
-    #expect(json?["memorySize"] as? String == "4GB")
-    #expect(json?["diskSize"] as? String == "64GB")
-    #expect(json?["cpuCount"] as? Int == 4)
+    #expect((json?["memorySize"] as? NSNumber)?.uint64Value == UInt64(4 * 1024 * 1024 * 1024))
+    #expect((json?["diskSize"] as? NSNumber)?.uint64Value == UInt64(64 * 1024 * 1024 * 1024))
+    #expect((json?["cpuCount"] as? NSNumber)?.intValue == 4)
     #expect(json?["memoryGB"] == nil)
     #expect(json?["diskGB"] == nil)
   }
@@ -630,9 +771,9 @@ struct RequestValidationTests {
   }
 
   @Test
-  func updateConfigAcceptsNilTimezone() {
+  func updateConfigAcceptsExplicitNilTimezone() {
     let request = UpdateConfigRequest(
-      logging: LoggingConfigUpdate(level: nil, retentionDays: nil, maxTotalSize: nil, timezone: nil),
+      logging: LoggingConfigUpdate(level: nil, retentionDays: nil, maxTotalSize: nil, timezone: .some(nil)),
       networking: nil,
       images: nil
     )
@@ -693,14 +834,15 @@ struct RequestValidationTests {
   }
 
   @Test
-  func vmDefinitionDecodesLegacyJSONWithoutLifetimeFields() throws {
+  func vmDefinitionDecodesVersionOneJSONWithoutOptionalLifetimeFields() throws {
     let id = UUID()
     let json = Data(#"""
     {
       "id": "\#(id.uuidString)",
-      "name": "legacy",
+      "name": "version-one",
       "state": "stopped",
       "ephemeral": false,
+      "hasBooted": false,
       "resources": {"cpuCount": 4, "memorySize": 4294967296, "diskSize": 21474836480},
       "network": {"macAddress": "02:00:00:00:00:01"},
       "paths": {
@@ -708,7 +850,8 @@ struct RequestValidationTests {
         "diskImagePath": "/tmp/x.bundle/Disk.img",
         "auxiliaryStoragePath": "/tmp/x.bundle/AuxiliaryStorage",
         "hardwareModelPath": "/tmp/x.bundle/HardwareModel",
-        "machineIdentifierPath": "/tmp/x.bundle/MachineIdentifier"
+        "machineIdentifierPath": "/tmp/x.bundle/MachineIdentifier",
+        "saveFilePath": "/tmp/x.bundle/SaveFile.vzvmsave"
       },
       "metadata": {},
       "createdAt": "2024-01-01T00:00:00Z",

@@ -1,7 +1,8 @@
+import Darwin
 import Foundation
 
 /// Complete definition of a virtual machine including all configuration and metadata
-struct VMDefinition: Codable, Identifiable, Equatable {
+struct VMDefinition: Codable, Identifiable, Equatable, Sendable {
   let id: UUID
   var name: String
   var state: VMState
@@ -10,6 +11,10 @@ struct VMDefinition: Codable, Identifiable, Equatable {
   var network: VMNetwork
   var paths: VMPaths
   var metadata: [String: String]
+  /// Installation lifecycle persisted independently from the runtime VM state.
+  var installation: VMInstallation?
+  /// True after the guest reached `running` at least once.
+  var hasBooted: Bool
   /// Max lifetime in seconds from first `.running` transition. `nil` = no TTL.
   var lifetimeSeconds: Int?
   /// Absolute expiry instant; set when the VM first enters `.running`. Persisted so TTL survives restart.
@@ -26,6 +31,8 @@ struct VMDefinition: Codable, Identifiable, Equatable {
     network: VMNetwork = VMNetwork(),
     paths: VMPaths,
     metadata: [String: String] = [:],
+    installation: VMInstallation? = nil,
+    hasBooted: Bool = false,
     lifetimeSeconds: Int? = nil,
     expiresAt: Date? = nil,
     createdAt: Date = Date(),
@@ -39,6 +46,8 @@ struct VMDefinition: Codable, Identifiable, Equatable {
     self.network = network
     self.paths = paths
     self.metadata = metadata
+    self.installation = installation
+    self.hasBooted = hasBooted
     self.lifetimeSeconds = lifetimeSeconds
     self.expiresAt = expiresAt
     self.createdAt = createdAt
@@ -93,10 +102,75 @@ struct VMDefinition: Codable, Identifiable, Equatable {
     expiresAt = nil
     updatedAt = Date()
   }
+
+  mutating func markBooted() {
+    hasBooted = true
+    updatedAt = Date()
+  }
+
+  mutating func updateInstallation(_ installation: VMInstallation) {
+    self.installation = installation
+    updatedAt = Date()
+  }
+}
+
+/// Durable installation lifecycle for a VM.
+struct VMInstallation: Codable, Equatable, Sendable {
+  enum State: String, Codable, Equatable, Sendable {
+    case installing
+    case finalizing
+    case completed
+    case failed
+    case cancelled
+    case interrupted
+
+    var isActive: Bool { self == .installing || self == .finalizing }
+  }
+
+  var state: State
+  var message: String
+  var error: String?
+  let startedAt: Date
+  var updatedAt: Date
+  var completedAt: Date?
+
+  init(
+    state: State,
+    message: String,
+    error: String? = nil,
+    startedAt: Date = Date(),
+    updatedAt: Date = Date(),
+    completedAt: Date? = nil
+  ) {
+    self.state = state
+    self.message = message
+    self.error = error
+    self.startedAt = startedAt
+    self.updatedAt = updatedAt
+    self.completedAt = completedAt
+  }
+
+  mutating func finish(as state: State, message: String, error: String? = nil) {
+    self.state = state
+    self.message = message
+    self.error = error
+    updatedAt = Date()
+    completedAt = Date()
+  }
+
+  static func completed(message: String, at date: Date = Date()) -> VMInstallation {
+    VMInstallation(
+      state: .completed,
+      message: message,
+      startedAt: date,
+      updatedAt: date,
+      completedAt: date
+    )
+  }
 }
 
 /// Hardware resource configuration for a VM
-struct VMResources: Codable, Equatable {
+struct VMResources: Codable, Equatable, Sendable {
   var cpuCount: Int
   /// Memory allocated to the VM, in bytes. Use `memoryGB` for display.
   var memorySize: UInt64
@@ -129,7 +203,7 @@ struct VMResources: Codable, Equatable {
 }
 
 /// Network configuration for a VM
-struct VMNetwork: Codable, Equatable {
+struct VMNetwork: Codable, Equatable, Sendable {
   var macAddress: String
   var sshPort: Int?
   var vncPort: Int?
@@ -161,21 +235,33 @@ struct VMNetwork: Codable, Equatable {
   /// Validates MAC address format
   var isValidMACAddress: Bool {
     let pattern = "^([0-9A-Fa-f]{2}:){5}([0-9A-Fa-f]{2})$"
-    return macAddress.range(of: pattern, options: .regularExpression) != nil
+    guard macAddress.range(of: pattern, options: .regularExpression) != nil,
+          let firstOctetText = macAddress.split(separator: ":").first,
+          let firstOctet = UInt8(firstOctetText, radix: 16) else
+    {
+      return false
+    }
+    return firstOctet & 0x01 == 0 && firstOctet & 0x02 == 0x02
+  }
+
+  var isValidNATIPAddress: Bool {
+    guard let natIP else { return true }
+    var address = in_addr()
+    return natIP.withCString { inet_pton(AF_INET, $0, &address) == 1 }
   }
 }
 
 /// File paths associated with a VM bundle
-struct VMPaths: Codable, Equatable {
+struct VMPaths: Codable, Equatable, Sendable {
   var bundlePath: String
   var diskImagePath: String
   /// NVRAM data required by the Virtualization framework. Must not be deleted while the VM is running.
   var auxiliaryStoragePath: String
   var hardwareModelPath: String
   var machineIdentifierPath: String
-  /// Path to the VM save file (`SaveFile.vzvmsave`). Non-nil only while the VM is in `paused` state.
-  /// Deleted automatically when the VM resumes or is deleted.
-  var saveFilePath: String?
+  /// Path where VM save state is written (`SaveFile.vzvmsave`). The path is configured for every VM bundle.
+  /// The file itself exists only while a saved paused state is present.
+  var saveFilePath: String
 
   /// Creates paths for a VM with the given ID in the standard location
   static func forVM(id: UUID, baseDir: String? = nil) -> VMPaths {
@@ -220,7 +306,7 @@ struct VMPaths: Codable, Equatable {
 }
 
 /// Top-level database structure containing all VMs
-struct VMDatabase: Codable {
+struct VMDatabase: Codable, Sendable {
   var version: Int
   var vms: [UUID: VMDefinition]
 

@@ -1,5 +1,23 @@
 import Foundation
 
+// FileHandle can autorelease every Data returned by a long read loop until its surrounding
+// worker drains. Bound each chunk to its own pool so large image and log files keep constant memory use.
+func readFileChunk(from handle: FileHandle, upToCount count: Int) throws -> Data? {
+  try autoreleasepool {
+    try handle.read(upToCount: count)
+  }
+}
+
+// Bundled tools must not inherit debugger-injected dynamic libraries from the app process.
+// Custom tools keep the caller environment because their dependencies may rely on DYLD settings.
+func bundledToolEnvironment(
+  from environment: [String: String] = ProcessInfo.processInfo.environment
+) -> [String: String] {
+  environment.filter { key, _ in
+    key.hasPrefix("DYLD_") == false
+  }
+}
+
 // MARK: - Token Masking
 
 /// Masks a token for safe logging, showing only first 4 and last 4 characters
@@ -21,15 +39,15 @@ enum VMNameValidator {
   static func validate(_ name: String) -> Bool {
     guard !name.isEmpty, name.count <= 100 else { return false }
     let trimmed = name.trimmingCharacters(in: .whitespaces)
-    guard !trimmed.isEmpty else { return false }
+    guard !trimmed.isEmpty, trimmed == name else { return false }
     return trimmed.unicodeScalars.allSatisfy { allowedCharacters.contains($0) }
   }
 }
 
-// MARK: - Shared Date Formatter
+// MARK: - Date Formatting
 
-/// Thread-safe ISO8601 date formatter for API responses
-let iso8601Formatter: ISO8601DateFormatter = {
+/// Formats a date for API responses without sharing formatter instances across threads.
+func iso8601String(from date: Date) -> String {
   let formatter = ISO8601DateFormatter()
-  return formatter
-}()
+  return formatter.string(from: date)
+}

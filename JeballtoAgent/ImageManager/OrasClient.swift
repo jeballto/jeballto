@@ -4,142 +4,49 @@ import Foundation
 
 /// Errors from oras CLI operations
 enum OrasError: Error, LocalizedError {
+  case invalidInput(String)
   case orasNotFound(String)
   case commandFailed(exitCode: Int32, stderr: String)
   case invalidOutput(String)
   case timeout(String)
+  case manifestCommitOutcomeUnknown(String)
 
   var errorDescription: String? {
     switch self {
+    case .invalidInput(let msg): "Invalid oras input: \(msg)"
     case .orasNotFound(let msg): "oras binary not found: \(msg)"
     case .commandFailed(let code, let stderr): "oras command failed (exit \(code)): \(stderr)"
     case .invalidOutput(let msg): "Invalid oras output: \(msg)"
     case .timeout(let msg): "oras command timed out: \(msg)"
+    case .manifestCommitOutcomeUnknown(let msg):
+      "OCI manifest publication started, but its commit outcome is unknown: \(msg)"
     }
   }
 }
 
-/// Result of an oras pull operation
-struct OrasPullResult: Sendable {
-  let digest: String
-  let rawOutput: String
-}
+private final class OrasManifestPushAttempt: @unchecked Sendable {
+  private let lock = NSLock()
+  private var processStarted = false
 
-/// Result of an oras push operation
-struct OrasPushResult: Sendable {
-  let digest: String
-  let rawOutput: String
-}
-
-private let ociImageManifestMediaType = "application/vnd.oci.image.manifest.v1+json"
-
-/// Metadata from an OCI manifest
-struct OrasDescriptor: Codable, Equatable, Sendable {
-  let mediaType: String
-  let digest: String
-  let size: UInt64
-}
-
-struct OrasManifestInfo: Sendable {
-  let schemaVersion: Int?
-  let mediaType: String?
-  let artifactType: String?
-  let configMediaType: String?
-  let configDescriptor: OrasDescriptor?
-  let layers: [OrasDescriptor]
-  let rawManifest: String
-
-  var isJeballtoImage: Bool {
-    (try? validateJeballtoImage()) != nil
+  var didStart: Bool {
+    lock.withLock { processStarted }
   }
 
-  var formatSummary: String {
-    let layerSummary = Dictionary(grouping: layers, by: \.mediaType)
-      .map { mediaType, descriptors in "\(mediaType) x\(descriptors.count)" }
-      .sorted()
-      .joined(separator: ", ")
-    return [
-      "schemaVersion=\(schemaVersion.map(String.init) ?? "nil")",
-      "mediaType=\(mediaType ?? "nil")",
-      "artifactType=\(artifactType ?? "nil")",
-      "configMediaType=\(configMediaType ?? "nil")",
-      "layerMediaTypes=\(layerSummary)",
-    ].joined(separator: ", ")
+  func markStarted() {
+    lock.withLock { processStarted = true }
   }
-
-  init(rawManifest: String) throws {
-    struct Manifest: Decodable {
-      let schemaVersion: Int?
-      let mediaType: String?
-      let artifactType: String?
-      let config: OrasDescriptor?
-      let layers: [OrasDescriptor]?
-    }
-
-    let data = Data(rawManifest.utf8)
-    let manifest = try JSONDecoder().decode(Manifest.self, from: data)
-    schemaVersion = manifest.schemaVersion
-    mediaType = manifest.mediaType
-    artifactType = manifest.artifactType
-    configMediaType = manifest.config?.mediaType
-    configDescriptor = manifest.config
-    layers = manifest.layers ?? []
-    self.rawManifest = rawManifest
-  }
-
-  func validateJeballtoImage(reference: String? = nil) throws {
-    let subject = reference ?? "image"
-
-    guard schemaVersion == 2 else {
-      throw OrasError.invalidOutput("\(subject) manifest must use OCI schemaVersion 2")
-    }
-    if let mediaType, mediaType != ociImageManifestMediaType {
-      throw OrasError.invalidOutput("\(subject) manifest has unsupported media type \(mediaType)")
-    }
-    guard artifactType == jeballtoImageArtifactType else {
-      throw OrasError.invalidOutput("\(subject) manifest has unsupported artifact type \(artifactType ?? "nil")")
-    }
-    guard let configDescriptor else {
-      throw OrasError.invalidOutput("\(subject) manifest is missing a config descriptor")
-    }
-    guard configDescriptor.mediaType == jeballtoImageConfigMediaType else {
-      throw OrasError
-        .invalidOutput("\(subject) manifest has unsupported config media type \(configDescriptor.mediaType)")
-    }
-    try Self.validateDescriptor(configDescriptor, role: "config", subject: subject)
-    guard layers.isEmpty == false else {
-      throw OrasError.invalidOutput("\(subject) manifest must include at least one layer")
-    }
-    for layer in layers {
-      guard layer.mediaType == jeballtoImageChunkMediaType else {
-        throw OrasError.invalidOutput("\(subject) manifest has unsupported layer media type \(layer.mediaType)")
-      }
-      try Self.validateDescriptor(layer, role: "layer", subject: subject)
-    }
-  }
-
-  private static func validateDescriptor(_ descriptor: OrasDescriptor, role: String, subject: String) throws {
-    guard descriptor.digest.range(of: "^sha256:[a-f0-9]{64}$", options: .regularExpression) != nil else {
-      throw OrasError.invalidOutput("\(subject) \(role) descriptor has invalid digest \(descriptor.digest)")
-    }
-    guard descriptor.size > 0 else {
-      throw OrasError.invalidOutput("\(subject) \(role) descriptor must have a positive size")
-    }
-  }
-}
-
-enum OrasBlobPresence: Equatable, Sendable {
-  case exists
-  case missing
 }
 
 /// Swift wrapper around the oras CLI binary.
 /// Uses Process with array arguments (no shell) to prevent command injection.
 struct OrasClient: Sendable {
   private let config: ImageConfig
+  private let temporaryRoot: URL
+  private let credentialStore: RegistryCredentialStore
+  private let childProcessLease: ImageWorkChildProcessLease?
 
   /// Maximum output size per stream (stdout/stderr)
-  private static let maxOutputSize = 5 * 1024 * 1024
+  private static let maxOutputSize = 8 * 1024 * 1024
 
   /// Default timeout for oras push/pull: nil means unlimited
   private static let defaultTimeout: TimeInterval? = nil
@@ -147,8 +54,33 @@ struct OrasClient: Sendable {
   /// Timeout for short commands (login, logout, resolve)
   private static let shortTimeout: TimeInterval = 30
 
-  init(config: ImageConfig) {
+  init(
+    config: ImageConfig,
+    temporaryRoot: URL,
+    credentialStore: RegistryCredentialStore = .shared,
+    childProcessLease: ImageWorkChildProcessLease? = nil
+  ) {
     self.config = config
+    self.temporaryRoot = temporaryRoot
+    self.credentialStore = credentialStore
+    self.childProcessLease = childProcessLease
+  }
+
+  var imageWorkSessionURL: URL {
+    temporaryRoot
+  }
+
+  var imageWorkChildProcessLease: ImageWorkChildProcessLease? {
+    childProcessLease
+  }
+
+  func updatingConfig(_ config: ImageConfig) -> OrasClient {
+    OrasClient(
+      config: config,
+      temporaryRoot: temporaryRoot,
+      credentialStore: credentialStore,
+      childProcessLease: childProcessLease
+    )
   }
 
   // MARK: - Public API
@@ -165,7 +97,11 @@ struct OrasClient: Sendable {
     args.append(contentsOf: Self.transportSecurityArguments(plainHTTP: insecure))
 
     do {
-      _ = try await execute(arguments: args, timeout: Self.shortTimeout)
+      _ = try await execute(
+        arguments: args,
+        timeout: Self.shortTimeout,
+        registryHost: Self.registryHost(fromRepositoryReference: repositoryReference)
+      )
       return .exists
     } catch is CancellationError {
       throw CancellationError()
@@ -208,9 +144,23 @@ struct OrasClient: Sendable {
     ]
     args.append(contentsOf: Self.transportSecurityArguments(plainHTTP: insecure))
 
-    let result = try await execute(arguments: args, timeout: timeout ?? Self.defaultTimeout)
+    let result = try await execute(
+      arguments: args,
+      timeout: timeout ?? Self.defaultTimeout,
+      registryHost: Self.registryHost(fromRepositoryReference: repositoryReference)
+    )
     let stdout = String(data: result.stdout, encoding: .utf8) ?? ""
-    return parseDescriptorFromJSON(stdout) ?? OrasDescriptor(mediaType: mediaType, digest: digest, size: expectedSize)
+    guard let descriptor = parseDescriptorFromJSON(stdout) else {
+      throw OrasError.invalidOutput("blob push did not return a valid descriptor")
+    }
+    try Self.validateReturnedDescriptor(
+      descriptor,
+      expectedMediaType: mediaType,
+      expectedDigest: digest,
+      expectedSize: expectedSize,
+      operation: "blob push"
+    )
+    return descriptor
   }
 
   /// Pushes an OCI image manifest and returns the pushed manifest digest.
@@ -220,6 +170,7 @@ struct OrasClient: Sendable {
     insecure: Bool = false,
     timeout: TimeInterval? = nil
   ) async throws -> OrasPushResult {
+    let expectedManifest = try OrasLocalManifest.metadata(atPath: manifestPath)
     var args = [
       "manifest", "push",
       "--descriptor",
@@ -229,14 +180,33 @@ struct OrasClient: Sendable {
     ]
     args.append(contentsOf: Self.transportSecurityArguments(plainHTTP: insecure))
 
-    let result = try await execute(arguments: args, timeout: timeout ?? Self.defaultTimeout)
-    let stdout = String(data: result.stdout, encoding: .utf8) ?? ""
-    let digest: String = if let descriptorDigest = parseDescriptorFromJSON(stdout)?.digest {
-      descriptorDigest
-    } else {
-      try sha256File(atPath: manifestPath)
+    let attempt = OrasManifestPushAttempt()
+    do {
+      let result = try await execute(
+        arguments: args,
+        timeout: timeout ?? Self.defaultTimeout,
+        registryHost: reference.registry,
+        onProcessStarted: { attempt.markStarted() }
+      )
+      let stdout = String(data: result.stdout, encoding: .utf8) ?? ""
+      guard let descriptor = parseDescriptorFromJSON(stdout) else {
+        throw OrasError.invalidOutput("manifest push did not return a valid descriptor")
+      }
+      try Self.validateReturnedDescriptor(
+        descriptor,
+        expectedMediaType: ociImageManifestMediaType,
+        expectedDigest: expectedManifest.digest,
+        expectedSize: expectedManifest.size,
+        operation: "manifest push"
+      )
+      return OrasPushResult(digest: descriptor.digest)
+    } catch {
+      guard attempt.didStart else { throw error }
+      if case OrasError.manifestCommitOutcomeUnknown = error {
+        throw error
+      }
+      throw OrasError.manifestCommitOutcomeUnknown(error.localizedDescription)
     }
-    return OrasPushResult(digest: digest, rawOutput: stdout)
   }
 
   /// Fetches the raw OCI manifest so callers can verify the Jeballto image format.
@@ -244,8 +214,14 @@ struct OrasClient: Sendable {
     var args = ["manifest", "fetch", reference.fullReference]
     args.append(contentsOf: Self.transportSecurityArguments(plainHTTP: insecure))
 
-    let result = try await execute(arguments: args, timeout: Self.shortTimeout)
-    let stdout = String(data: result.stdout, encoding: .utf8) ?? ""
+    let result = try await execute(
+      arguments: args,
+      timeout: Self.shortTimeout,
+      registryHost: reference.registry
+    )
+    guard let stdout = String(data: result.stdout, encoding: .utf8) else {
+      throw OrasError.invalidOutput("Manifest output is not valid UTF-8")
+    }
     do {
       return try OrasManifestInfo(rawManifest: stdout)
     } catch {
@@ -274,17 +250,22 @@ struct OrasClient: Sendable {
       try await executeToFile(
         arguments: args,
         outputPath: tempOutputPath,
-        timeout: timeout ?? Self.defaultTimeout
+        timeout: timeout ?? Self.defaultTimeout,
+        registryHost: reference.registry
       )
       if let expectedSize {
         let actualSize = try fileSize(atPath: tempOutputPath)
         guard actualSize == expectedSize else {
-          throw OrasError.invalidOutput("Blob \(digest) size mismatch: expected \(expectedSize), got \(actualSize)")
+          throw OrasBlobValidationError.sizeMismatch(
+            digest: digest,
+            expected: expectedSize,
+            actual: actualSize
+          )
         }
       }
       let actualDigest = try sha256File(atPath: tempOutputPath)
       guard actualDigest == digest else {
-        throw OrasError.invalidOutput("Blob \(digest) digest mismatch: got \(actualDigest)")
+        throw OrasBlobValidationError.digestMismatch(expected: digest, actual: actualDigest)
       }
       if FileManager.default.fileExists(atPath: outputPath) {
         try FileManager.default.removeItem(atPath: outputPath)
@@ -308,59 +289,57 @@ struct OrasClient: Sendable {
     plainHTTP ? ["--plain-http"] : []
   }
 
+  static func reachabilityHost(for registryHost: String) -> String {
+    registryHost == "docker.io" ? "registry-1.docker.io" : registryHost
+  }
+
+  private static func registryHost(fromRepositoryReference reference: String) throws -> String {
+    guard let separator = reference.firstIndex(of: "/"), separator != reference.startIndex else {
+      throw OrasError.invalidInput("Repository reference must include a registry host")
+    }
+    let registry = String(reference[..<separator])
+    guard RegistryCredentialValidator.registryError(registry) == nil else {
+      throw OrasError.invalidInput("Repository reference has an invalid registry host")
+    }
+    return registry
+  }
+
   /// Authenticates to an OCI registry.
   /// Password is passed via stdin to avoid exposure in process listings.
   func login(registry: String, username: String, password: String, insecure: Bool = false) async throws {
+    if let error = RegistryCredentialValidator.loginError(
+      registry: registry,
+      username: username,
+      password: password
+    ) {
+      throw OrasError.invalidInput(error)
+    }
     var args = ["login", registry, "-u", username, "--password-stdin"]
     args.append(contentsOf: Self.transportSecurityArguments(plainHTTP: insecure))
-
-    let orasPath = try resolveOrasPath()
-
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: orasPath)
-    process.arguments = args
-
-    let stdinPipe = Pipe()
-    let stdoutPipe = Pipe()
-    let stderrPipe = Pipe()
-    process.standardInput = stdinPipe
-    process.standardOutput = stdoutPipe
-    process.standardError = stderrPipe
-
-    let result: ProcessExecutionResult
-    do {
-      result = try await AsyncProcessRunner.run(
-        process: process,
-        stdoutPipe: stdoutPipe,
-        stderrPipe: stderrPipe,
-        options: AsyncProcessRunnerOptions(
-          timeout: Self.shortTimeout,
-          timeoutDescription: "login to \(registry)",
-          maxOutputSize: Self.maxOutputSize
-        ),
-        afterLaunch: { _ in
-          let passwordData = Data((password + "\n").utf8)
-          stdinPipe.fileHandleForWriting.write(passwordData)
-          stdinPipe.fileHandleForWriting.closeFile()
-        }
-      )
-    } catch let error as AsyncProcessRunnerError {
-      throw mapProcessRunnerError(error)
-    }
-
-    if result.exitCode != 0 {
-      let stderr = String(data: result.stderr, encoding: .utf8) ?? ""
-      throw OrasError.commandFailed(exitCode: result.exitCode, stderr: stderr)
-    }
+    _ = try await execute(
+      arguments: args,
+      timeout: Self.shortTimeout,
+      standardInputData: Data((password + "\n").utf8)
+    )
+    try await credentialStore.save(
+      RegistryCredential(username: username, password: password),
+      for: registry
+    )
   }
 
   /// Checks if the registry endpoint is reachable before starting a long push.
   /// Hits the OCI distribution spec health endpoint at <scheme>://registryHost/v2/.
-  /// Accepts HTTP 200 or 401 (auth required but registry alive). Uses a 5-second timeout.
+  /// Accepts success, an authentication challenge, or an authorization denial.
+  /// Other status codes report the registry as unavailable. Uses a 5-second timeout.
   /// Pass a custom `session` to override the default ephemeral URLSession (used in tests).
   func checkRegistryReachable(registryHost: String, insecure: Bool, session: URLSession? = nil) async throws {
+    try Task.checkCancellation()
+    if let error = RegistryCredentialValidator.registryError(registryHost) {
+      throw OrasError.invalidInput(error)
+    }
     let scheme = insecure ? "http" : "https"
-    guard let url = URL(string: "\(scheme)://\(registryHost)/v2/") else {
+    let reachabilityHost = Self.reachabilityHost(for: registryHost)
+    guard let url = URL(string: "\(scheme)://\(reachabilityHost)/v2/") else {
       throw OrasError.commandFailed(exitCode: -1, stderr: "Invalid registry URL for host: \(registryHost)")
     }
 
@@ -375,18 +354,21 @@ struct OrasClient: Sendable {
     }
 
     do {
-      let (_, response) = try await effectiveSession.data(from: url)
+      let (bytes, response) = try await effectiveSession.bytes(from: url)
+      defer { bytes.task.cancel() }
       guard let http = response as? HTTPURLResponse else {
         throw OrasError.commandFailed(exitCode: -1, stderr: "Non-HTTP response from \(registryHost)")
       }
-      guard http.statusCode == 200 || http.statusCode == 401 else {
+      guard [200, 401, 403].contains(http.statusCode) else {
         throw OrasError.commandFailed(
           exitCode: -1,
-          stderr: "Registry \(registryHost) returned unexpected status \(http.statusCode)"
+          stderr: "Registry \(registryHost) availability check returned HTTP \(http.statusCode)"
         )
       }
     } catch let error as OrasError {
       throw error
+    } catch is CancellationError {
+      throw CancellationError()
     } catch {
       throw OrasError.commandFailed(
         exitCode: -1,
@@ -397,8 +379,10 @@ struct OrasClient: Sendable {
 
   /// Removes stored credentials for a registry
   func logout(registry: String) async throws {
-    let args = ["logout", registry]
-    _ = try await execute(arguments: args, timeout: Self.shortTimeout)
+    if let error = RegistryCredentialValidator.registryError(registry) {
+      throw OrasError.invalidInput(error)
+    }
+    try await credentialStore.deleteCredential(for: registry)
   }
 
   /// Resolves the digest for a reference without downloading
@@ -406,11 +390,15 @@ struct OrasClient: Sendable {
     var args = ["resolve", reference.fullReference]
     args.append(contentsOf: Self.transportSecurityArguments(plainHTTP: insecure))
 
-    let result = try await execute(arguments: args, timeout: Self.shortTimeout)
+    let result = try await execute(
+      arguments: args,
+      timeout: Self.shortTimeout,
+      registryHost: reference.registry
+    )
     let stdout = String(data: result.stdout, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 
-    guard !stdout.isEmpty else {
-      throw OrasError.invalidOutput("Empty digest from resolve")
+    guard stdout.range(of: "^sha256:[a-f0-9]{64}$", options: .regularExpression) != nil else {
+      throw OrasError.invalidOutput("Resolve returned an invalid digest: \(stdout.prefix(100))")
     }
 
     return stdout
@@ -447,23 +435,37 @@ struct OrasClient: Sendable {
   private func execute(
     arguments: [String],
     timeout: TimeInterval?,
-    workingDirectory: String? = nil
-  ) async throws -> (stdout: Data, stderr: Data) {
+    workingDirectory: String? = nil,
+    registryHost: String? = nil,
+    standardInputData: Data? = nil,
+    onProcessStarted: (@Sendable () -> Void)? = nil
+  ) async throws -> ProcessExecutionResult {
     let orasPath = try resolveOrasPath()
-
-    logDebug("oras \(arguments.joined(separator: " "))", category: "OrasClient")
 
     // Create a per-operation temp dir so oras intermediate files don't leak
     // into the system temp on interruption. Cleaned up in defer below.
-    let orasTmpDir = JeballtoCachePaths.imageWork
+    let orasTmpDir = temporaryRoot
       .appendingPathComponent("oras-tmp-\(UUID().uuidString)", isDirectory: true)
       .path
-    try FileManager.default.createDirectory(atPath: orasTmpDir, withIntermediateDirectories: true)
+    try Self.createPrivateDirectory(atPath: orasTmpDir)
+    defer { try? FileManager.default.removeItem(atPath: orasTmpDir) }
+
+    let prepared = try await prepareExecution(
+      arguments: arguments,
+      registryHost: registryHost,
+      registryConfigPath: "\(orasTmpDir)/registry-config.json",
+      standardInputData: standardInputData
+    )
+    try Task.checkCancellation()
+    logDebug("oras \(Self.sanitizedArguments(prepared.arguments))", category: "OrasClient")
 
     let process = Process()
     process.executableURL = URL(fileURLWithPath: orasPath)
-    process.arguments = arguments
-    process.environment = ProcessInfo.processInfo.environment
+    process.arguments = prepared.arguments
+    let processEnvironment = config.orasPath == nil
+      ? bundledToolEnvironment()
+      : ProcessInfo.processInfo.environment
+    process.environment = processEnvironment
       .merging(["TMPDIR": orasTmpDir]) { _, new in new }
     if let workDir = workingDirectory {
       process.currentDirectoryURL = URL(fileURLWithPath: workDir)
@@ -473,9 +475,10 @@ struct OrasClient: Sendable {
     let stderrPipe = Pipe()
     process.standardOutput = stdoutPipe
     process.standardError = stderrPipe
-    process.standardInput = FileHandle.nullDevice
-
-    defer { try? FileManager.default.removeItem(atPath: orasTmpDir) }
+    if prepared.standardInput == nil {
+      process.standardInput = FileHandle.nullDevice
+    }
+    let childLaunchReservation = try childProcessLease?.prepare(process)
 
     let result: ProcessExecutionResult
     do {
@@ -485,55 +488,79 @@ struct OrasClient: Sendable {
         stderrPipe: stderrPipe,
         options: AsyncProcessRunnerOptions(
           timeout: timeout,
-          timeoutDescription: "oras \(arguments.first ?? "command")",
+          timeoutDescription: "oras \(prepared.arguments.first ?? "command")",
           maxOutputSize: Self.maxOutputSize
-        )
+        ),
+        standardInput: prepared.standardInput,
+        childLaunchReservation: childLaunchReservation,
+        onProcessStarted: onProcessStarted
       )
     } catch let error as AsyncProcessRunnerError {
       throw mapProcessRunnerError(error)
     }
 
     if result.exitCode != 0 {
-      let stderr = String(data: result.stderr, encoding: .utf8) ?? ""
+      let suffix = result.stderrTruncated ? " (output truncated)" : ""
+      let stderr = String(decoding: result.stderr, as: UTF8.self) + suffix
       throw OrasError.commandFailed(exitCode: result.exitCode, stderr: stderr)
     }
+    guard result.stdoutTruncated == false else {
+      throw OrasError.invalidOutput("oras standard output exceeded the 8MB limit")
+    }
+    guard result.stderrTruncated == false else {
+      throw OrasError.invalidOutput("oras standard error exceeded the 8MB limit")
+    }
 
-    return (stdout: result.stdout, stderr: result.stderr)
+    return result
   }
 
   private func executeToFile(
     arguments: [String],
     outputPath: String,
-    timeout: TimeInterval?
+    timeout: TimeInterval?,
+    registryHost: String
   ) async throws {
     let orasPath = try resolveOrasPath()
-
-    logDebug("oras \(arguments.joined(separator: " "))", category: "OrasClient")
 
     let outputParent = (outputPath as NSString).deletingLastPathComponent
     try FileManager.default.createDirectory(atPath: outputParent, withIntermediateDirectories: true)
     let outputHandle = try Self.openOutputFile(atPath: outputPath)
     defer { try? outputHandle.close() }
 
-    let orasTmpDir = JeballtoCachePaths.imageWork
+    let orasTmpDir = temporaryRoot
       .appendingPathComponent("oras-tmp-\(UUID().uuidString)", isDirectory: true)
       .path
-    try FileManager.default.createDirectory(atPath: orasTmpDir, withIntermediateDirectories: true)
+    try Self.createPrivateDirectory(atPath: orasTmpDir)
     defer { try? FileManager.default.removeItem(atPath: orasTmpDir) }
+    let prepared = try await prepareExecution(
+      arguments: arguments,
+      registryHost: registryHost,
+      registryConfigPath: "\(orasTmpDir)/registry-config.json"
+    )
+    logDebug("oras \(Self.sanitizedArguments(prepared.arguments))", category: "OrasClient")
 
     let process = Process()
     process.executableURL = URL(fileURLWithPath: orasPath)
-    process.arguments = arguments
-    process.environment = ProcessInfo.processInfo.environment
+    process.arguments = prepared.arguments
+    let processEnvironment = config.orasPath == nil
+      ? bundledToolEnvironment()
+      : ProcessInfo.processInfo.environment
+    process.environment = processEnvironment
       .merging(["TMPDIR": orasTmpDir]) { _, new in new }
-    process.standardInput = FileHandle.nullDevice
+    if let standardInput = prepared.standardInput {
+      process.standardInput = standardInput.pipe
+    } else {
+      process.standardInput = FileHandle.nullDevice
+    }
     process.standardOutput = outputHandle
 
     let stderrPipe = Pipe()
     process.standardError = stderrPipe
 
     let exitObserver = OrasProcessExitObserver()
-    let stderrCollector = OrasLimitedPipeCollector(maxOutputSize: Self.maxOutputSize)
+    let stderrCollector = LimitedPipeOutputCollector(maxOutputSize: Self.maxOutputSize)
+    let childLaunchReservation = try childProcessLease?.prepare(process)
+    defer { childLaunchReservation?.processDidExit() }
 
     process.terminationHandler = { process in
       exitObserver.finish(process.terminationStatus)
@@ -542,10 +569,24 @@ struct OrasClient: Sendable {
 
     do {
       try process.run()
+      childLaunchReservation?.processDidLaunch()
     } catch {
+      childLaunchReservation?.cancelBeforeLaunch()
       stderrCollector.stop()
+      prepared.standardInput?.close()
       throw OrasError.commandFailed(exitCode: -1, stderr: "Failed to launch oras: \(error.localizedDescription)")
     }
+    prepared.standardInput?.closeParentReadEnd()
+    let inputTask = prepared.standardInput.map { standardInput in
+      Task<Void, Error> {
+        try await standardInput.write()
+      }
+    }
+    defer {
+      inputTask?.cancel()
+      prepared.standardInput?.close()
+    }
+    try? stderrPipe.fileHandleForWriting.close()
 
     ChildProcessTracker.shared.track(process)
     defer { ChildProcessTracker.shared.untrack(process) }
@@ -557,7 +598,7 @@ struct OrasClient: Sendable {
           exitObserver: exitObserver,
           process: process,
           timeout: timeout,
-          timeoutDescription: "oras \(arguments.first ?? "command")"
+          timeoutDescription: "oras \(prepared.arguments.first ?? "command")"
         )
       } onCancel: {
         ChildProcessTracker.shared.terminateIfRunning(process)
@@ -567,17 +608,72 @@ struct OrasClient: Sendable {
       throw error
     }
 
-    let stderr = stderrCollector.stopAndReadRemaining()
+    do {
+      try await inputTask?.value
+    } catch let error as AsyncProcessRunnerError {
+      stderrCollector.stop()
+      throw mapProcessRunnerError(error)
+    }
+
+    let stderr = await stderrCollector.finish()
     guard exitCode == 0 else {
-      let stderrText = String(data: stderr, encoding: .utf8) ?? ""
+      let suffix = stderr.wasTruncated ? " (output truncated)" : ""
+      let stderrText = String(decoding: stderr.data, as: UTF8.self) + suffix
       throw OrasError.commandFailed(exitCode: exitCode, stderr: stderrText)
     }
+    guard stderr.wasTruncated == false else {
+      throw OrasError.invalidOutput("oras standard error exceeded the 8MB limit or did not close after exit")
+    }
+  }
+
+  private func prepareExecution(
+    arguments: [String],
+    registryHost: String?,
+    registryConfigPath: String,
+    standardInputData: Data? = nil
+  ) async throws -> (arguments: [String], standardInput: AsyncProcessStandardInput?) {
+    var preparedArguments = arguments
+    preparedArguments.append(contentsOf: ["--registry-config", registryConfigPath])
+
+    if let standardInputData {
+      return (preparedArguments, AsyncProcessStandardInput(data: standardInputData))
+    }
+    guard let registryHost,
+          let credential = try await credentialStore.credential(for: registryHost) else
+    {
+      return (preparedArguments, nil)
+    }
+    preparedArguments.append(contentsOf: ["-u", credential.username, "--password-stdin"])
+    return (
+      preparedArguments,
+      AsyncProcessStandardInput(data: Data((credential.password + "\n").utf8))
+    )
+  }
+
+  static func sanitizedArguments(_ arguments: [String]) -> String {
+    var redactNext = false
+    return arguments.map { argument in
+      if redactNext {
+        redactNext = false
+        return "<redacted>"
+      }
+      if argument == "-u" || argument == "--username" {
+        redactNext = true
+        return argument
+      }
+      if argument.hasPrefix("--username=") {
+        return "--username=<redacted>"
+      }
+      return argument
+    }.joined(separator: " ")
   }
 
   private func mapProcessRunnerError(_ error: AsyncProcessRunnerError) -> OrasError {
     switch error {
     case .launchFailed(let message):
       .commandFailed(exitCode: -1, stderr: "Failed to launch oras: \(message)")
+    case .inputWriteFailed(let message):
+      .commandFailed(exitCode: -1, stderr: "Failed to write oras standard input: \(message)")
     case .timeout(let command):
       .timeout(command)
     }
@@ -592,25 +688,44 @@ struct OrasClient: Sendable {
     return FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
   }
 
-  // MARK: - Output Parsing
-
-  /// Attempts to extract digest from oras JSON output
-  private func parseDigestFromJSON(_ output: String) -> String? {
-    guard let data = output.data(using: .utf8) else { return nil }
-
-    // oras --format json outputs a JSON object with a "digest" field
-    if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-       let digest = json["digest"] as? String
-    {
-      return digest
-    }
-
-    return nil
+  private static func createPrivateDirectory(atPath path: String) throws {
+    try FileManager.default.createDirectory(
+      atPath: path,
+      withIntermediateDirectories: true,
+      attributes: [.posixPermissions: 0o700]
+    )
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: path)
   }
+
+  // MARK: - Output Parsing
 
   private func parseDescriptorFromJSON(_ output: String) -> OrasDescriptor? {
     guard let data = output.data(using: .utf8), !data.isEmpty else { return nil }
     return try? JSONDecoder().decode(OrasDescriptor.self, from: data)
+  }
+
+  private static func validateReturnedDescriptor(
+    _ descriptor: OrasDescriptor,
+    expectedMediaType: String,
+    expectedDigest: String,
+    expectedSize: UInt64,
+    operation: String
+  ) throws {
+    guard descriptor.mediaType == expectedMediaType else {
+      throw OrasError.invalidOutput(
+        "\(operation) returned media type \(descriptor.mediaType), expected \(expectedMediaType)"
+      )
+    }
+    guard descriptor.digest == expectedDigest else {
+      throw OrasError.invalidOutput(
+        "\(operation) returned digest \(descriptor.digest), expected \(expectedDigest)"
+      )
+    }
+    guard descriptor.size == expectedSize else {
+      throw OrasError.invalidOutput(
+        "\(operation) returned size \(descriptor.size), expected \(expectedSize)"
+      )
+    }
   }
 
   private static func isMissingBlobError(_ error: OrasError) -> Bool {
@@ -626,7 +741,10 @@ struct OrasClient: Sendable {
 
   private func fileSize(atPath path: String) throws -> UInt64 {
     let attrs = try FileManager.default.attributesOfItem(atPath: path)
-    return attrs[.size] as? UInt64 ?? UInt64(attrs[.size] as? Int64 ?? 0)
+    guard let number = attrs[.size] as? NSNumber, number.doubleValue >= 0 else {
+      throw OrasError.invalidOutput("Invalid file size metadata for \(path)")
+    }
+    return number.uint64Value
   }
 
   private func sha256File(atPath path: String) throws -> String {
@@ -634,7 +752,8 @@ struct OrasClient: Sendable {
     defer { try? handle.close() }
     var hasher = SHA256()
     while true {
-      let data = try handle.read(upToCount: 4 * 1024 * 1024) ?? Data()
+      try Task.checkCancellation()
+      let data = try readFileChunk(from: handle, upToCount: 4 * 1024 * 1024) ?? Data()
       guard !data.isEmpty else { break }
       hasher.update(data: data)
     }
@@ -721,67 +840,6 @@ private final class OrasProcessExitObserver: @unchecked Sendable {
       if let existingStatus {
         continuation.resume(returning: existingStatus)
       }
-    }
-  }
-}
-
-private final class OrasLimitedPipeCollector: @unchecked Sendable {
-  private let lock = NSLock()
-  private let maxOutputSize: Int
-  private var data = Data()
-  private weak var handle: FileHandle?
-
-  init(maxOutputSize: Int) {
-    self.maxOutputSize = maxOutputSize
-  }
-
-  func start(_ handle: FileHandle) {
-    lock.lock()
-    self.handle = handle
-    lock.unlock()
-
-    handle.readabilityHandler = { [weak self] handle in
-      let chunk = handle.availableData
-      guard !chunk.isEmpty else { return }
-      self?.append(chunk)
-    }
-  }
-
-  func stop() {
-    lock.lock()
-    let handle = handle
-    self.handle = nil
-    lock.unlock()
-    handle?.readabilityHandler = nil
-  }
-
-  func stopAndReadRemaining() -> Data {
-    lock.lock()
-    let handle = handle
-    self.handle = nil
-    lock.unlock()
-
-    handle?.readabilityHandler = nil
-    if let remaining = handle?.availableData, !remaining.isEmpty {
-      append(remaining)
-    }
-
-    lock.lock()
-    let output = data
-    lock.unlock()
-    return output
-  }
-
-  private func append(_ chunk: Data) {
-    lock.lock()
-    defer { lock.unlock() }
-
-    guard data.count < maxOutputSize else { return }
-    let remainingCapacity = maxOutputSize - data.count
-    if chunk.count <= remainingCapacity {
-      data.append(chunk)
-    } else {
-      data.append(chunk.prefix(remainingCapacity))
     }
   }
 }

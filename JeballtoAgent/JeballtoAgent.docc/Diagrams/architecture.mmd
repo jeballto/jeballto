@@ -7,14 +7,14 @@ flowchart TD
 
         APIServer --> VMManager
         APIServer --> ImageManager
-        APIServer --> CommandExecutor
-        APIServer --> KeystrokeInjector
 
-        VMManager["VMManager\ncreate · start · stop · delete\npause · resume · clone · update\nlifetime expiry · shutdown cleanup"]
+        VMManager["VMManager\ncreate · start · stop · delete\npause · resume · clone · update\nSSH commands · GUI keystrokes\nlifetime expiry · shutdown cleanup"]
         ImageManager["ImageManager\npull · push · delete\nlogin · logout"]
         CommandExecutor["CommandExecutor\nSSH commands"]
         KeystrokeInjector["KeystrokeInjector\nGUI keystrokes"]
 
+        VMManager --> CommandExecutor
+        VMManager --> KeystrokeInjector
         VMManager --> VZVirtualMachine["VZVirtualMachine\nApple Virtualization"]
         ImageManager -->|"oras CLI"| Registry[("OCI Registry")]
     end
