@@ -3,8 +3,17 @@ import Foundation
 
 func makeTestConfig(root: String) -> Config {
   Config(
-    api: APIConfig(port: 18080, host: "127.0.0.1", token: "test-token", enableHTTPS: false, maxConcurrentRequests: 10),
-    storage: StorageConfig(vmStorageDir: "\(root)/vms", databasePath: "\(root)/vms.json"),
+    api: APIConfig(
+      port: 18080,
+      host: "127.0.0.1",
+      token: "test-token-1234567890-abcdefghijkl",
+      maxConcurrentRequests: 10
+    ),
+    storage: StorageConfig(
+      vmStorageDir: "\(root)/vms",
+      databasePath: "\(root)/vms.json",
+      imageIndexPath: "\(root)/images.json"
+    ),
     logging: LoggingConfig(
       level: "debug",
       enableFileLogging: false,
@@ -31,7 +40,9 @@ func makeTestConfig(root: String) -> Config {
 func makeTestAPIServer(
   root: String,
   configure: (inout Config) -> Void = { _ in },
-  capabilityProvider: @escaping @Sendable () -> VirtualizationCapabilities = { testVirtualizationCapabilities() }
+  useLiveRegistryAvailabilityCheck: Bool = false,
+  capabilityProvider: @escaping @Sendable () -> VirtualizationCapabilities = { testVirtualizationCapabilities() },
+  systemResetEnvironment: SystemResetEnvironment? = nil
 ) -> APIServer {
   var config = makeTestConfig(root: root)
   configure(&config)
@@ -47,9 +58,33 @@ func makeTestAPIServer(
     networkManager: networkManager,
     portForwardingManager: portForwardingManager
   )
-  let imageStore = ImageStore(storagePath: config.images.imageStorageDir)
-  let orasClient = OrasClient(config: config.images)
-  let imageManager = ImageManager(imageStore: imageStore, orasClient: orasClient, eventBus: eventBus, config: config)
+  let imageStore = ImageStore(storagePath: config.images.imageStorageDir, indexPath: config.storage.imageIndexPath)
+  let orasClient = OrasClient(
+    config: config.images,
+    temporaryRoot: URL(fileURLWithPath: root, isDirectory: true)
+      .appendingPathComponent("cache/ImageWork/sessions/\(UUID().uuidString)", isDirectory: true),
+    credentialStore: makeTestRegistryCredentialStore()
+  )
+  let registryAvailabilityChecker: RegistryAvailabilityChecker? = if useLiveRegistryAvailabilityCheck {
+    nil
+  } else {
+    { _, _ in }
+  }
+  let imageManager = ImageManager(
+    imageStore: imageStore,
+    orasClient: orasClient,
+    eventBus: eventBus,
+    config: config,
+    diskImageCapacityValidator: { _, _ in },
+    registryAvailabilityChecker: registryAvailabilityChecker
+  )
+  let resetEnvironment = systemResetEnvironment ?? SystemResetEnvironment(
+    appSupportDirectory: "\(root)/app-support",
+    defaultLogDirectory: "\(root)/default-logs",
+    cacheRoot: URL(fileURLWithPath: "\(root)/cache", isDirectory: true),
+    deleteSecrets: {},
+    terminate: {}
+  )
 
   return APIServer(
     vmManager: vmManager,
@@ -57,6 +92,8 @@ func makeTestAPIServer(
     imageManager: imageManager,
     eventBus: eventBus,
     config: config,
+    configPath: "\(root)/config.json",
+    systemResetEnvironment: resetEnvironment,
     capabilityProvider: capabilityProvider
   )
 }

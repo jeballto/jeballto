@@ -7,8 +7,6 @@ extension APIServer {
     guard let vmId = extractResourceId(from: request.path) else {
       return APIRouteErrorMapper.invalidID()
     }
-    if let response = requireCapabilities(VirtualizationFeature.commandExecutionRequirements) { return response }
-
     guard let body = request.body else {
       return APIRouteErrorMapper.missingBody()
     }
@@ -22,6 +20,7 @@ extension APIServer {
     guard validation.valid else {
       return APIRouteErrorMapper.invalidRequest(validation.error ?? "Invalid request")
     }
+    if let response = requireCapabilities(VirtualizationFeature.commandExecutionRequirements) { return response }
 
     return await executeCommand(vmId: vmId, command: executeRequest.command, request: executeRequest)
   }
@@ -30,8 +29,6 @@ extension APIServer {
     guard let vmId = extractResourceId(from: request.path) else {
       return APIRouteErrorMapper.invalidID()
     }
-    if let response = requireCapability(.keystrokeInjection) { return response }
-
     guard let body = request.body else {
       return APIRouteErrorMapper.missingBody()
     }
@@ -45,6 +42,7 @@ extension APIServer {
     guard validation.valid else {
       return APIRouteErrorMapper.invalidRequest(validation.error ?? "Invalid request")
     }
+    if let response = requireCapability(.keystrokeInjection) { return response }
 
     return await executeKeystrokes(vmId: vmId, keystrokes: keystrokesRequest.keystrokes)
   }
@@ -53,6 +51,18 @@ extension APIServer {
 
   private func executeCommand(vmId: UUID, command: String, request: CommandExecuteRequest) async -> HTTPResponse {
     do {
+      let state = try await vmManager.getVMState(vmId)
+      if state == .running {
+        let definition = try await vmManager.getVM(vmId)
+        guard definition.network.sshPort != nil else {
+          return HTTPResponse.error(
+            "SSH_NOT_CONFIGURED",
+            message: "SSH port not configured for VM \(vmId.uuidString)",
+            statusCode: 409
+          )
+        }
+      }
+
       let result = try await vmManager.executeCommand(
         vmId,
         command: command,
@@ -64,7 +74,9 @@ extension APIServer {
         vmId: vmId.uuidString,
         exitCode: Int(result.exitCode),
         stdout: result.stdout,
-        stderr: result.stderr
+        stderr: result.stderr,
+        stdoutTruncated: result.stdoutTruncated,
+        stderrTruncated: result.stderrTruncated
       )
       return HTTPResponse.json(response)
     } catch let error as VMManagerError {

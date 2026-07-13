@@ -55,6 +55,24 @@ struct VMStateMachineTests {
   }
 
   @Test
+  func errorCanRecoverToCreatedForInstallationRetry() throws {
+    let sut = VMStateMachine(initialState: .error)
+
+    try sut.transition(to: .created)
+
+    #expect(sut.currentState == .created)
+  }
+
+  @Test
+  func forcingCurrentStateDoesNotRecordANonTransition() {
+    let sut = VMStateMachine(initialState: .created)
+
+    sut.forceState(.created)
+
+    #expect(sut.transitionHistory.isEmpty)
+  }
+
+  @Test
   func resetClearsHistoryAndRestoresState() throws {
     let sut = VMStateMachine(initialState: .created)
     try sut.transition(to: .installing)
@@ -76,5 +94,14 @@ struct VMStateMachineTests {
     #expect(sut.transitionHistory.count == 2)
     #expect(sut.transitionHistory[0] == VMStateTransition(from: .installing, to: .stopped))
     #expect(sut.transitionHistory[1] == VMStateTransition(from: .stopped, to: .starting))
+  }
+
+  @Test
+  func negativeHistoryLimitDoesNotTrap() throws {
+    let sut = VMStateMachine(initialState: .created, maxHistorySize: -1)
+
+    try sut.transition(to: .installing)
+
+    #expect(sut.transitionHistory.isEmpty)
   }
 }

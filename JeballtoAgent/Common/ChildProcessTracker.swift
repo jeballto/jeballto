@@ -60,7 +60,7 @@ final class ChildProcessTracker: @unchecked Sendable {
 
   private func scheduleForceKillIfNeeded(_ process: Process) {
     let pid = process.processIdentifier
-    Task.detached {
+    Task<Void, Never>.detached {
       try? await Task.sleep(nanoseconds: Self.forceKillDelayNanoseconds)
       guard process.isRunning else { return }
       logWarning("Force killing child process (pid \(pid))", category: "ChildProcessTracker")

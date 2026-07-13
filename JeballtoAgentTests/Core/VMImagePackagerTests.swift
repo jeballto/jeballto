@@ -1,10 +1,11 @@
+import CryptoKit
 import Foundation
 import Testing
 @testable import JeballtoAgent
 
-@Suite(.tags(.core))
+@Suite(.tags(.core), .serialized)
 // swiftlint:disable:next type_body_length
-struct VMImagePackagerTests {
+struct VMImagePackagerTests: VMImagePackagerTestSupport {
   @Test(
     arguments: [
       (activeProcessorCount: 1, expectedLimit: 1),
@@ -70,34 +71,6 @@ struct VMImagePackagerTests {
   }
 
   @Test
-  func versionedImageConfigIsRejected() async throws {
-    try await withTemporaryDirectory(prefix: "vm-image-packager-config") { root in
-      let configPath = "\(root)/vm-bundle-config.json"
-      let config = VMImageBundleConfig(
-        artifactType: "application/vnd.jeballto.vm.bundle.v2",
-        chunkSize: VMImagePackager.defaultChunkSize,
-        compression: .init(algorithm: "zstd", level: VMImagePackager.defaultCompressionLevel),
-        files: [
-          VMImagePackedFile(path: "Disk.img", size: 0, chunks: []),
-        ]
-      )
-      let encoder = JSONEncoder()
-      encoder.outputFormatting = [.sortedKeys]
-      try encoder.encode(config).write(to: URL(fileURLWithPath: configPath))
-
-      let packager = try makePackager(chunkSize: 1024 * 1024)
-
-      await #expect(throws: VMImagePackagerError.self) {
-        try await packager.unpackBundle(
-          pulledDirectory: root,
-          configPath: configPath,
-          outputBundlePath: "\(root)/unpacked.bundle"
-        )
-      }
-    }
-  }
-
-  @Test
   func parallelPackingKeepsChunkAndLayerOrderDeterministic() async throws {
     try await withTemporaryDirectory(prefix: "vm-image-packager-order") { root in
       let source = "\(root)/source.bundle"
@@ -109,9 +82,20 @@ struct VMImagePackagerTests {
       let config = try JSONDecoder().decode(VMImageBundleConfig.self, from: data)
       let disk = try #require(config.files.first { $0.path == "Disk.img" })
       let diskLayerPaths = package.layers.map(\.relativePath).filter { $0.contains("/Disk.img.") }
+      let declaredLayers = Dictionary(uniqueKeysWithValues: config.files.flatMap { file in
+        file.chunks.compactMap { chunk -> (String, VMImagePackedChunk)? in
+          guard let layerPath = chunk.layerPath else { return nil }
+          return (layerPath, chunk)
+        }
+      })
 
       #expect(disk.chunks.map(\.index) == [0, 1, 2])
       #expect(diskLayerPaths == disk.chunks.compactMap(\.layerPath))
+      for layer in package.layers {
+        let declared = try #require(declaredLayers[layer.relativePath])
+        #expect(layer.digest == declared.compressedDigest)
+        #expect(layer.size == declared.compressedSize)
+      }
     }
   }
 
@@ -348,6 +332,85 @@ struct VMImagePackagerTests {
   }
 
   @Test
+  func packRejectsSymbolicLinksInsideTheBundle() async throws {
+    try await withTemporaryDirectory(prefix: "vm-image-packager-symlink") { root in
+      let source = "\(root)/source.bundle"
+      let outsideFile = "\(root)/host-secret"
+      try makeFakeBundle(at: source)
+      try Data("must not be packed".utf8).write(to: URL(fileURLWithPath: outsideFile))
+      try FileManager.default.createSymbolicLink(
+        atPath: "\(source)/HostSecret",
+        withDestinationPath: outsideFile
+      )
+
+      let packager = try makePackager(chunkSize: 1024 * 1024)
+
+      await #expect(throws: VMImagePackagerError.self) {
+        try await packager.packBundle(bundlePath: source, stagingRoot: root)
+      }
+    }
+  }
+
+  @Test
+  func packRejectsMissingRequiredFilesBeforeStartingCompression() async throws {
+    try await withTemporaryDirectory(prefix: "vm-image-packager-required-preflight") { root in
+      let source = "\(root)/source.bundle"
+      try FileManager.default.createDirectory(atPath: source, withIntermediateDirectories: true)
+      for fileName in ["AuxiliaryStorage", "HardwareModel", "MachineIdentifier", "payload"] {
+        try Data(fileName.utf8).write(to: URL(fileURLWithPath: "\(source)/\(fileName)"))
+      }
+      let packager = VMImagePackager(
+        zstdClient: ZstdClient(configuredPath: "/usr/bin/false"),
+        chunkSize: VMImagePackager.minimumChunkSize
+      )
+
+      do {
+        _ = try await packager.packBundle(bundlePath: source, stagingRoot: root)
+        Issue.record("Expected the missing Disk.img to fail preflight")
+      } catch let error as VMImagePackagerError {
+        guard case .invalidBundle(let message) = error else {
+          Issue.record("Expected invalidBundle, got \(error.localizedDescription)")
+          return
+        }
+        #expect(message.contains("Required VM bundle files are missing or empty"))
+        #expect(message.contains("Disk.img"))
+      }
+    }
+  }
+
+  @Test
+  func unpackRejectsCaseInsensitiveFilePathCollisions() async throws {
+    try await withTemporaryDirectory(prefix: "vm-image-packager-case-collision") { root in
+      let source = "\(root)/source.bundle"
+      let unpacked = "\(root)/unpacked.bundle"
+      let corruptConfigPath = "\(root)/corrupt-config.json"
+      try makeFakeBundle(at: source)
+
+      let packager = try makePackager(chunkSize: 1024 * 1024)
+      let package = try await packager.packBundle(bundlePath: source, stagingRoot: root)
+      let config = try decodePackageConfig(package)
+      let disk = try #require(config.files.first { $0.path == "Disk.img" })
+      let corruptConfig = VMImageBundleConfig(
+        artifactType: config.artifactType,
+        resources: config.resources,
+        chunkSize: config.chunkSize,
+        compression: config.compression,
+        files: config.files + [VMImagePackedFile(path: "disk.img", size: disk.size, chunks: disk.chunks)]
+      )
+      try writeConfig(corruptConfig, to: corruptConfigPath)
+
+      await #expect(throws: VMImagePackagerError.self) {
+        try await packager.unpackBundle(
+          pulledDirectory: package.stagingDirectory,
+          configPath: corruptConfigPath,
+          outputBundlePath: unpacked
+        )
+      }
+      #expect(FileManager.default.fileExists(atPath: unpacked) == false)
+    }
+  }
+
+  @Test
   func unpackDeletesCompressedLayerFilesAfterWriting() async throws {
     try await withTemporaryDirectory(prefix: "vm-image-packager-cleanup") { root in
       let source = "\(root)/source.bundle"
@@ -440,6 +503,66 @@ struct VMImagePackagerTests {
           configPath: package.configPath,
           outputBundlePath: unpacked
         )
+      }
+      #expect(FileManager.default.fileExists(atPath: unpacked) == false)
+    }
+  }
+
+  @Test
+  func descriptorValidNonZstdLayerIsRejectedAsInvalidConfig() async throws {
+    try await withTemporaryDirectory(prefix: "vm-image-packager-invalid-zstd") { root in
+      let source = "\(root)/source.bundle"
+      let unpacked = "\(root)/unpacked.bundle"
+      let configPath = "\(root)/invalid-zstd-config.json"
+      try makeFakeBundle(at: source)
+
+      let packager = try makePackager(chunkSize: 1024 * 1024)
+      let package = try await packager.packBundle(bundlePath: source, stagingRoot: root)
+      let config = try decodePackageConfig(package)
+      let fileIndex = try #require(config.files.firstIndex { file in
+        file.chunks.contains { $0.zero == false }
+      })
+      let chunkIndex = try #require(config.files[fileIndex].chunks.firstIndex { $0.zero == false })
+      let chunk = config.files[fileIndex].chunks[chunkIndex]
+      let layerPath = try #require(chunk.layerPath)
+      let invalidCompressedData = Data("this is not a zstd stream".utf8)
+      try invalidCompressedData.write(
+        to: URL(fileURLWithPath: "\(package.stagingDirectory)/\(layerPath)")
+      )
+      let digest = "sha256:" + SHA256.hash(data: invalidCompressedData)
+        .map { String(format: "%02x", $0) }
+        .joined()
+      let invalidChunk = VMImagePackedChunk(
+        index: chunk.index,
+        offset: chunk.offset,
+        uncompressedSize: chunk.uncompressedSize,
+        uncompressedDigest: chunk.uncompressedDigest,
+        compressedSize: UInt64(invalidCompressedData.count),
+        compressedDigest: digest,
+        layerPath: layerPath,
+        zero: false
+      )
+      let invalidConfig = replacingChunk(
+        in: config,
+        fileIndex: fileIndex,
+        chunkIndex: chunkIndex,
+        with: invalidChunk
+      )
+      try writeConfig(invalidConfig, to: configPath)
+
+      do {
+        try await packager.unpackBundle(
+          pulledDirectory: package.stagingDirectory,
+          configPath: configPath,
+          outputBundlePath: unpacked
+        )
+        Issue.record("Expected a non-zstd layer to be rejected")
+      } catch let error as VMImagePackagerError {
+        guard case .invalidConfig(let message) = error else {
+          Issue.record("Expected invalidConfig, got \(error.localizedDescription)")
+          return
+        }
+        #expect(message.contains(layerPath))
       }
       #expect(FileManager.default.fileExists(atPath: unpacked) == false)
     }
@@ -680,6 +803,7 @@ struct VMImagePackagerTests {
     try await withTemporaryDirectory(prefix: "vm-image-packager-paths") { root in
       let source = "\(root)/source.bundle"
       let unpacked = "\(root)/unpacked.bundle"
+      try makeFakeBundle(at: source)
       try FileManager.default.createDirectory(atPath: "\(source)/a", withIntermediateDirectories: true)
       try Data("nested".utf8).write(to: URL(fileURLWithPath: "\(source)/a/b"))
       try Data("flat".utf8).write(to: URL(fileURLWithPath: "\(source)/a__b"))
@@ -701,15 +825,6 @@ struct VMImagePackagerTests {
     }
   }
 
-  private func makePackager(chunkSize: UInt64, maxParallelChunks: Int = 0) throws -> VMImagePackager {
-    let zstdPath = try #require(findZstdPath())
-    return VMImagePackager(
-      zstdClient: ZstdClient(configuredPath: zstdPath),
-      chunkSize: chunkSize,
-      maxParallelChunks: maxParallelChunks
-    )
-  }
-
   private func findOrasPath() -> String? {
     let repoOras = URL(fileURLWithPath: #filePath)
       .deletingLastPathComponent()
@@ -725,53 +840,12 @@ struct VMImagePackagerTests {
     return nil
   }
 
-  private func findZstdPath() -> String? {
-    let repoZstd = URL(fileURLWithPath: #filePath)
-      .deletingLastPathComponent()
-      .deletingLastPathComponent()
-      .deletingLastPathComponent()
-      .appendingPathComponent("Resources/zstd")
-      .path
-    for path in [repoZstd, "/opt/homebrew/bin/zstd", "/usr/local/bin/zstd"]
-      where FileManager.default.fileExists(atPath: path)
-    {
-      return path
-    }
-    return nil
-  }
-
-  private func makeFakeBundle(at path: String) throws {
-    try FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
-    try Data("aux".utf8).write(to: URL(fileURLWithPath: "\(path)/AuxiliaryStorage"))
-    try Data("hardware".utf8).write(to: URL(fileURLWithPath: "\(path)/HardwareModel"))
-    try Data("machine".utf8).write(to: URL(fileURLWithPath: "\(path)/MachineIdentifier"))
-
-    FileManager.default.createFile(atPath: "\(path)/Disk.img", contents: nil)
-    let disk = try FileHandle(forWritingTo: URL(fileURLWithPath: "\(path)/Disk.img"))
-    try disk.write(contentsOf: Data(repeating: 0x41, count: 1024 * 1024))
-    try disk.seek(toOffset: 2 * 1024 * 1024)
-    try disk.write(contentsOf: Data(repeating: 0x42, count: 1024 * 1024))
-    try disk.truncate(atOffset: 3 * 1024 * 1024)
-    try disk.close()
-  }
-
   private func assertBundlesEqual(_ lhs: String, _ rhs: String) throws {
     for file in ["AuxiliaryStorage", "HardwareModel", "MachineIdentifier", "Disk.img"] {
       let lhsData = try Data(contentsOf: URL(fileURLWithPath: "\(lhs)/\(file)"))
       let rhsData = try Data(contentsOf: URL(fileURLWithPath: "\(rhs)/\(file)"))
       #expect(lhsData == rhsData)
     }
-  }
-
-  private func decodePackageConfig(_ package: VMImagePackage) throws -> VMImageBundleConfig {
-    let data = try Data(contentsOf: URL(fileURLWithPath: package.configPath))
-    return try JSONDecoder().decode(VMImageBundleConfig.self, from: data)
-  }
-
-  private func writeConfig(_ config: VMImageBundleConfig, to path: String) throws {
-    let encoder = JSONEncoder()
-    encoder.outputFormatting = [.sortedKeys]
-    try encoder.encode(config).write(to: URL(fileURLWithPath: path))
   }
 
   private func replacingChunk(
@@ -860,17 +934,5 @@ struct VMImagePackagerTests {
       throw VMImagePackagerError.invalidBundle("\(path) failed: \(errorText)")
     }
     return stdout
-  }
-}
-
-private actor PackProgressRecorder {
-  private var updates: [VMImagePackProgressUpdate] = []
-
-  func append(_ update: VMImagePackProgressUpdate) {
-    updates.append(update)
-  }
-
-  func all() -> [VMImagePackProgressUpdate] {
-    updates
   }
 }

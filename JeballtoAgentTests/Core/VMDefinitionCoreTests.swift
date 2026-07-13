@@ -4,6 +4,16 @@ import Testing
 
 @Suite(.tags(.core))
 struct VMDefinitionCoreTests {
+  @Test
+  func expirySleepIntervalsRecheckLongWallClockDeadlines() {
+    let now = Date(timeIntervalSince1970: 1000)
+
+    #expect(VMManager.expirySleepInterval(expiresAt: now.addingTimeInterval(120), now: now) == 30)
+    #expect(VMManager.expirySleepInterval(expiresAt: now.addingTimeInterval(5), now: now) == 5)
+    #expect(VMManager.expirySleepInterval(expiresAt: now, now: now) == nil)
+    #expect(VMManager.expirySleepInterval(expiresAt: now.addingTimeInterval(-1), now: now) == nil)
+  }
+
   @Test(arguments: [
     VMResources(cpuCount: 1, memorySize: 2 * 1024 * 1024 * 1024, diskSize: 20 * 1024 * 1024 * 1024),
     VMResources.default,
@@ -28,7 +38,7 @@ struct VMDefinitionCoreTests {
     #expect(VMNameValidator.validate(name))
   }
 
-  @Test(arguments: ["", "   ", "bad/name", "bad*name", String(repeating: "a", count: 101)])
+  @Test(arguments: ["", "   ", " vm", "vm ", "bad/name", "bad*name", String(repeating: "a", count: 101)])
   func vmNameValidatorRejectsInvalidValues(_ name: String) {
     #expect(VMNameValidator.validate(name) == false)
   }
@@ -55,7 +65,7 @@ struct VMDefinitionCoreTests {
     #expect(paths.auxiliaryStoragePath.hasSuffix("/AuxiliaryStorage"))
     #expect(paths.hardwareModelPath.hasSuffix("/HardwareModel"))
     #expect(paths.machineIdentifierPath.hasSuffix("/MachineIdentifier"))
-    #expect(paths.saveFilePath?.hasSuffix("/SaveFile.vzvmsave") == true)
+    #expect(paths.saveFilePath.hasSuffix("/SaveFile.vzvmsave"))
   }
 
   @Test
@@ -113,7 +123,7 @@ struct VMDefinitionCoreTests {
 
   @Test
   func vmPathsExistenceChecksReflectFilesystemState() async throws {
-    try await withTemporaryDirectory(prefix: "paths") { root in
+    try withTemporaryDirectory(prefix: "paths") { root in
       let id = UUID()
       let paths = VMPaths.forVM(id: id, baseDir: root)
 

@@ -17,7 +17,7 @@ enum VMStateMachineError: Error, LocalizedError {
 
 /// State machine that manages and enforces VM state transitions
 /// Thread-safe: all state access is synchronized via an internal lock.
-class VMStateMachine {
+final class VMStateMachine {
   /// Lock for thread-safe state access
   private let lock = NSRecursiveLock()
 
@@ -46,7 +46,7 @@ class VMStateMachine {
 
   init(initialState: VMState = .created, maxHistorySize: Int = 100) {
     _currentState = initialState
-    self.maxHistorySize = maxHistorySize
+    self.maxHistorySize = max(0, maxHistorySize)
   }
 
   /// Attempts to transition to a new state
@@ -83,6 +83,7 @@ class VMStateMachine {
   func forceState(_ newState: VMState) {
     lock.lock()
     defer { lock.unlock() }
+    guard _currentState != newState else { return }
     let transition = VMStateTransition(from: _currentState, to: newState)
     _currentState = newState
     addToHistoryLocked(transition)

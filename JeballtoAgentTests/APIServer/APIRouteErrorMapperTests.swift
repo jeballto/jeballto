@@ -87,6 +87,17 @@ struct APIRouteErrorMapperTests {
   }
 
   @Test
+  func vmTimeoutMapsTo504() throws {
+    let response = APIRouteErrorMapper.vmManager(
+      .timeout("disk resize"),
+      defaultCode: "UPDATE_VM_FAILED"
+    )
+
+    #expect(response.statusCode == 504)
+    #expect(try decodedError(response).error.code == "UPDATE_VM_FAILED")
+  }
+
+  @Test
   func commandExecutorTimeoutMapsTo504() throws {
     let timeout = APIRouteErrorMapper.commandExecutor(
       .timeout(command: "echo", seconds: 2),
@@ -129,9 +140,9 @@ struct APIRouteErrorMapperTests {
   }
 
   @Test
-  func registryUnreachableMapsTo503() throws {
+  func registryUnavailableMapsTo503() throws {
     let response = APIRouteErrorMapper.imageManager(
-      .registryUnreachable("registry.example.com"),
+      .registryUnavailable("registry.example.com"),
       defaultCode: "IMAGE_PUSH_FAILED"
     )
     let decoded = try decodedError(response)
@@ -153,6 +164,40 @@ struct APIRouteErrorMapperTests {
   }
 
   @Test
+  func partiallyCommittedPushUsesItsOwnStableErrorCode() throws {
+    let response = APIRouteErrorMapper.imageManager(
+      .pushPartiallyCommitted(
+        reference: "registry.example.com/repo:tag",
+        digest: "sha256:\(String(repeating: "a", count: 64))",
+        reason: "atomic rename failed"
+      ),
+      defaultCode: "IMAGE_PUSH_FAILED"
+    )
+    let decoded = try decodedError(response)
+
+    #expect(response.statusCode == 500)
+    #expect(decoded.error.code == "IMAGE_PUSH_PARTIALLY_COMMITTED")
+    #expect(decoded.error.message.contains("Pull the reference to recover the local record"))
+  }
+
+  @Test
+  func unknownPushCommitOutcomeUsesItsOwnStableErrorCode() throws {
+    let response = APIRouteErrorMapper.imageManager(
+      .pushCommitOutcomeUnknown(
+        reference: "registry.example.com/repo:tag",
+        digest: "sha256:\(String(repeating: "a", count: 64))",
+        reason: "manifest process was interrupted"
+      ),
+      defaultCode: "IMAGE_PUSH_FAILED"
+    )
+    let decoded = try decodedError(response)
+
+    #expect(response.statusCode == 500)
+    #expect(decoded.error.code == "IMAGE_PUSH_COMMIT_OUTCOME_UNKNOWN")
+    #expect(decoded.error.message.contains("may have been committed"))
+  }
+
+  @Test
   func invalidImageReferenceMapsTo400() throws {
     let response = APIRouteErrorMapper.imageManager(
       .invalidReference("bad reference"),
@@ -162,5 +207,31 @@ struct APIRouteErrorMapperTests {
 
     #expect(response.statusCode == 400)
     #expect(decoded.error.code == "INVALID_REFERENCE")
+  }
+
+  @Test
+  func unsupportedImageFormatMapsToSpecific400() throws {
+    let response = APIRouteErrorMapper.imageManager(
+      .unsupportedImageFormat("unversioned pre-1.0 image"),
+      defaultCode: "IMAGE_PULL_FAILED"
+    )
+    let decoded = try decodedError(response)
+
+    #expect(response.statusCode == 400)
+    #expect(decoded.error.code == "UNSUPPORTED_IMAGE_FORMAT")
+    #expect(decoded.error.message.contains("unversioned pre-1.0 image"))
+  }
+
+  @Test
+  func invalidImageMapsToSpecific400() throws {
+    let response = APIRouteErrorMapper.imageManager(
+      .invalidImage("config is missing chunkSize"),
+      defaultCode: "IMAGE_PULL_FAILED"
+    )
+    let decoded = try decodedError(response)
+
+    #expect(response.statusCode == 400)
+    #expect(decoded.error.code == "INVALID_IMAGE")
+    #expect(decoded.error.message.contains("config is missing chunkSize"))
   }
 }

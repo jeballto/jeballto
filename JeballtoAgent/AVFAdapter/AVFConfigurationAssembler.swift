@@ -1,8 +1,15 @@
+import Darwin
 import Foundation
 @preconcurrency import Virtualization
 
 /// Converts pure VM configuration specs into Apple Virtualization configurations.
 struct AVFConfigurationAssembler {
+  /// Validates requested resources against the current host without changing them.
+  func validateHostResources(_ resources: VMResources) throws {
+    _ = try computeCPUCount(requested: resources.cpuCount, installationRequirements: nil)
+    _ = try computeMemorySize(requested: resources.memorySize, installationRequirements: nil)
+  }
+
   func validateResources(
     in spec: VMConfigurationSpec,
     installationRequirements: VZMacOSConfigurationRequirements?
@@ -37,15 +44,19 @@ struct AVFConfigurationAssembler {
       installationRequirements: installationRequirements
     )
     configuration.storageDevices = try spec.storage.map(createStorageDevice)
-    configuration.networkDevices = spec.network.map(createNetworkDevice)
+    configuration.networkDevices = try spec.network.map(createNetworkDevice)
     configuration.graphicsDevices = spec.graphics.map(createGraphicsDevice)
     configuration.audioDevices = spec.audio.map(createAudioDevice)
     configuration.pointingDevices = spec.pointing.map(createPointingDevice)
     configuration.keyboards = spec.keyboards.map(createKeyboard)
 
-    try configuration.validate()
-    if spec.validateSaveRestoreSupport {
-      try configuration.validateSaveRestoreSupport()
+    do {
+      try configuration.validate()
+      if spec.validateSaveRestoreSupport {
+        try configuration.validateSaveRestoreSupport()
+      }
+    } catch {
+      throw AVFError.configurationValidationFailed(error)
     }
 
     return configuration
@@ -72,12 +83,12 @@ struct AVFConfigurationAssembler {
   private func createExistingPlatformConfiguration(
     paths: VMConfigurationSpec.PlatformPaths
   ) throws -> VZMacPlatformConfiguration {
-    let hardwareModelData = try Data(contentsOf: URL(fileURLWithPath: paths.hardwareModelPath))
+    let hardwareModelData = try readPlatformIdentity(at: paths.hardwareModelPath)
     guard let hardwareModel = VZMacHardwareModel(dataRepresentation: hardwareModelData) else {
       throw AVFError.invalidHardwareModel
     }
 
-    let machineIdentifierData = try Data(contentsOf: URL(fileURLWithPath: paths.machineIdentifierPath))
+    let machineIdentifierData = try readPlatformIdentity(at: paths.machineIdentifierPath)
     guard let machineIdentifier = VZMacMachineIdentifier(dataRepresentation: machineIdentifierData) else {
       throw AVFError.invalidMachineIdentifier
     }
@@ -129,60 +140,114 @@ struct AVFConfigurationAssembler {
     installationRequirements: VZMacOSConfigurationRequirements?
   ) throws -> Int {
     let totalAvailableCPUs = ProcessInfo.processInfo.processorCount
-    var cpuCount = requested
-    if cpuCount >= totalAvailableCPUs {
-      cpuCount = max(1, totalAvailableCPUs - 1)
-    }
-    cpuCount = max(cpuCount, VZVirtualMachineConfiguration.minimumAllowedCPUCount)
-    cpuCount = min(cpuCount, VZVirtualMachineConfiguration.maximumAllowedCPUCount)
-
-    if let installationRequirements,
-       cpuCount < installationRequirements.minimumSupportedCPUCount
-    {
+    let maximumForHost = max(1, totalAvailableCPUs - 1)
+    guard requested <= maximumForHost else {
       throw AVFError.insufficientResources(
-        "CPU count \(cpuCount) is below minimum \(installationRequirements.minimumSupportedCPUCount)"
+        "Requested \(requested) CPUs, but this host supports at most \(maximumForHost) guest CPUs"
       )
     }
-    return cpuCount
+    guard requested >= VZVirtualMachineConfiguration.minimumAllowedCPUCount,
+          requested <= VZVirtualMachineConfiguration.maximumAllowedCPUCount else
+    {
+      throw AVFError.insufficientResources("Requested CPU count is outside Virtualization framework limits")
+    }
+
+    if let installationRequirements,
+       requested < installationRequirements.minimumSupportedCPUCount
+    {
+      throw AVFError.insufficientResources(
+        "CPU count \(requested) is below minimum \(installationRequirements.minimumSupportedCPUCount)"
+      )
+    }
+    return requested
   }
 
   private func computeMemorySize(
     requested: UInt64,
     installationRequirements: VZMacOSConfigurationRequirements?
   ) throws -> UInt64 {
-    var memorySize = requested
-    memorySize = max(memorySize, VZVirtualMachineConfiguration.minimumAllowedMemorySize)
-    memorySize = min(memorySize, VZVirtualMachineConfiguration.maximumAllowedMemorySize)
+    guard requested >= VZVirtualMachineConfiguration.minimumAllowedMemorySize,
+          requested <= VZVirtualMachineConfiguration.maximumAllowedMemorySize else
+    {
+      throw AVFError.insufficientResources("Requested memory is outside Virtualization framework limits")
+    }
 
     if let installationRequirements,
-       memorySize < installationRequirements.minimumSupportedMemorySize
+       requested < installationRequirements.minimumSupportedMemorySize
     {
       throw AVFError.insufficientResources("Memory size is below minimum required")
     }
-    return memorySize
+    return requested
   }
 
   private func createStorageDevice(
     from spec: VMConfigurationSpec.StorageDevice
   ) throws -> VZStorageDeviceConfiguration {
-    let attachment = try VZDiskImageStorageDeviceAttachment(
-      url: URL(fileURLWithPath: spec.path),
-      readOnly: spec.readOnly
-    )
+    guard FileManager.default.fileExists(atPath: spec.path) else {
+      throw AVFError.diskImageNotFound(spec.path)
+    }
+    let attachment: VZDiskImageStorageDeviceAttachment
+    do {
+      attachment = try VZDiskImageStorageDeviceAttachment(
+        url: URL(fileURLWithPath: spec.path),
+        readOnly: spec.readOnly
+      )
+    } catch {
+      throw AVFError.storageAttachmentFailed(spec.path, error.localizedDescription)
+    }
     switch spec.controller {
     case .virtioBlock:
       return VZVirtioBlockDeviceConfiguration(attachment: attachment)
     }
   }
 
-  private func createNetworkDevice(from spec: VMConfigurationSpec.NetworkDevice) -> VZNetworkDeviceConfiguration {
+  private func createNetworkDevice(
+    from spec: VMConfigurationSpec.NetworkDevice
+  ) throws -> VZNetworkDeviceConfiguration {
     let networkDevice = VZVirtioNetworkDeviceConfiguration()
-    networkDevice.macAddress = VZMACAddress(string: spec.macAddress) ?? VZMACAddress.randomLocallyAdministered()
+    guard let macAddress = VZMACAddress(string: spec.macAddress) else {
+      throw AVFError.invalidMACAddress(spec.macAddress)
+    }
+    networkDevice.macAddress = macAddress
     switch spec.attachment {
     case .nat:
       networkDevice.attachment = VZNATNetworkDeviceAttachment()
     }
     return networkDevice
+  }
+
+  private func readPlatformIdentity(at path: String) throws -> Data {
+    let maximumSize = 1_048_576
+    let descriptor = Darwin.open(path, O_RDONLY | O_NOFOLLOW)
+    guard descriptor >= 0 else {
+      throw AVFError.platformIdentityReadFailed(path, Self.posixMessage())
+    }
+    let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+    defer { try? handle.close() }
+    var status = stat()
+    guard Darwin.fstat(descriptor, &status) == 0,
+          status.st_mode & S_IFMT == S_IFREG else
+    {
+      throw AVFError.platformIdentityReadFailed(path, "Expected a regular file")
+    }
+    guard status.st_size >= 0, UInt64(status.st_size) <= UInt64(maximumSize) else {
+      throw AVFError.platformIdentityReadFailed(path, "File exceeds the 1MB limit")
+    }
+    do {
+      let data = try handle.read(upToCount: maximumSize + 1) ?? Data()
+      guard data.count <= maximumSize else {
+        throw AVFError.platformIdentityReadFailed(path, "File exceeds the 1MB limit")
+      }
+      return data
+    } catch let error as AVFError {
+      throw error
+    } catch {
+      throw AVFError.platformIdentityReadFailed(path, error.localizedDescription)
+    }
+  }
+
+  private static func posixMessage(_ code: Int32 = errno) -> String {
+    String(cString: strerror(code))
   }
 
   private func createGraphicsDevice(from spec: VMConfigurationSpec.GraphicsDevice) -> VZGraphicsDeviceConfiguration {

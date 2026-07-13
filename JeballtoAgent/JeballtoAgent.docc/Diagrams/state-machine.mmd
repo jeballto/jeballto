@@ -20,15 +20,16 @@ flowchart TD
 
     stopping -->|done| stopped
 
-    pausing -->|saved| paused
+    pausing -->|paused| paused
 
     paused -->|resume| resuming
     paused -->|restart| starting
     paused -->|stop| stopping
 
-    resuming -->|restored| running
+    resuming -->|running| running
 
-    error -->|recover| stopped
+    error -->|retry install| created
+    error -->|recover runtime| stopped
     error --> deleted
 
     deleted --> End(( ))

@@ -1,7 +1,7 @@
 import Foundation
 
 /// Types of events that can be published through the event bus
-enum VMEvent: Equatable {
+enum VMEvent: Equatable, Sendable {
   /// Published by `VMStateMachine` for every validated transition. Use `from` and `to` to react to specific
   /// transitions.
   case stateChanged(vmId: UUID, from: VMState, to: VMState)
@@ -36,6 +36,7 @@ enum VMEvent: Equatable {
     downloadSpeed: UInt64?
   )
   case installCompleted(vmId: UUID)
+  case installCancelled(vmId: UUID)
   case installFailed(vmId: UUID, error: String)
   case vmCloned(vmId: UUID, sourceVmId: UUID, name: String)
   case vmResourcesUpdated(vmId: UUID)
@@ -53,9 +54,9 @@ enum VMEvent: Equatable {
 
   // Jeballtofile events
   case jeballtofileStarted(executionId: UUID, vmId: UUID)
-  case jeballtofileStepStarted(executionId: UUID, step: Int, stepType: String)
-  case jeballtofileStepCompleted(executionId: UUID, step: Int, stepType: String)
-  case jeballtofileStepFailed(executionId: UUID, step: Int, stepType: String, error: String)
+  case jeballtofileStepStarted(executionId: UUID, vmId: UUID, step: Int, stepType: String)
+  case jeballtofileStepCompleted(executionId: UUID, vmId: UUID, step: Int, stepType: String)
+  case jeballtofileStepFailed(executionId: UUID, vmId: UUID, step: Int, stepType: String, error: String)
   case jeballtofileCompleted(executionId: UUID, vmId: UUID)
   case jeballtofileCancelled(executionId: UUID, vmId: UUID, step: Int)
   case jeballtofileFailed(executionId: UUID, vmId: UUID, step: Int, error: String)
@@ -81,6 +82,7 @@ enum VMEvent: Equatable {
     case .installStarted: "INSTALL_STARTED"
     case .installProgress: "INSTALL_PROGRESS"
     case .installCompleted: "INSTALL_COMPLETED"
+    case .installCancelled: "INSTALL_CANCELLED"
     case .installFailed: "INSTALL_FAILED"
     case .vmCloned: "VM_CLONED"
     case .vmResourcesUpdated: "VM_RESOURCES_UPDATED"
@@ -112,15 +114,18 @@ enum VMEvent: Equatable {
          .sshPortReleased(let vmId), .sshReady(let vmId),
          .vncPortAssigned(let vmId, _), .vncPortReleased(let vmId),
          .installStarted(let vmId), .installProgress(let vmId, _, _, _, _, _, _, _),
-         .installCompleted(let vmId), .installFailed(let vmId, _), .guiOpened(let vmId), .guiClosed(let vmId):
+         .installCompleted(let vmId), .installCancelled(let vmId), .installFailed(let vmId, _),
+         .guiOpened(let vmId), .guiClosed(let vmId):
       vmId
     case .errorOccurred(let vmId, _): vmId
     case .jeballtofileStarted(_, let vmId), .jeballtofileCompleted(_, let vmId),
          .jeballtofileCancelled(_, let vmId, _),
          .jeballtofileFailed(_, let vmId, _, _):
       vmId
-    case .jeballtofileStepStarted, .jeballtofileStepCompleted, .jeballtofileStepFailed:
-      nil
+    case .jeballtofileStepStarted(_, let vmId, _, _),
+         .jeballtofileStepCompleted(_, let vmId, _, _),
+         .jeballtofileStepFailed(_, let vmId, _, _, _):
+      vmId
     case .imagePullStarted, .imagePulled, .imagePullFailed, .imagePushStarted, .imagePushed, .imagePushFailed,
          .imageDeleted:
       nil
@@ -129,7 +134,7 @@ enum VMEvent: Equatable {
 }
 
 /// A recorded event with timestamp
-struct RecordedEvent {
+struct RecordedEvent: Sendable {
   let timestamp: Date
   let event: VMEvent
 
@@ -140,10 +145,10 @@ struct RecordedEvent {
 }
 
 /// Type alias for event subscriber callback
-typealias EventSubscriber = (VMEvent) -> Void
+typealias EventSubscriber = @Sendable (VMEvent) -> Void
 
 /// Event bus for pub/sub messaging across the application
-class EventBus {
+final class EventBus: @unchecked Sendable {
   /// Subscription identifier
   typealias SubscriptionToken = UUID
 
@@ -159,7 +164,10 @@ class EventBus {
   /// Queue for thread-safe operations
   private let queue = DispatchQueue(label: "com.jeballto.eventbus", attributes: .concurrent)
 
-  init(maxHistorySize: Int = 1000) { self.maxHistorySize = maxHistorySize }
+  /// Serial queue for subscriber callbacks, preserving publish order without running callbacks under the state lock.
+  private let deliveryQueue = DispatchQueue(label: "com.jeballto.eventbus.delivery")
+
+  init(maxHistorySize: Int = 1000) { self.maxHistorySize = max(0, maxHistorySize) }
 
   // MARK: - Public API
 
@@ -191,10 +199,11 @@ class EventBus {
         self.eventHistory.removeFirst(self.eventHistory.count - self.maxHistorySize)
       }
 
-      // Notify each subscriber independently so one slow subscriber cannot block others
       let currentSubscribers = Array(self.subscribers.values)
-      for subscriber in currentSubscribers {
-        DispatchQueue.global(qos: .userInitiated).async { subscriber(event) }
+      self.deliveryQueue.async {
+        for subscriber in currentSubscribers {
+          subscriber(event)
+        }
       }
     }
   }
@@ -205,22 +214,68 @@ class EventBus {
   ///   - limit: Maximum number of events to return
   /// - Returns: Array of recorded events
   func getEvents(forVM vmId: UUID, limit: Int = 100) -> [RecordedEvent] {
-    queue.sync { eventHistory.filter { $0.event.vmId == vmId }.suffix(limit).map { $0 } }
+    queue.sync { eventHistory.filter { $0.event.vmId == vmId }.suffix(max(0, limit)).map { $0 } }
   }
 
   /// Returns all recent events
   /// - Parameter limit: Maximum number of events to return
   /// - Returns: Array of recorded events
   func getAllEvents(limit: Int = 100) -> [RecordedEvent] {
-    queue.sync { Array(eventHistory.suffix(limit)) }
+    queue.sync { Array(eventHistory.suffix(max(0, limit))) }
   }
 
   /// Clears all event history
   func clearHistory() { queue.async(flags: .barrier) { self.eventHistory.removeAll() } }
+
+  /// Waits until all events published before this call have been recorded and delivered.
+  func waitUntilIdle() async {
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+      let state = EventBusIdleWaitState(continuation: continuation)
+      let deliveryQueue = deliveryQueue
+      queue.async(flags: .barrier) {
+        deliveryQueue.async {
+          state.resume()
+        }
+      }
+    }
+  }
+
+  /// Waits until all events published before this call have been recorded and delivered.
+  func waitUntilIdle(timeout: TimeInterval) -> Bool {
+    let semaphore = DispatchSemaphore(value: 0)
+    let deliveryQueue = deliveryQueue
+    queue.async(flags: .barrier) {
+      deliveryQueue.async {
+        semaphore.signal()
+      }
+    }
+    return semaphore.wait(timeout: .now() + timeout) == .success
+  }
 
   /// Returns the number of active subscribers
   var subscriberCount: Int { queue.sync { subscribers.count } }
 
   /// Returns the number of events in history
   var eventCount: Int { queue.sync { eventHistory.count } }
+}
+
+private final class EventBusIdleWaitState: @unchecked Sendable {
+  private let lock = NSLock()
+  private var didResume = false
+  private let continuation: CheckedContinuation<Void, Never>
+
+  init(continuation: CheckedContinuation<Void, Never>) {
+    self.continuation = continuation
+  }
+
+  func resume() {
+    lock.lock()
+    guard didResume == false else {
+      lock.unlock()
+      return
+    }
+    didResume = true
+    lock.unlock()
+    continuation.resume()
+  }
 }

@@ -2,7 +2,7 @@ import Foundation
 
 actor ImageBlobCache {
   private var activeDigests: Set<String> = []
-  private let retryDelay: UInt64 = 1_000_000
+  private var waiters: [String: [(id: UUID, continuation: CheckedContinuation<Void, Error>)]] = [:]
 
   func withExclusiveAccess<T: Sendable>(
     for digest: String,
@@ -15,17 +15,49 @@ actor ImageBlobCache {
   }
 
   private func acquire(_ digest: String) async throws {
-    while true {
-      try Task.checkCancellation()
-      if activeDigests.contains(digest) == false {
-        activeDigests.insert(digest)
-        return
+    try Task.checkCancellation()
+    if activeDigests.contains(digest) == false {
+      activeDigests.insert(digest)
+      return
+    }
+
+    let waiterId = UUID()
+    try await withTaskCancellationHandler {
+      try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+        if Task.isCancelled {
+          continuation.resume(throwing: CancellationError())
+        } else {
+          waiters[digest, default: []].append((waiterId, continuation))
+        }
       }
-      try await Task.sleep(nanoseconds: retryDelay)
+    } onCancel: {
+      Task<Void, Never> { await self.cancelWaiter(waiterId, for: digest) }
     }
   }
 
   private func release(_ digest: String) {
+    if var digestWaiters = waiters[digest], digestWaiters.isEmpty == false {
+      let waiter = digestWaiters.removeFirst()
+      if digestWaiters.isEmpty {
+        waiters.removeValue(forKey: digest)
+      } else {
+        waiters[digest] = digestWaiters
+      }
+      waiter.continuation.resume()
+      return
+    }
     activeDigests.remove(digest)
+  }
+
+  private func cancelWaiter(_ id: UUID, for digest: String) {
+    guard var digestWaiters = waiters[digest],
+          let index = digestWaiters.firstIndex(where: { $0.id == id }) else { return }
+    let waiter = digestWaiters.remove(at: index)
+    if digestWaiters.isEmpty {
+      waiters.removeValue(forKey: digest)
+    } else {
+      waiters[digest] = digestWaiters
+    }
+    waiter.continuation.resume(throwing: CancellationError())
   }
 }

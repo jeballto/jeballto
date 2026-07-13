@@ -1,13 +1,33 @@
 import Foundation
 
-struct CommandResult {
+struct CommandResult: Sendable {
   let exitCode: Int32
   let stdout: String
   let stderr: String
+  let stdoutTruncated: Bool
+  let stderrTruncated: Bool
+
+  init(
+    exitCode: Int32,
+    stdout: String,
+    stderr: String,
+    stdoutTruncated: Bool = false,
+    stderrTruncated: Bool = false
+  ) {
+    self.exitCode = exitCode
+    self.stdout = stdout
+    self.stderr = stderr
+    self.stdoutTruncated = stdoutTruncated
+    self.stderrTruncated = stderrTruncated
+  }
 }
 
 enum CommandExecutorError: Error, LocalizedError {
   case sshNotConfigured(String)
+  case invalidUsername(String)
+  case invalidCommand(String)
+  case invalidPassword(String)
+  case invalidTimeout(TimeInterval)
   case timeout(command: String, seconds: TimeInterval)
   case processLaunchFailed(String)
   case askpassScriptFailed(String)
@@ -15,6 +35,10 @@ enum CommandExecutorError: Error, LocalizedError {
   var errorDescription: String? {
     switch self {
     case .sshNotConfigured(let msg): "SSH not configured: \(msg)"
+    case .invalidUsername(let username): "Invalid SSH username: '\(username)'"
+    case .invalidCommand(let message): "Invalid command: \(message)"
+    case .invalidPassword(let message): "Invalid SSH password: \(message)"
+    case .invalidTimeout(let seconds): "Invalid command timeout: \(seconds) seconds"
     case .timeout(let command, let seconds):
       "Command timed out after \(Int(seconds))s: \(command.prefix(100))"
     case .processLaunchFailed(let msg): "Failed to launch SSH process: \(msg)"
@@ -28,12 +52,44 @@ enum CommandExecutorError: Error, LocalizedError {
   }
 }
 
-class CommandExecutor {
+enum SSHUsernameValidator {
+  static let maximumLength = 255
+
+  static var validationError: String {
+    "Invalid SSH username. Use 1-\(maximumLength) ASCII letters, digits, dots, hyphens, or underscores; "
+      + "the first character cannot be a dot or hyphen"
+  }
+
+  static func validate(_ username: String) -> Bool {
+    let bytes = Array(username.utf8)
+    guard !bytes.isEmpty, bytes.count <= maximumLength, isLeadingByte(bytes[0]) else { return false }
+    return bytes.allSatisfy(isAllowedByte)
+  }
+
+  private static func isLeadingByte(_ byte: UInt8) -> Bool {
+    isASCIILetter(byte) || isASCIIDigit(byte) || byte == 0x5F
+  }
+
+  private static func isAllowedByte(_ byte: UInt8) -> Bool {
+    isLeadingByte(byte) || byte == 0x2D || byte == 0x2E
+  }
+
+  private static func isASCIILetter(_ byte: UInt8) -> Bool {
+    (0x41 ... 0x5A).contains(byte) || (0x61 ... 0x7A).contains(byte)
+  }
+
+  private static func isASCIIDigit(_ byte: UInt8) -> Bool {
+    (0x30 ... 0x39).contains(byte)
+  }
+}
+
+final class CommandExecutor {
   /// Maximum allowed output size per stream (stdout/stderr)  - 5 MB
   private static let maxOutputSize = 5 * 1024 * 1024
 
   /// Maximum allowed command length  - 64 KB
   static let maxCommandLength = 65536
+  static let maxPasswordLength = 16384
 
   func execute(
     command: String,
@@ -43,12 +99,27 @@ class CommandExecutor {
     timeout: TimeInterval,
     retryOnSSHFailure: Bool = false
   ) async throws -> CommandResult {
-    guard command.count <= Self.maxCommandLength else {
-      throw CommandExecutorError
-        .processLaunchFailed("Command too long (\(command.count) characters, max \(Self.maxCommandLength))")
+    guard SSHUsernameValidator.validate(user) else {
+      throw CommandExecutorError.invalidUsername(user)
+    }
+    guard command.isEmpty == false else {
+      throw CommandExecutorError.invalidCommand("Command must not be empty")
+    }
+    let commandByteCount = command.utf8.count
+    guard commandByteCount <= Self.maxCommandLength else {
+      throw CommandExecutorError.invalidCommand(
+        "Command is too long (\(commandByteCount) UTF-8 bytes, max \(Self.maxCommandLength))"
+      )
+    }
+    if let password, let validationError = Self.passwordValidationError(password) {
+      throw CommandExecutorError.invalidPassword(validationError)
+    }
+    guard timeout.isFinite, timeout > 0 else {
+      throw CommandExecutorError.invalidTimeout(timeout)
     }
 
-    let result = try await executeOnce(
+    let deadline = ProcessInfo.processInfo.systemUptime + timeout
+    var result = try await executeOnce(
       command: command,
       sshPort: sshPort,
       user: user,
@@ -56,34 +127,49 @@ class CommandExecutor {
       timeout: timeout
     )
 
-    // Retry on SSH connection failure (exit code 255) if requested.
-    // This handles cases where SSH daemon is not yet ready after being enabled.
-    // macOS SSH daemon startup inside a guest VM takes 30-60s, so 20 retries covers the full window.
-    if retryOnSSHFailure, result.exitCode == 255 {
-      let maxRetries = 20
-      let retryDelay: UInt64 = 3_000_000_000 // 3 seconds
-      for attempt in 1 ... maxRetries {
+    // Retry only transient connection failures, bounded by the caller's overall deadline.
+    if retryOnSSHFailure, Self.isTransientSSHConnectionFailure(result) {
+      var attempt = 0
+      while Self.isTransientSSHConnectionFailure(result) {
+        attempt += 1
+        let remainingBeforeDelay = deadline - ProcessInfo.processInfo.systemUptime
+        guard remainingBeforeDelay > 0 else {
+          throw CommandExecutorError.timeout(command: command, seconds: timeout)
+        }
         logInfo(
-          "SSH connection failed (exit 255), retry \(attempt)/\(maxRetries) in 3s",
+          "SSH connection is not ready, retry \(attempt) in 3s",
           category: "CommandExecutor"
         )
-        try await Task.sleep(nanoseconds: retryDelay)
+        try await Task.sleep(for: .seconds(min(3, remainingBeforeDelay)))
 
-        let retryResult = try await executeOnce(
+        let remaining = deadline - ProcessInfo.processInfo.systemUptime
+        guard remaining > 0 else {
+          throw CommandExecutorError.timeout(command: command, seconds: timeout)
+        }
+        result = try await executeOnce(
           command: command,
           sshPort: sshPort,
           user: user,
           password: password,
-          timeout: timeout
+          timeout: remaining
         )
-        if retryResult.exitCode != 255 {
-          return retryResult
-        }
       }
-      logWarning("SSH connection failed after \(maxRetries) retries", category: "CommandExecutor")
     }
 
     return result
+  }
+
+  static func isTransientSSHConnectionFailure(_ result: CommandResult) -> Bool {
+    guard result.exitCode == 255 else { return false }
+    let message = result.stderr.lowercased()
+    return [
+      "connection refused",
+      "connection timed out",
+      "operation timed out",
+      "no route to host",
+      "connection reset",
+      "kex_exchange_identification",
+    ].contains { message.contains($0) }
   }
 
   /// Single SSH execution attempt (no retry). Used by retry loop to create a fresh Process.
@@ -97,7 +183,11 @@ class CommandExecutor {
     var askpassPath: String?
     defer {
       if let path = askpassPath {
-        try? FileManager.default.removeItem(atPath: path)
+        do {
+          try FileManager.default.removeItem(atPath: path)
+        } catch {
+          logWarning("Failed to remove SSH_ASKPASS script at \(path): \(error)", category: "CommandExecutor")
+        }
       }
     }
 
@@ -110,6 +200,7 @@ class CommandExecutor {
       "-o", "ConnectTimeout=5",
       "-o", "LogLevel=ERROR",
       "-p", "\(sshPort)",
+      "--",
       "\(user)@127.0.0.1",
       command,
     ]
@@ -169,13 +260,17 @@ class CommandExecutor {
       )
       return CommandResult(
         exitCode: result.exitCode,
-        stdout: String(data: result.stdout, encoding: .utf8) ?? "",
-        stderr: String(data: result.stderr, encoding: .utf8) ?? ""
+        stdout: String(decoding: result.stdout, as: UTF8.self),
+        stderr: String(decoding: result.stderr, as: UTF8.self),
+        stdoutTruncated: result.stdoutTruncated,
+        stderrTruncated: result.stderrTruncated
       )
     } catch let error as AsyncProcessRunnerError {
       switch error {
       case .launchFailed(let message):
         throw CommandExecutorError.processLaunchFailed(message)
+      case .inputWriteFailed(let message):
+        throw CommandExecutorError.processLaunchFailed("Failed to write process standard input: \(message)")
       case .timeout:
         throw CommandExecutorError.timeout(command: command, seconds: timeout)
       }
@@ -185,9 +280,18 @@ class CommandExecutor {
   static func askpassScriptContent(for password: String) -> String {
     let escapedPassword = password
       .replacingOccurrences(of: "'", with: "'\\''")
-      .replacingOccurrences(of: "\n", with: "")
-      .replacingOccurrences(of: "\r", with: "")
     return "#!/bin/sh\nprintf '%s\\n' '\(escapedPassword)'\n"
+  }
+
+  static func passwordValidationError(_ password: String) -> String? {
+    let byteCount = password.utf8.count
+    if byteCount > maxPasswordLength {
+      return "Password is too long (\(byteCount) UTF-8 bytes, max \(maxPasswordLength))"
+    }
+    if password.unicodeScalars.contains(where: { $0.value == 0 || $0.value == 10 || $0.value == 13 }) {
+      return "Password must not contain NUL, carriage return, or newline characters"
+    }
+    return nil
   }
 
   private func createAskpassScript(password: String) throws -> String {

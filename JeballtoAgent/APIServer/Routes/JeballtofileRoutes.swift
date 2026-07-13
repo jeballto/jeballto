@@ -47,7 +47,10 @@ extension APIServer {
       steps: jeballtofileRequest.steps,
       source: jeballtofileRequest.source,
       vmManager: vmManager,
-      eventBus: eventBus
+      eventBus: eventBus,
+      onTerminal: { [weak self] executionId in
+        self?.recordTerminalJeballtofileExecutor(executionId)
+      }
     )
 
     setJeballtofileExecutor(executionId, executor: executor)
@@ -89,15 +92,15 @@ extension APIServer {
       return HTTPResponse.error("NOT_FOUND", message: "Jeballtofile execution not found", statusCode: 404)
     }
 
-    guard executor.execution.status == .running else {
+    guard executor.cancel() else {
+      let status = executor.execution.status
       return HTTPResponse.error(
         "INVALID_STATE",
-        message: "Execution is not running (current: \(executor.execution.status.rawValue))",
+        message: "Execution is not running (current: \(status.rawValue))",
         statusCode: 409
       )
     }
 
-    executor.cancel()
     return HTTPResponse.json(SuccessResponse(message: "Jeballtofile execution cancellation requested"))
   }
 
@@ -118,15 +121,23 @@ extension APIServer {
       )
     }
 
-    removeJeballtofileExecutor(executionId)
+    await executor.waitUntilFinished()
+    guard removeJeballtofileExecutor(executionId, expected: executor) else {
+      return HTTPResponse.error("NOT_FOUND", message: "Jeballtofile execution not found", statusCode: 404)
+    }
     return HTTPResponse.json(SuccessResponse(message: "Jeballtofile execution deleted"))
   }
 
   // MARK: - Decoding
 
   private func decodeJeballtofile(body: Data, contentType: String?) throws -> JeballtofileRequest {
-    let isYAML = contentType.map {
-      $0.contains("yaml") || $0.contains("x-yaml")
+    let mediaType = contentType?
+      .split(separator: ";", maxSplits: 1, omittingEmptySubsequences: false)
+      .first?
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .lowercased()
+    let isYAML = mediaType.map {
+      ["application/yaml", "application/x-yaml", "text/yaml", "text/x-yaml"].contains($0)
     } ?? false
 
     if isYAML {

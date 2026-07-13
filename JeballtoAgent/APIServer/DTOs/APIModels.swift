@@ -14,7 +14,7 @@ enum ByteSizeParseError: Error, LocalizedError {
 }
 
 enum ByteSize {
-  private static let suffixes: [(suffix: String, multiplier: Double)] = [
+  private static let suffixes: [(suffix: String, multiplier: UInt64)] = [
     ("TB", 1024 * 1024 * 1024 * 1024),
     ("GB", 1024 * 1024 * 1024),
     ("MB", 1024 * 1024),
@@ -26,17 +26,65 @@ enum ByteSize {
     for (suffix, multiplier) in suffixes {
       guard trimmed.hasSuffix(suffix) else { continue }
       let numberPart = String(trimmed.dropLast(suffix.count)).trimmingCharacters(in: .whitespaces)
-      guard let number = Double(numberPart), number > 0 else {
+      let components = numberPart.split(separator: ".", omittingEmptySubsequences: false)
+      guard components.count == 1 || components.count == 2,
+            let wholePart = components.first,
+            wholePart.isEmpty == false,
+            wholePart.utf8.allSatisfy({ (0x30 ... 0x39).contains($0) }),
+            let whole = UInt64(wholePart) else
+      {
         throw ByteSizeParseError.invalidFormat(value)
       }
-      let bytes = number * multiplier
-      guard bytes <= Double(UInt64.max) else {
+
+      let (wholeBytes, wholeOverflow) = whole.multipliedReportingOverflow(by: multiplier)
+      guard wholeOverflow == false else {
         throw ByteSizeParseError.invalidFormat(value)
       }
-      return UInt64(bytes)
+
+      var fractionalBytes: UInt64 = 0
+      if components.count == 2 {
+        var fraction = String(components[1])
+        guard fraction.isEmpty == false,
+              fraction.utf8.allSatisfy({ (0x30 ... 0x39).contains($0) }) else
+        {
+          throw ByteSizeParseError.invalidFormat(value)
+        }
+        while fraction.last == "0" {
+          fraction.removeLast()
+        }
+        if fraction.isEmpty == false {
+          guard fraction.count <= 19,
+                let fractionValue = UInt64(fraction),
+                let denominator = powerOfTen(fraction.count) else
+          {
+            throw ByteSizeParseError.invalidFormat(value)
+          }
+          let (scaledFraction, fractionOverflow) = fractionValue.multipliedReportingOverflow(by: multiplier)
+          guard fractionOverflow == false, scaledFraction.isMultiple(of: denominator) else {
+            throw ByteSizeParseError.invalidFormat(value)
+          }
+          fractionalBytes = scaledFraction / denominator
+        }
+      }
+
+      let (bytes, additionOverflow) = wholeBytes.addingReportingOverflow(fractionalBytes)
+      guard additionOverflow == false, bytes > 0 else {
+        throw ByteSizeParseError.invalidFormat(value)
+      }
+      return bytes
     }
 
     throw ByteSizeParseError.invalidFormat(value)
+  }
+
+  private static func powerOfTen(_ exponent: Int) -> UInt64? {
+    var value: UInt64 = 1
+    for _ in 0 ..< exponent {
+      let (next, overflow) = value.multipliedReportingOverflow(by: 10)
+      guard overflow == false else { return nil }
+      value = next
+    }
+    return value
   }
 }
 
@@ -83,9 +131,12 @@ struct CreateVMRequest: Codable {
       return (false, "Invalid VM name. Must be 1-100 characters, alphanumeric, hyphens, underscores, spaces, and dots")
     }
 
-    if let image, !image.isEmpty {
+    if let image {
+      guard image.isEmpty == false else {
+        return (false, "image must not be empty; omit it to create a blank VM")
+      }
       do {
-        _ = try ImageReference.parse(image)
+        _ = try ImageReference.parse(image, defaultRegistry: "default.invalid")
       } catch {
         return (false, "Invalid image reference: \(error.localizedDescription)")
       }
@@ -115,6 +166,14 @@ struct VMResourcesDTO: Codable {
       memorySize: memorySize?.bytes ?? (4 * 1024 * 1024 * 1024),
       diskSize: diskSize?.bytes ?? (64 * 1024 * 1024 * 1024)
     )
+  }
+
+  func validateProvidedFields() -> (valid: Bool, error: String?) {
+    UpdateVMResourcesDTO(
+      cpuCount: cpuCount,
+      memorySize: memorySize,
+      diskSize: diskSize
+    ).validate()
   }
 }
 
@@ -177,10 +236,18 @@ struct CloneVMRequest: Codable {
   let name: String
   let resources: VMResourcesDTO?
   var ephemeral: Bool? = nil
+  var lifetimeSeconds: Int? = nil
 
   func validate() -> (valid: Bool, error: String?) {
     guard VMNameValidator.validate(name) else {
       return (false, "Invalid VM name. Must be 1-100 characters, alphanumeric, hyphens, underscores, spaces, and dots")
+    }
+    if let resources {
+      let resourceValidation = resources.validateProvidedFields()
+      if resourceValidation.valid == false { return resourceValidation }
+    }
+    if let lifetimeSeconds, lifetimeSeconds < 1 || lifetimeSeconds > 604_800 {
+      return (false, "lifetimeSeconds must be between 1 and 604800 (7 days)")
     }
     return (true, nil)
   }
@@ -191,45 +258,17 @@ struct InstallVMRequest: Codable {
   let source: String?
 
   func validate() -> (valid: Bool, error: String?) {
-    guard let source, !source.isEmpty else {
-      return (true, nil) // omitted = download latest macOS
-    }
-
-    let lowered = source.lowercased()
-
-    if lowered.hasPrefix("https://") {
-      guard URL(string: source) != nil else {
-        return (false, "Invalid HTTPS URL format")
-      }
+    do {
+      _ = try IPSWSourceValidator.normalized(source)
       return (true, nil)
+    } catch {
+      return (false, error.localizedDescription)
     }
-
-    if lowered.hasPrefix("http://") {
-      return (false, "HTTP is not supported for security reasons. Use HTTPS or a local file path")
-    }
-
-    if lowered.hasPrefix("file://") {
-      let path = String(source.dropFirst("file://".count))
-      guard path.hasPrefix("/") else {
-        return (false, "file:// URL must use an absolute path (e.g., file:///path/to/file.ipsw)")
-      }
-      return (true, nil)
-    }
-
-    if source.hasPrefix("/") {
-      return (true, nil) // bare absolute path
-    }
-
-    return (false, "Invalid source format. Use an HTTPS URL, file:// URL, or absolute path (e.g., /path/to/file.ipsw)")
   }
 
-  /// Resolved source for downstream consumption (strips file:// scheme)
+  /// Resolved source for downstream consumption.
   var effectiveIPSWSource: String? {
-    guard let source, !source.isEmpty else { return nil }
-    if source.lowercased().hasPrefix("file://") {
-      return String(source.dropFirst("file://".count))
-    }
-    return source
+    try? IPSWSourceValidator.normalized(source)
   }
 }
 
@@ -245,18 +284,24 @@ struct CommandExecuteRequest: Codable {
     if command.isEmpty {
       return (false, "'command' must not be empty")
     }
-    if command.count > CommandExecutor.maxCommandLength {
-      return (false, "Command too long (max \(CommandExecutor.maxCommandLength) characters)")
+    if command.utf8.count > CommandExecutor.maxCommandLength {
+      return (false, "Command too long (max \(CommandExecutor.maxCommandLength) UTF-8 bytes)")
     }
     if let t = timeout {
       if t <= 0 { return (false, "Timeout must be positive") }
       if t > Self.maxTimeoutSeconds { return (false, "Timeout must not exceed \(Self.maxTimeoutSeconds) seconds") }
     }
+    if let user, !SSHUsernameValidator.validate(user) {
+      return (false, SSHUsernameValidator.validationError)
+    }
+    if let password, let validationError = CommandExecutor.passwordValidationError(password) {
+      return (false, validationError)
+    }
     return (true, nil)
   }
 
   var effectiveUser: String { user ?? "admin" }
-  var effectivePassword: String? { password ?? "admin" }
+  var effectivePassword: String? { password }
   var effectiveTimeout: TimeInterval { TimeInterval(timeout ?? 30) }
 }
 
@@ -265,23 +310,40 @@ struct CommandExecuteResponse: Codable {
   let exitCode: Int
   let stdout: String
   let stderr: String
+  let stdoutTruncated: Bool
+  let stderrTruncated: Bool
 }
 
 struct KeystrokesRequest: Codable {
   let keystrokes: [String]
 
-  private static let maxKeystrokeSequences = 1000
-  private static let maxKeystrokeSequenceLength = 10000
-
   func validate() -> (valid: Bool, error: String?) {
-    if keystrokes.isEmpty {
+    KeystrokeSequenceValidator.validate(keystrokes)
+  }
+}
+
+enum KeystrokeSequenceValidator {
+  static let maximumSequences = 1000
+  static let maximumSequenceCharacters = 10000
+  static let maximumTotalCharacters = 10000
+
+  static func validate(_ sequences: [String]) -> (valid: Bool, error: String?) {
+    if sequences.isEmpty {
       return (false, "'keystrokes' array must not be empty")
     }
-    if keystrokes.count > Self.maxKeystrokeSequences {
-      return (false, "Too many keystroke sequences (max \(Self.maxKeystrokeSequences))")
+    if sequences.count > maximumSequences {
+      return (false, "Too many keystroke sequences (max \(maximumSequences))")
     }
-    for seq in keystrokes where seq.count > Self.maxKeystrokeSequenceLength {
-      return (false, "Keystroke sequence too long (max \(Self.maxKeystrokeSequenceLength) characters)")
+    var totalCharacters = 0
+    for sequence in sequences {
+      let count = sequence.count
+      if count > maximumSequenceCharacters {
+        return (false, "Keystroke sequence too long (max \(maximumSequenceCharacters) characters)")
+      }
+      totalCharacters += count
+      if totalCharacters > maximumTotalCharacters {
+        return (false, "Keystroke request too long (max \(maximumTotalCharacters) total characters)")
+      }
     }
     return (true, nil)
   }
@@ -302,13 +364,28 @@ struct VMResponse: Codable {
   let state: String
   let ephemeral: Bool
   let resources: VMResourcesResponse
-  let network: VMNetworkResponse?
+  let network: VMNetworkResponse
   let guiOpen: Bool
   let uptime: Int? // seconds since VM started running, nil if not running
   let lifetimeSeconds: Int?
   let expiresAt: String?
   let createdAt: String
   let updatedAt: String
+
+  enum CodingKeys: String, CodingKey {
+    case id
+    case name
+    case state
+    case ephemeral
+    case resources
+    case network
+    case guiOpen
+    case uptime
+    case lifetimeSeconds
+    case expiresAt
+    case createdAt
+    case updatedAt
+  }
 
   /// Creates response from VMDefinition
   init(from definition: VMDefinition, guiOpen: Bool = false, uptime: Int? = nil) {
@@ -321,38 +398,38 @@ struct VMResponse: Codable {
     self.guiOpen = guiOpen
     self.uptime = uptime
     lifetimeSeconds = definition.lifetimeSeconds
-    expiresAt = definition.expiresAt.map { iso8601Formatter.string(from: $0) }
-    createdAt = iso8601Formatter.string(from: definition.createdAt)
-    updatedAt = iso8601Formatter.string(from: definition.updatedAt)
+    expiresAt = definition.expiresAt.map { iso8601String(from: $0) }
+    createdAt = iso8601String(from: definition.createdAt)
+    updatedAt = iso8601String(from: definition.updatedAt)
+  }
+
+  func encode(to encoder: Encoder) throws {
+    var container = encoder.container(keyedBy: CodingKeys.self)
+    try container.encode(id, forKey: .id)
+    try container.encode(name, forKey: .name)
+    try container.encode(state, forKey: .state)
+    try container.encode(ephemeral, forKey: .ephemeral)
+    try container.encode(resources, forKey: .resources)
+    try container.encode(network, forKey: .network)
+    try container.encode(guiOpen, forKey: .guiOpen)
+    try container.encode(uptime, forKey: .uptime)
+    try container.encode(lifetimeSeconds, forKey: .lifetimeSeconds)
+    try container.encode(expiresAt, forKey: .expiresAt)
+    try container.encode(createdAt, forKey: .createdAt)
+    try container.encode(updatedAt, forKey: .updatedAt)
   }
 }
 
 /// VM resources in response
 struct VMResourcesResponse: Codable {
   let cpuCount: Int
-  let memorySize: String
-  let diskSize: String
+  let memorySize: UInt64
+  let diskSize: UInt64
 
   init(from resources: VMResources) {
     cpuCount = resources.cpuCount
-    memorySize = Self.formatByteSize(resources.memorySize)
-    diskSize = Self.formatByteSize(resources.diskSize)
-  }
-
-  /// Formats bytes as a human-readable string like "4GB" or "4.5GB"
-  static func formatByteSize(_ bytes: UInt64) -> String {
-    let gb = Double(bytes) / (1024 * 1024 * 1024)
-    if gb >= 1, gb == gb.rounded() {
-      return "\(Int(gb))GB"
-    } else if gb >= 1 {
-      return String(format: "%.1fGB", gb)
-    } else {
-      let mb = Double(bytes) / (1024 * 1024)
-      if mb == mb.rounded() {
-        return "\(Int(mb))MB"
-      }
-      return String(format: "%.1fMB", mb)
-    }
+    memorySize = resources.memorySize
+    diskSize = resources.diskSize
   }
 }
 
@@ -375,12 +452,12 @@ struct VMNetworkResponse: Codable {
 struct VMListResponse: Codable {
   let vms: [VMResponse]
   let total: Int
-  let limit: Int?
-  let offset: Int?
+  let limit: Int
+  let offset: Int
 
-  init(vms: [VMResponse], total: Int? = nil, limit: Int? = nil, offset: Int? = nil) {
+  init(vms: [VMResponse], total: Int, limit: Int, offset: Int) {
     self.vms = vms
-    self.total = total ?? vms.count
+    self.total = total
     self.limit = limit
     self.offset = offset
   }
@@ -391,13 +468,11 @@ struct SSHInfoResponse: Codable {
   let host: String
   let port: Int?
   let status: String
-  let user: String?
 
-  init(host: String = "127.0.0.1", port: Int?, status: String = "ready", user: String? = nil) {
+  init(host: String = "127.0.0.1", port: Int?, status: String = "ready") {
     self.host = host
     self.port = port
     self.status = status
-    self.user = user
   }
 }
 
@@ -451,7 +526,7 @@ struct HealthResponse: Codable {
 /// Response for installation status
 struct InstallStatusResponse: Codable {
   let vmId: String
-  let status: String // "not_started", "installing", "completed", "failed"
+  let status: String // durable installation state, including cancellation and restart interruption
   let progress: Double? // overall 0.0 to 1.0
   let phaseProgress: Double? // progress within current phase 0.0 to 1.0
   let message: String?
@@ -475,6 +550,10 @@ struct InstallStatusResponse: Codable {
     self.bytesTotal = bytesTotal
     self.downloadSpeed = downloadSpeed
   }
+
+  static func wireStatus(for installation: VMInstallation?) -> String {
+    installation?.state.rawValue ?? "not_started"
+  }
 }
 
 /// Response for events
@@ -484,44 +563,92 @@ struct EventResponse: Codable {
   let vmId: String?
   let data: [String: String]?
 
+  enum CodingKeys: String, CodingKey {
+    case timestamp
+    case type
+    case vmId
+    case data
+  }
+
   init(from event: RecordedEvent) {
-    timestamp = iso8601Formatter.string(from: event.timestamp)
+    timestamp = iso8601String(from: event.timestamp)
     type = event.event.eventType
     vmId = event.event.vmId?.uuidString
+    data = Self.lifecycleData(for: event.event)
+      ?? Self.installAndNetworkData(for: event.event)
+      ?? Self.imageData(for: event.event)
+      ?? Self.jeballtofileData(for: event.event)
+  }
 
-    // Extract event-specific data
-    switch event.event {
-    case .stateChanged(_, let from, let to): data = ["from": from.rawValue, "to": to.rawValue]
-    case .vmCreated(_, let name): data = ["name": name]
-    case .vmDeleted(_, let name): data = ["name": name]
-    case .errorOccurred(_, let error): data = ["error": error]
-    case .sshPortAssigned(_, let port): data = ["port": String(port)]
-    case .sshPortReleased: data = nil
-    case .vncPortAssigned(_, let port): data = ["port": String(port)]
-    case .vncPortReleased: data = nil
+  private static func lifecycleData(for event: VMEvent) -> [String: String]? {
+    switch event {
+    case .stateChanged(_, let from, let to): ["from": from.rawValue, "to": to.rawValue]
+    case .vmCreated(_, let name), .vmDeleted(_, let name): ["name": name]
+    case .errorOccurred(_, let error): ["error": error]
+    case .vmCloned(_, let sourceVmId, let name): ["sourceVmId": sourceVmId.uuidString, "name": name]
+    default: nil
+    }
+  }
+
+  private static func installAndNetworkData(for event: VMEvent) -> [String: String]? {
+    switch event {
+    case .sshPortAssigned(_, let port), .vncPortAssigned(_, let port): return ["port": String(port)]
+    case .installProgress(
+      _, let progress, let phaseProgress, let message, let phase,
+      let bytesDownloaded, let bytesTotal, let downloadSpeed
+    ):
+      var payload = [
+        "progress": String(progress),
+        "phaseProgress": String(phaseProgress),
+        "message": message,
+        "phase": phase,
+      ]
+      if let bytesDownloaded { payload["bytesDownloaded"] = String(bytesDownloaded) }
+      if let bytesTotal { payload["bytesTotal"] = String(bytesTotal) }
+      if let downloadSpeed { payload["downloadSpeed"] = String(downloadSpeed) }
+      return payload
+    case .installFailed(_, let error): return ["error": error]
+    default: return nil
+    }
+  }
+
+  private static func imageData(for event: VMEvent) -> [String: String]? {
+    switch event {
     case .imagePullStarted(let ref), .imagePulled(let ref), .imagePushStarted(let ref), .imagePushed(let ref),
          .imageDeleted(let ref):
-      data = ["reference": ref]
+      ["reference": ref]
     case .imagePullFailed(let ref, let error), .imagePushFailed(let ref, let error):
-      data = ["reference": ref, "error": error]
-    case .vmCloned(_, let sourceVmId, let name): data = ["sourceVmId": sourceVmId.uuidString, "name": name]
-    case .guiOpened, .guiClosed: data = nil
-    case .jeballtofileStarted(let execId, let vmId):
-      data = ["executionId": execId.uuidString, "vmId": vmId.uuidString]
-    case .jeballtofileStepStarted(let execId, let step, let stepType):
-      data = ["executionId": execId.uuidString, "step": String(step), "stepType": stepType]
-    case .jeballtofileStepCompleted(let execId, let step, let stepType):
-      data = ["executionId": execId.uuidString, "step": String(step), "stepType": stepType]
-    case .jeballtofileStepFailed(let execId, let step, let stepType, let error):
-      data = ["executionId": execId.uuidString, "step": String(step), "stepType": stepType, "error": error]
-    case .jeballtofileCompleted(let execId, let vmId):
-      data = ["executionId": execId.uuidString, "vmId": vmId.uuidString]
-    case .jeballtofileCancelled(let execId, let vmId, let step):
-      data = ["executionId": execId.uuidString, "vmId": vmId.uuidString, "step": String(step)]
-    case .jeballtofileFailed(let execId, let vmId, let step, let error):
-      data = ["executionId": execId.uuidString, "vmId": vmId.uuidString, "step": String(step), "error": error]
-    default: data = nil
+      ["reference": ref, "error": error]
+    default: nil
     }
+  }
+
+  private static func jeballtofileData(for event: VMEvent) -> [String: String]? {
+    switch event {
+    case .jeballtofileStarted(let execId, let vmId):
+      ["executionId": execId.uuidString, "vmId": vmId.uuidString]
+    case .jeballtofileStepStarted(let execId, _, let step, let stepType):
+      ["executionId": execId.uuidString, "step": String(step), "stepType": stepType]
+    case .jeballtofileStepCompleted(let execId, _, let step, let stepType):
+      ["executionId": execId.uuidString, "step": String(step), "stepType": stepType]
+    case .jeballtofileStepFailed(let execId, _, let step, let stepType, let error):
+      ["executionId": execId.uuidString, "step": String(step), "stepType": stepType, "error": error]
+    case .jeballtofileCompleted(let execId, let vmId):
+      ["executionId": execId.uuidString, "vmId": vmId.uuidString]
+    case .jeballtofileCancelled(let execId, let vmId, let step):
+      ["executionId": execId.uuidString, "vmId": vmId.uuidString, "step": String(step)]
+    case .jeballtofileFailed(let execId, let vmId, let step, let error):
+      ["executionId": execId.uuidString, "vmId": vmId.uuidString, "step": String(step), "error": error]
+    default: nil
+    }
+  }
+
+  func encode(to encoder: Encoder) throws {
+    var container = encoder.container(keyedBy: CodingKeys.self)
+    try container.encode(timestamp, forKey: .timestamp)
+    try container.encode(type, forKey: .type)
+    try container.encode(vmId, forKey: .vmId)
+    try container.encode(data, forKey: .data)
   }
 }
 
@@ -555,17 +682,15 @@ struct ErrorResponse: Codable {
   struct ErrorDetail: Codable {
     let code: String
     let message: String
-    let details: [String: String]?
 
-    init(code: String, message: String, details: [String: String]? = nil) {
+    init(code: String, message: String) {
       self.code = code
       self.message = message
-      self.details = details
     }
   }
 
-  init(code: String, message: String, details: [String: String]? = nil) {
-    error = ErrorDetail(code: code, message: message, details: details)
+  init(code: String, message: String) {
+    error = ErrorDetail(code: code, message: message)
   }
 }
 
@@ -608,16 +733,25 @@ struct PullImageRequest: Codable {
     asyncRequested ?? false
   }
 
+  var validationFailureCode: String {
+    if let timeout, timeout <= 0 || timeout > Self.maxTimeoutSeconds {
+      return "INVALID_REQUEST"
+    }
+    return "INVALID_REFERENCE"
+  }
+
   func validate() -> (valid: Bool, error: String?) {
+    if let t = timeout {
+      if t <= 0 { return (false, "Timeout must be positive if specified") }
+      if t > Self.maxTimeoutSeconds {
+        return (false, "Timeout must not exceed \(Self.maxTimeoutSeconds) seconds")
+      }
+    }
     guard !reference.isEmpty else {
       return (false, "Image reference is required")
     }
-    if let t = timeout {
-      if t <= 0 { return (false, "Timeout must be positive if specified") }
-      if t > Self.maxTimeoutSeconds { return (false, "Timeout must not exceed \(Self.maxTimeoutSeconds) seconds") }
-    }
     do {
-      _ = try ImageReference.parse(reference)
+      _ = try ImageReference.parse(reference, defaultRegistry: "default.invalid")
       return (true, nil)
     } catch {
       return (false, "Invalid image reference: \(error.localizedDescription)")
@@ -653,7 +787,7 @@ struct PushImageRequest: Codable {
       if t > Self.maxTimeoutSeconds { return (false, "Timeout must not exceed \(Self.maxTimeoutSeconds) seconds") }
     }
     do {
-      _ = try ImageReference.parse(reference)
+      _ = try ImageReference.parse(reference, defaultRegistry: "default.invalid")
     } catch {
       return (false, "Invalid image reference: \(error.localizedDescription)")
     }
@@ -694,18 +828,20 @@ struct PushImageRequest: Codable {
 }
 
 struct RegistryLoginRequest: Codable {
+  static let maximumUsernameLength = RegistryCredentialValidator.maximumUsernameLength
+  static let maximumPasswordLength = RegistryCredentialValidator.maximumPasswordLength
+
   let registry: String
   let username: String
   let password: String
 
-  private static let hostPattern = "^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?(:[0-9]{1,5})?$"
-
   func validate() -> (valid: Bool, error: String?) {
-    guard !registry.isEmpty else { return (false, "Registry is required") }
-    guard !username.isEmpty else { return (false, "Username is required") }
-    guard !password.isEmpty else { return (false, "Password is required") }
-    guard registry.range(of: Self.hostPattern, options: .regularExpression) != nil else {
-      return (false, "Invalid registry hostname")
+    if let error = RegistryCredentialValidator.loginError(
+      registry: registry,
+      username: username,
+      password: password
+    ) {
+      return (false, error)
     }
     return (true, nil)
   }
@@ -714,14 +850,9 @@ struct RegistryLoginRequest: Codable {
 struct RegistryLogoutRequest: Codable {
   let registry: String
 
-  private static let hostPattern = "^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?(:[0-9]{1,5})?$"
-
   func validate() -> (valid: Bool, error: String?) {
-    guard !registry.isEmpty else {
-      return (false, "Registry is required")
-    }
-    guard registry.range(of: Self.hostPattern, options: .regularExpression) != nil else {
-      return (false, "Invalid registry hostname")
+    if let error = RegistryCredentialValidator.registryError(registry) {
+      return (false, error)
     }
     return (true, nil)
   }
@@ -735,6 +866,8 @@ struct ImageResponse: Codable {
   let digest: String?
   let localPath: String
   let size: UInt64?
+  let resources: VMResourcesResponse?
+  let formatVersion: Int
   let pulledAt: String?
   let pushedAt: String?
   let metadata: [String: String]?
@@ -745,8 +878,10 @@ struct ImageResponse: Codable {
     digest = record.digest
     localPath = record.localPath
     size = record.size
-    pulledAt = record.pulledAt.map { iso8601Formatter.string(from: $0) }
-    pushedAt = record.pushedAt.map { iso8601Formatter.string(from: $0) }
+    resources = record.resources.map(VMResourcesResponse.init(from:))
+    formatVersion = record.formatVersion
+    pulledAt = record.pulledAt.map { iso8601String(from: $0) }
+    pushedAt = record.pushedAt.map { iso8601String(from: $0) }
     metadata = record.metadata.isEmpty ? nil : record.metadata
   }
 }
@@ -754,12 +889,12 @@ struct ImageResponse: Codable {
 struct ImageListResponse: Codable {
   let images: [ImageResponse]
   let total: Int
-  let limit: Int?
-  let offset: Int?
+  let limit: Int
+  let offset: Int
 
-  init(images: [ImageRecord], total: Int? = nil, limit: Int? = nil, offset: Int? = nil) {
+  init(images: [ImageRecord], total: Int, limit: Int, offset: Int) {
     self.images = images.map { ImageResponse(from: $0) }
-    self.total = total ?? images.count
+    self.total = total
     self.limit = limit
     self.offset = offset
   }
@@ -811,6 +946,7 @@ struct ImageOperationStatusResponse: Codable {
   let completedAt: String?
   let digest: String?
   let image: ImageResponse?
+  let errorCode: String?
   let error: String?
 
   init(from status: ImageOperationStatus) {
@@ -828,58 +964,33 @@ struct ImageOperationStatusResponse: Codable {
     chunksTotal = status.chunksTotal
     bytesCompleted = status.bytesCompleted
     bytesTotal = status.bytesTotal
-    startedAt = iso8601Formatter.string(from: status.startedAt)
-    updatedAt = iso8601Formatter.string(from: status.updatedAt)
-    completedAt = status.completedAt.map { iso8601Formatter.string(from: $0) }
+    startedAt = iso8601String(from: status.startedAt)
+    updatedAt = iso8601String(from: status.updatedAt)
+    completedAt = status.completedAt.map { iso8601String(from: $0) }
     digest = status.digest
     image = status.image.map { ImageResponse(from: $0) }
+    errorCode = status.errorCode?.rawValue
     error = status.error
   }
 
   private static func averageSpeedMBps(for status: ImageOperationStatus) -> Double? {
-    let endDate = status.completedAt ?? status.updatedAt
-    let startedAt = status.stageStartedAt ?? status.startedAt
-    let elapsed = endDate.timeIntervalSince(startedAt)
+    guard status.stage != .finalizing else { return nil }
+    let endUptime = status.completedUptime ?? status.updatedUptime
+    let startedUptime = status.stageStartedUptime ?? status.startedUptime
+    let elapsed = endUptime - startedUptime
     guard elapsed > 0, status.bytesCompleted > 0 else { return nil }
     let speed = Double(status.bytesCompleted) / elapsed / 1_000_000.0
+    guard speed.isFinite else { return nil }
     return roundTwoDecimals(speed)
   }
 
   private static func roundTwoDecimals(_ value: Double) -> Double {
-    (value * 100).rounded() / 100
+    guard value.isFinite else { return 0 }
+    return (value * 100).rounded() / 100
   }
 }
 
 struct RegistryLoginResponse: Codable {
   let registry: String
   let status: String
-  let message: String?
-}
-
-// MARK: - System Reset Models
-
-struct SystemResetRequest: Codable {
-  let mode: String
-
-  private static let validModes = ["soft", "hard"]
-
-  func validate() -> (valid: Bool, error: String?) {
-    guard Self.validModes.contains(mode) else {
-      return (false, "Invalid mode '\(mode)'. Must be one of: \(Self.validModes.joined(separator: ", "))")
-    }
-    return (true, nil)
-  }
-}
-
-struct SystemResetResponse: Codable {
-  let mode: String
-  let vmsDeleted: Int
-  let vmsFailed: Int
-  let imagesDeleted: Int
-  let imagesFailed: Int
-  let ipswCacheCleared: Bool
-  let configDeleted: Bool
-  let logsDeleted: Bool
-  let willTerminate: Bool
-  let errors: [String]?
 }

@@ -2,6 +2,9 @@
 
 Running JeballtoAgent day-to-day: the status bar menu, auto-updates, start-at-login, the IPSW cache, and required macOS permissions.
 
+Only one JeballtoAgent process can use a user's local state at a time. A second process exits before loading the VM
+database, image index, or API credential, so it cannot reconcile or overwrite state owned by the running agent.
+
 ## Status Bar Menu
 
 JeballtoAgent runs as a headless macOS app with a status bar icon. Click it to open the menu:
@@ -46,14 +49,29 @@ Downloaded macOS IPSWs are cached at:
 
 The cache is reused across installs so repeated `POST /v1/vms/{id}/install` calls with the same source don't re-download.
 
-OCI image pull and push operations use a separate resumable transfer cache at `~/Library/Caches/Jeballto/ImageWork/`. That cache is session-scoped: startup removes it, successful transfers delete their own operation cache, and failed or cancelled transfers keep verified work only until the agent exits.
+OCI image pull and push operations use a separate resumable transfer cache under
+`~/Library/Caches/Jeballto/ImageWork/sessions/`. The agent and each image child process hold shared advisory leases on
+their session. A launch marker protects the handoff before a child acquires its lease, and the child preserves that
+lease while running `oras`, `zstd`, or the bundle-copy tool. Cleanup requires an exclusive lease. This prevents a new
+agent from deleting work still used by an orphaned child after an unexpected exit.
+
+Startup removes only sessions proven inactive. After acquiring the global single-instance lock, it may also remove
+old work that has no lock. A symbolic or otherwise unsafe lock target is preserved for manual inspection. Successful
+transfers delete their operation cache. Failed or cancelled transfers keep verified work until the process exits,
+and a later startup removes the inactive session.
 
 **Clearing caches:**
 
-- `POST /v1/system/reset` (either mode) clears the IPSW cache.
+- `POST /v1/system/reset` (either mode) attempts to clear the IPSW cache. Hard reset reaches cache cleanup only after
+  every VM and image has been removed successfully.
 - Or remove the directory manually while the agent is stopped.
 
-Typical IPSW size is 12-18 GB, so this is often the biggest user of disk space beyond the VM bundles themselves.
+An image wipe clears only the current process's image work session and keeps its lock files. It does not scan foreign
+session directories. The next exclusive startup removes inactive or old lockless work. Remove directories with
+unsafe lock files manually only while every Jeballto process and image child is stopped.
+
+IPSW restore images are large, so a cache containing several versions can be a major user of disk space beyond the
+VM bundles themselves.
 
 ## Local Network Permission
 
@@ -72,13 +90,21 @@ The agent is headless by default: VMs run without a visible window. You can atta
 - `POST /v1/vms/{id}/gui` - opens a native `VZVirtualMachineView` window
 - `DELETE /v1/vms/{id}/gui` - closes it; the VM keeps running
 
-A window is **not required** for `GET /v1/vms/{id}/screenshot` (which always works while the VM is RUNNING) or for keystroke injection (a hidden view is created automatically when no window is open).
+A window is **not required** for `GET /v1/vms/{id}/screenshot` (which works while the VM is `running`) or for
+keystroke injection (a hidden view is created automatically when no window is open).
 
 ## Shutdown Behavior
 
 `Stop Jeballto` (or SIGTERM/SIGINT) runs `cleanupForShutdown()` with a 30-second budget:
 
 - **Ephemeral VMs** are stopped, then deleted.
-- **Non-ephemeral running VMs** are paused and saved to disk. They resume automatically on next launch if still PAUSED with a save file.
+- **Non-ephemeral running VMs** are paused and saved to disk.
+- **Non-ephemeral in-memory paused VMs** are saved without being resumed first.
 
-If the 30-second budget expires, the agent exits anyway. VMs still in a transitional state on next startup are reset to STOPPED (their runtime process is gone).
+On the next launch, saved VMs remain `paused` with the save file available. Resume them explicitly with
+`POST /v1/vms/{id}/resume`.
+
+If the 30-second budget expires, the agent exits anyway. On next startup, `starting`, `stopping`, `pausing`, and
+`resuming` states become `stopped` because their runtime process is gone. A `paused` VM remains paused only when its
+save file exists. An interrupted installation becomes retryable in `created`; finalization is recovered to `stopped`
+when the bundle is complete, or to `error` when validation fails.

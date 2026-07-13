@@ -6,13 +6,19 @@ extension APIServer {
   // MARK: - Health
 
   func handleHealth() async -> HTTPResponse {
-    let uptime = Int(Date().timeIntervalSince(startTime))
-    let health = await HealthResponse(
-      vmsTotal: vmManager.vmCount(),
-      vmsRunning: vmManager.runningVMCount(),
-      uptime: uptime
-    )
-    return HTTPResponse.json(health)
+    do {
+      let uptime = startUptime.map {
+        max(0, Int(ProcessInfo.processInfo.systemUptime - $0))
+      } ?? 0
+      let health = try await HealthResponse(
+        vmsTotal: vmManager.vmCount(),
+        vmsRunning: vmManager.runningVMCount(),
+        uptime: uptime
+      )
+      return HTTPResponse.json(health)
+    } catch {
+      return HTTPResponse.error("HEALTH_CHECK_FAILED", message: error.localizedDescription, statusCode: 500)
+    }
   }
 
   // MARK: - Capabilities
@@ -48,7 +54,11 @@ extension APIServer {
       let status = proxyAlive ? "ready" : "unavailable"
       let response = SSHInfoResponse(host: "127.0.0.1", port: sshPort, status: status)
       return HTTPResponse.json(response)
-    } catch { return HTTPResponse.error("NOT_FOUND", message: "VM not found", statusCode: 404) }
+    } catch let error as VMManagerError {
+      return APIRouteErrorMapper.vmManager(error, defaultCode: "SSH_STATUS_FAILED")
+    } catch {
+      return HTTPResponse.error("SSH_STATUS_FAILED", message: error.localizedDescription, statusCode: 500)
+    }
   }
 
   func handleEnableSSH(_ request: HTTPRequest) async -> HTTPResponse {
@@ -57,6 +67,14 @@ extension APIServer {
     }
     if let response = requireCapability(.portForwarding) { return response }
 
+    return await withExclusiveNetworkingOperation(
+      vmId: vmId,
+      operation: "enable SSH forwarding",
+      errorCode: "SSH_ENABLE_FAILED"
+    ) { await self.performEnableSSH(vmId) }
+  }
+
+  private func performEnableSSH(_ vmId: UUID) async -> HTTPResponse {
     do {
       var definition = try await vmManager.getVM(vmId)
 
@@ -72,20 +90,19 @@ extension APIServer {
       // Wait for any pending auto-enable networking task to finish, then re-read definition.
       // This prevents a race where auto-enable allocates port 2222 and this endpoint
       // allocates port 2223 because it read the definition before auto-enable persisted.
-      await vmManager.awaitNetworkingSetup(vmId)
+      try await vmManager.awaitNetworkingSetup(vmId)
       definition = try await vmManager.getVM(vmId)
 
       if let existingPort = definition.network.sshPort {
-        // Verify the TCP proxy is actually running (it may have died)
         if await portForwardingManager.isSSHForwardingActive(vmId: vmId) {
           let response = SSHInfoResponse(host: "127.0.0.1", port: existingPort)
           return HTTPResponse.json(response)
         }
-        // Proxy is dead - clean up stale state and re-create below
+        // The persisted reservation outlived its proxy. Release it before the
+        // actor atomically chooses and starts a replacement.
         await portForwardingManager.releasePort(existingPort)
-        var cleaned = definition
-        cleaned.clearSSHPort()
-        try await updateVMDefinition(vmId, definition: cleaned)
+        try await vmManager.setSSHPort(nil, for: vmId)
+        definition = try await vmManager.getVM(vmId)
       }
 
       var natIP = definition.network.natIP
@@ -103,25 +120,30 @@ extension APIServer {
         )
       }
 
-      guard let sshPort = await portForwardingManager.allocatePort() else {
-        return HTTPResponse.error(
-          "SSH_ENABLE_FAILED",
-          message: "No available SSH ports in configured range",
-          statusCode: 503
-        )
-      }
-
+      let sshPort: Int
       do {
-        try await portForwardingManager.setupSSHForwarding(vmId: vmId, vmIPAddress: natIP, sshPort: sshPort)
-        await vmManager.startSSHReadinessProbe(vmId: vmId, sshPort: sshPort)
+        guard let allocatedPort = try await portForwardingManager.allocateAndSetupSSHForwarding(
+          vmId: vmId,
+          vmIPAddress: natIP
+        ) else {
+          return HTTPResponse.error(
+            "SSH_ENABLE_FAILED",
+            message: "No available SSH ports in configured range",
+            statusCode: 503
+          )
+        }
+        sshPort = allocatedPort
       } catch {
-        await portForwardingManager.releasePort(sshPort)
         return HTTPResponse.error("SSH_ENABLE_FAILED", message: error.localizedDescription, statusCode: 500)
       }
 
-      var updated = definition
-      updated.updateSSHPort(sshPort)
-      try await updateVMDefinition(vmId, definition: updated)
+      do {
+        try await vmManager.setSSHPort(sshPort, for: vmId)
+      } catch {
+        await portForwardingManager.stopSSHForwarding(vmId: vmId)
+        throw error
+      }
+      await vmManager.startSSHReadinessProbe(vmId: vmId, sshPort: sshPort)
 
       let response = SSHInfoResponse(host: "127.0.0.1", port: sshPort)
       return HTTPResponse.json(response)
@@ -135,10 +157,18 @@ extension APIServer {
       return APIRouteErrorMapper.invalidID()
     }
 
-    do {
-      let definition = try await vmManager.getVM(vmId)
+    return await withExclusiveNetworkingOperation(
+      vmId: vmId,
+      operation: "disable SSH forwarding",
+      errorCode: "SSH_DISABLE_FAILED"
+    ) { await self.performDisableSSH(vmId) }
+  }
 
-      let state = try await vmManager.getVMState(vmId)
+  private func performDisableSSH(_ vmId: UUID) async -> HTTPResponse {
+    do {
+      _ = try await vmManager.getVM(vmId)
+
+      var state = try await vmManager.getVMState(vmId)
       guard state != .created, state != .installing else {
         return HTTPResponse.error(
           "INVALID_STATE",
@@ -147,16 +177,24 @@ extension APIServer {
         )
       }
 
+      await vmManager.cancelNetworkingSetup(vmId)
+
+      state = try await vmManager.getVMState(vmId)
+      guard state != .created, state != .installing else {
+        return HTTPResponse.error(
+          "INVALID_STATE",
+          message: "VM must be installed before SSH can be managed (current: \(state.rawValue))",
+          statusCode: 409
+        )
+      }
+      let definition = try await vmManager.getVM(vmId)
+
       await portForwardingManager.stopSSHForwarding(vmId: vmId)
 
       if let sshPort = definition.network.sshPort {
         await portForwardingManager.releasePort(sshPort)
-        eventBus.publish(.sshPortReleased(vmId: vmId))
       }
-
-      var updated = definition
-      updated.clearSSHPort()
-      try await updateVMDefinition(vmId, definition: updated)
+      try await vmManager.setSSHPort(nil, for: vmId)
 
       let response = SSHInfoResponse(host: "127.0.0.1", port: nil, status: "disabled")
       return HTTPResponse.json(response)
@@ -173,6 +211,14 @@ extension APIServer {
     }
     if let response = requireCapability(.portForwarding) { return response }
 
+    return await withExclusiveNetworkingOperation(
+      vmId: vmId,
+      operation: "enable VNC forwarding",
+      errorCode: "VNC_ENABLE_FAILED"
+    ) { await self.performEnableVNC(vmId) }
+  }
+
+  private func performEnableVNC(_ vmId: UUID) async -> HTTPResponse {
     do {
       var definition = try await vmManager.getVM(vmId)
 
@@ -187,16 +233,15 @@ extension APIServer {
 
       // Idempotent: if VNC is already enabled, return current info
       if let existingPort = definition.network.vncPort {
-        // Verify the TCP proxy is actually running (it may have died)
         if await portForwardingManager.isVNCForwardingActive(vmId: vmId) {
           let response = VNCInfoResponse(port: existingPort)
           return HTTPResponse.json(response)
         }
-        // Proxy is dead - clean up stale state and re-create below
+        // The persisted reservation outlived its proxy. Release it before the
+        // actor atomically chooses and starts a replacement.
         await portForwardingManager.releaseVNCPort(existingPort)
-        var cleaned = definition
-        cleaned.clearVNCPort()
-        try await updateVMDefinition(vmId, definition: cleaned)
+        try await vmManager.setVNCPort(nil, for: vmId)
+        definition = try await vmManager.getVM(vmId)
       }
 
       var natIP = definition.network.natIP
@@ -214,24 +259,29 @@ extension APIServer {
         )
       }
 
-      guard let vncPort = await portForwardingManager.allocateVNCPort() else {
-        return HTTPResponse.error(
-          "VNC_ENABLE_FAILED",
-          message: "No available VNC ports in configured range",
-          statusCode: 503
-        )
-      }
-
+      let vncPort: Int
       do {
-        try await portForwardingManager.setupVNCForwarding(vmId: vmId, vmIPAddress: natIP, vncPort: vncPort)
+        guard let allocatedPort = try await portForwardingManager.allocateAndSetupVNCForwarding(
+          vmId: vmId,
+          vmIPAddress: natIP
+        ) else {
+          return HTTPResponse.error(
+            "VNC_ENABLE_FAILED",
+            message: "No available VNC ports in configured range",
+            statusCode: 503
+          )
+        }
+        vncPort = allocatedPort
       } catch {
-        await portForwardingManager.releaseVNCPort(vncPort)
         return HTTPResponse.error("VNC_ENABLE_FAILED", message: error.localizedDescription, statusCode: 500)
       }
 
-      var updated = definition
-      updated.updateVNCPort(vncPort)
-      try await updateVMDefinition(vmId, definition: updated)
+      do {
+        try await vmManager.setVNCPort(vncPort, for: vmId)
+      } catch {
+        await portForwardingManager.stopVNCForwarding(vmId: vmId)
+        throw error
+      }
 
       let response = VNCInfoResponse(port: vncPort)
       return HTTPResponse.json(response)
@@ -245,6 +295,14 @@ extension APIServer {
       return APIRouteErrorMapper.invalidID()
     }
 
+    return await withExclusiveNetworkingOperation(
+      vmId: vmId,
+      operation: "disable VNC forwarding",
+      errorCode: "VNC_DISABLE_FAILED"
+    ) { await self.performDisableVNC(vmId) }
+  }
+
+  private func performDisableVNC(_ vmId: UUID) async -> HTTPResponse {
     do {
       let definition = try await vmManager.getVM(vmId)
 
@@ -261,12 +319,8 @@ extension APIServer {
 
       if let vncPort = definition.network.vncPort {
         await portForwardingManager.releaseVNCPort(vncPort)
-        eventBus.publish(.vncPortReleased(vmId: vmId))
       }
-
-      var updated = definition
-      updated.clearVNCPort()
-      try await updateVMDefinition(vmId, definition: updated)
+      try await vmManager.setVNCPort(nil, for: vmId)
 
       let response = VNCInfoResponse(host: "127.0.0.1", port: nil, status: "disabled")
       return HTTPResponse.json(response)
@@ -304,7 +358,26 @@ extension APIServer {
       let status = proxyAlive ? "ready" : "unavailable"
       let response = VNCInfoResponse(port: vncPort, status: status)
       return HTTPResponse.json(response)
-    } catch { return HTTPResponse.error("NOT_FOUND", message: "VM not found", statusCode: 404) }
+    } catch let error as VMManagerError {
+      return APIRouteErrorMapper.vmManager(error, defaultCode: "VNC_STATUS_FAILED")
+    } catch {
+      return HTTPResponse.error("VNC_STATUS_FAILED", message: error.localizedDescription, statusCode: 500)
+    }
+  }
+
+  private func withExclusiveNetworkingOperation(
+    vmId: UUID,
+    operation: String,
+    errorCode: String,
+    body: @Sendable () async -> HTTPResponse
+  ) async -> HTTPResponse {
+    do {
+      return try await vmManager.withExclusiveVMOperation(vmId, operation: operation, body: body)
+    } catch let error as VMManagerError {
+      return APIRouteErrorMapper.vmManager(error, defaultCode: errorCode)
+    } catch {
+      return HTTPResponse.error(errorCode, message: error.localizedDescription, statusCode: 500)
+    }
   }
 
   // MARK: - State & Events
@@ -315,11 +388,14 @@ extension APIServer {
     }
 
     do {
-      let state = try await vmManager.getVMState(vmId)
-      let uptime = try? await vmManager.getVMUptime(vmId)
-      let response = VMStateResponse(state: state, uptime: uptime ?? nil)
+      let snapshot = try await vmManager.getVMStateSnapshot(vmId)
+      let response = VMStateResponse(state: snapshot.state, uptime: snapshot.uptime)
       return HTTPResponse.json(response)
-    } catch { return HTTPResponse.error("NOT_FOUND", message: "VM not found", statusCode: 404) }
+    } catch let error as VMManagerError {
+      return APIRouteErrorMapper.vmManager(error, defaultCode: "GET_STATE_FAILED")
+    } catch {
+      return HTTPResponse.error("GET_STATE_FAILED", message: error.localizedDescription, statusCode: 500)
+    }
   }
 
   func handleGetEvents(_ request: HTTPRequest) async -> HTTPResponse {
@@ -327,20 +403,28 @@ extension APIServer {
       return APIRouteErrorMapper.invalidID()
     }
 
-    // Verify VM exists
+    let limit: Int
+    do {
+      limit = try HTTPQueryParameters.integer(named: "limit", in: request, defaultValue: 100, min: 1, max: 1000)
+    } catch {
+      return invalidQueryParameter(error)
+    }
+
+    let events = eventBus.getEvents(forVM: vmId, limit: limit)
+
+    // Preserve event history for recently deleted VMs. A never-seen UUID remains a 404.
     do {
       _ = try await vmManager.getVM(vmId)
     } catch let error as VMManagerError {
       switch error {
-      case .vmNotFound: return HTTPResponse.error("NOT_FOUND", message: "VM not found", statusCode: 404)
+      case .vmNotFound where events.isEmpty:
+        return HTTPResponse.error("NOT_FOUND", message: "VM not found", statusCode: 404)
+      case .vmNotFound:
+        break
       default: return HTTPResponse.error("EVENTS_FAILED", message: error.localizedDescription, statusCode: 500)
       }
     } catch { return HTTPResponse.error("EVENTS_FAILED", message: error.localizedDescription, statusCode: 500) }
 
-    let requestedLimit = Int(request.queryParameters["limit"] ?? "100") ?? 100
-    let limit = max(1, min(requestedLimit, 1000))
-
-    let events = eventBus.getEvents(forVM: vmId, limit: limit)
     let response = EventListResponse(events: events)
     return HTTPResponse.json(response)
   }
@@ -420,30 +504,29 @@ extension APIServer {
       return APIRouteErrorMapper.invalidJSON(error)
     }
 
-    let validation = updateRequest.validate(currentConfig: config.networking)
-    guard validation.valid else {
-      return HTTPResponse.error("INVALID_REQUEST", message: validation.error ?? "Invalid request", statusCode: 400)
-    }
-
-    let newConfig = updatedConfig(from: updateRequest)
-
-    // Persist to disk first - only update in-memory state on success
+    let committed: (config: Config, revision: UInt64)
     do {
-      try newConfig.save()
-      config = newConfig
+      committed = try commitConfiguration { currentConfig in
+        let validation = updateRequest.validate(currentConfig: currentConfig.networking)
+        guard validation.valid else {
+          throw ConfigError.invalidFormat(validation.error ?? "Invalid configuration update")
+        }
+        return updatedConfig(from: updateRequest, applyingTo: currentConfig)
+      }
+    } catch let error as ConfigError {
+      return HTTPResponse.error("INVALID_REQUEST", message: error.localizedDescription, statusCode: 400)
     } catch {
       return HTTPResponse.error("CONFIG_UPDATE_FAILED", message: error.localizedDescription, statusCode: 500)
     }
 
-    await imageManager.updateConfiguration(newConfig)
-    applyLoggingRuntimeUpdates(updateRequest.logging)
+    await applyRuntimeConfigurationUntilCurrent(startingWith: committed)
 
     logInfo("Configuration updated via API", category: "APIServer")
     return HTTPResponse.json(ConfigResponse(from: config))
   }
 
-  private func updatedConfig(from updateRequest: UpdateConfigRequest) -> Config {
-    var newConfig = config
+  private func updatedConfig(from updateRequest: UpdateConfigRequest, applyingTo currentConfig: Config) -> Config {
+    var newConfig = currentConfig
     applyLoggingUpdate(updateRequest.logging, to: &newConfig)
     applyNetworkingUpdate(updateRequest.networking, to: &newConfig)
     applyImageUpdate(updateRequest.images, to: &newConfig)
@@ -485,19 +568,28 @@ extension APIServer {
     }
   }
 
-  private func applyLoggingRuntimeUpdates(_ logging: LoggingConfigUpdate?) {
-    guard let logging else { return }
-    if let level = logging.level, let logLevel = LogLevel(rawValue: level.uppercased()) {
+  private func applyRuntimeConfigurationUntilCurrent(
+    startingWith initial: (config: Config, revision: UInt64)
+  ) async {
+    var snapshot = initial
+    while true {
+      await imageManager.updateConfiguration(snapshot.config)
+      applyLoggingRuntimeConfiguration(snapshot.config.logging)
+
+      let current = configurationSnapshot()
+      guard current.revision != snapshot.revision else { return }
+      snapshot = current
+    }
+  }
+
+  private func applyLoggingRuntimeConfiguration(_ logging: LoggingConfig) {
+    if let logLevel = LogLevel(rawValue: logging.level.uppercased()) {
       Logger.shared.logLevel = logLevel
     }
-    if let retentionDays = logging.retentionDays {
-      Logger.shared.retentionDays = retentionDays
-    }
-    if let maxTotalSize = logging.maxTotalSize, let bytes = LoggingConfig.parseSize(maxTotalSize) {
+    Logger.shared.retentionDays = logging.retentionDays
+    if let bytes = LoggingConfig.parseSize(logging.maxTotalSize) {
       Logger.shared.maxTotalSizeBytes = bytes
     }
-    if let tz = logging.timezone {
-      Logger.shared.timezone = tz.flatMap(TimeZone.init(identifier:)) ?? .current
-    }
+    Logger.shared.timezone = logging.timezone.flatMap(TimeZone.init(identifier:)) ?? .current
   }
 }

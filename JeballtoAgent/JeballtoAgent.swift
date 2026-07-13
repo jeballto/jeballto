@@ -1,11 +1,11 @@
 import Cocoa
+import Darwin
 import Foundation
-import ServiceManagement
 import Sparkle
 
 #if arch(arm64)
 
-@main class JeballtoAgent: NSObject, NSApplicationDelegate {
+@main @MainActor final class JeballtoAgent: NSObject, NSApplicationDelegate {
   private var config: Config?
   private var eventBus: EventBus?
   private var persistenceStore: PersistenceStore?
@@ -17,17 +17,31 @@ import Sparkle
   private var apiServer: APIServer?
   private var statusBarManager: StatusBarManager?
   private var updaterManager: UpdaterManager?
+  private var singleInstanceLock: SingleInstanceLock?
+  private var imageWorkSessionLock: ImageWorkSessionLock?
 
   /// Termination signal handlers (both must be retained to stay active)
   private var sigTermSource: DispatchSourceSignal?
   private var sigIntSource: DispatchSourceSignal?
+  private var isTerminationInProgress = false
 
   static func main() {
+    if let wrapperExitCode = ImageWorkChildProcessLease.runWrapperIfRequested(arguments: CommandLine.arguments) {
+      Darwin.exit(wrapperExitCode)
+    }
     let agent = JeballtoAgent()
     agent.run()
   }
 
   func run() {
+    if Self.isRunningUnderXCTest {
+      let app = NSApplication.shared
+      app.delegate = self
+      app.setActivationPolicy(.accessory)
+      app.run()
+      return
+    }
+
     logInfo("=== Jeballto VM Agent Starting ===", category: "Main")
     signal(SIGPIPE, SIG_IGN)
 
@@ -47,21 +61,33 @@ import Sparkle
 
     Task<Void, Never> {
       do {
-        try loadConfiguration()
+        singleInstanceLock = try SingleInstanceLock()
+        let imageWorkSessionLock = try ImageWorkSessionLock(sessionURL: JeballtoCachePaths.imageWorkSession)
+        self.imageWorkSessionLock = imageWorkSessionLock
+        let imageWorkRoot = JeballtoCachePaths.imageWork
+        let imageWorkSessionURL = imageWorkSessionLock.sessionURL
+        await Task.detached(priority: .utility) {
+          ImageManager.cleanupImageWorkDirectory(
+            imageWorkRoot: imageWorkRoot,
+            activeSessionURL: imageWorkSessionURL,
+            exclusiveProcessOwnershipConfirmed: true
+          )
+        }.value
+        try await loadConfiguration()
         try await initializeComponents()
 
         guard let vmManager, let apiServer else {
-          throw NSError(
-            domain: "JeballtoAgent",
-            code: -1,
-            userInfo: [NSLocalizedDescriptionKey: "Components not initialized"]
-          )
+          throw AgentStartupError.componentsNotInitialized
         }
 
         await LocalNetworkPermission.trigger()
 
         try await vmManager.loadPersistedVMs()
-        try apiServer.start()
+        // Listener readiness is a blocking Network-framework bridge. Keep it off MainActor so
+        // AppKit can finish launching and the menu-bar status remains responsive.
+        try await Task.detached(priority: .userInitiated) {
+          try apiServer.start()
+        }.value
 
         setupSignalHandlers()
 
@@ -71,13 +97,14 @@ import Sparkle
           logInfo("API Token: \(maskToken(config.api.token))", category: "Main")
           logInfo("Press Ctrl+C to stop", category: "Main")
 
-          let totalVMs = await vmManager.vmCount()
+          let totalVMs = try await vmManager.vmCount()
           await MainActor.run {
             statusBarManager?.configure(
               token: config.api.token,
               vmManager: vmManager,
-              serverStartTime: apiServer.startTime,
-              initialVMCount: totalVMs
+              serverStartUptime: apiServer.startUptime,
+              initialVMCount: totalVMs,
+              logDirectory: config.logging.logDirectory
             )
           }
         }
@@ -95,48 +122,35 @@ import Sparkle
 
   func applicationDidFinishLaunching(_ notification: Notification) {
     logInfo("Application did finish launching", category: "Main")
-    DispatchQueue.main.async {
-      self.registerLoginItem()
-    }
-  }
-
-  private func registerLoginItem() {
-    let service = SMAppService.mainApp
-    if service.status != .enabled {
-      do {
-        try service.register()
-        logInfo("Registered as login item", category: "Main")
-      } catch {
-        logError("Failed to register as login item: \(error)", category: "Main")
-      }
-    }
   }
 
   func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
   func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+    guard isTerminationInProgress == false else { return .terminateLater }
+    isTerminationInProgress = true
     logInfo("=== Jeballto VM Agent Shutting Down ===", category: "Main")
 
     Task<Void, Never> {
-      apiServer?.stop()
-      logInfo("API server stopped", category: "Main")
+      let cleanupTask = Task<Void, Never> { [apiServer, vmManager, portForwardingManager] in
+        await apiServer?.stop()
+        logInfo("API server stopped", category: "Main")
 
-      ChildProcessTracker.shared.terminateAll()
-      logInfo("Child processes terminated", category: "Main")
+        ChildProcessTracker.shared.terminateAll()
+        logInfo("Child processes terminated", category: "Main")
 
-      await withTaskGroup(of: Void.self) { group in
-        group.addTask { [vmManager, portForwardingManager] in
-          await vmManager?.cleanupForShutdown()
-          logInfo("VM shutdown cleanup complete", category: "Main")
+        await vmManager?.cleanupForShutdown()
+        logInfo("VM shutdown cleanup complete", category: "Main")
 
-          await portForwardingManager?.stopAllForwarding()
-          logInfo("Port forwarding stopped", category: "Main")
-        }
-        group.addTask {
-          try? await Task.sleep(nanoseconds: 30_000_000_000)
-        }
-        await group.next()
-        group.cancelAll()
+        await portForwardingManager?.stopAllForwarding()
+        logInfo("Port forwarding stopped", category: "Main")
+      }
+
+      let completed = await Self.waitForShutdownCleanup(cleanupTask, timeoutNanoseconds: 30_000_000_000)
+      if completed == false {
+        cleanupTask.cancel()
+        ChildProcessTracker.shared.terminateAll()
+        logError("Shutdown cleanup timed out after 30 seconds, terminating anyway", category: "Main")
       }
 
       logInfo("=== Jeballto VM Agent Stopped ===", category: "Main")
@@ -148,10 +162,19 @@ import Sparkle
 
   // MARK: - Initialization
 
-  private func loadConfiguration() throws {
+  private func loadConfiguration() async throws {
     logInfo("Loading configuration...", category: "Main")
 
-    let loadedConfig = try Config.load()
+    var loadedConfig = try await Task.detached(priority: .utility) {
+      try Config.load()
+    }.value
+    loadedConfig.api.token = try await APISecretStore.shared.resolveToken(
+      configurationCandidate: loadedConfig.api.token
+    )
+    let configToSave = loadedConfig
+    try await Task.detached(priority: .utility) {
+      try configToSave.save()
+    }.value
     Logger.shared.configure(with: loadedConfig.logging)
     config = loadedConfig
 
@@ -162,11 +185,10 @@ import Sparkle
     logInfo("Initializing components...", category: "Main")
 
     guard let config else {
-      throw NSError(
-        domain: "JeballtoAgent",
-        code: -1,
-        userInfo: [NSLocalizedDescriptionKey: "Configuration not loaded"]
-      )
+      throw AgentStartupError.configurationNotLoaded
+    }
+    guard let imageWorkSessionLock else {
+      throw AgentStartupError.imageWorkSessionNotInitialized
     }
 
     let eventBus = EventBus()
@@ -201,13 +223,24 @@ import Sparkle
     logInfo("VM manager initialized", category: "Main")
 
     let imageStore = ImageStore(storagePath: config.images.imageStorageDir, indexPath: config.storage.imageIndexPath)
-    let orasClient = OrasClient(config: config.images)
+    guard let agentExecutableURL = Bundle.main.executableURL else {
+      throw AgentStartupError.imageChildWrapperUnavailable
+    }
+    let childProcessLease = try imageWorkSessionLock.childProcessLease(
+      wrapperExecutableURL: agentExecutableURL
+    )
+    let orasClient = OrasClient(
+      config: config.images,
+      temporaryRoot: imageWorkSessionLock.sessionURL,
+      childProcessLease: childProcessLease
+    )
     let imageManager = ImageManager(
       imageStore: imageStore,
       orasClient: orasClient,
       eventBus: eventBus,
       config: config
     )
+    try await imageManager.recoverPendingDeletions()
     self.imageManager = imageManager
     logInfo("Image manager initialized", category: "Main")
 
@@ -253,6 +286,65 @@ import Sparkle
 
   private func shutdown() {
     DispatchQueue.main.async { NSApp.terminate(nil) }
+  }
+
+  private static var isRunningUnderXCTest: Bool {
+    ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+  }
+
+  private static func waitForShutdownCleanup(_ task: Task<Void, Never>, timeoutNanoseconds: UInt64) async -> Bool {
+    await withCheckedContinuation { continuation in
+      let state = ShutdownWaitState(continuation: continuation)
+      Task<Void, Never> {
+        await task.value
+        state.resume(true)
+      }
+      Task<Void, Never> {
+        try? await Task.sleep(nanoseconds: timeoutNanoseconds)
+        state.resume(false)
+      }
+    }
+  }
+}
+
+private final class ShutdownWaitState: @unchecked Sendable {
+  private let lock = NSLock()
+  private var didResume = false
+  private let continuation: CheckedContinuation<Bool, Never>
+
+  init(continuation: CheckedContinuation<Bool, Never>) {
+    self.continuation = continuation
+  }
+
+  func resume(_ value: Bool) {
+    lock.lock()
+    guard didResume == false else {
+      lock.unlock()
+      return
+    }
+    didResume = true
+    lock.unlock()
+    continuation.resume(returning: value)
+  }
+}
+
+private enum AgentStartupError: Error, LocalizedError {
+  case componentsNotInitialized
+  case configurationNotLoaded
+  case imageWorkSessionNotInitialized
+  case imageChildWrapperUnavailable
+
+  var errorDescription: String? {
+    switch self {
+    case .componentsNotInitialized:
+      "Agent components were not initialized"
+    case .configurationNotLoaded:
+      "Agent configuration was not loaded"
+    case .imageWorkSessionNotInitialized:
+      "Image work session was not initialized"
+    case .imageChildWrapperUnavailable:
+      "Image child process wrapper executable is unavailable"
+    }
   }
 }
 
