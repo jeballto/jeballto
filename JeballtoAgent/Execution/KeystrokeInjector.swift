@@ -13,7 +13,45 @@ enum KeystrokeInjectorError: Error, LocalizedError {
   }
 }
 
-class KeystrokeInjector {
+struct KeystrokeModifierRelease: Equatable {
+  let keyCode: UInt16
+  let remainingFlags: NSEvent.ModifierFlags
+}
+
+struct KeystrokeModifierState {
+  private var flagsByKeyCode: [UInt16: NSEvent.ModifierFlags] = [:]
+  private var activationOrder: [UInt16] = []
+
+  var flags: NSEvent.ModifierFlags {
+    flagsByKeyCode.values.reduce(into: []) { result, flags in
+      result.formUnion(flags)
+    }
+  }
+
+  mutating func apply(flags: NSEvent.ModifierFlags, keyCode: UInt16, keyDown: Bool) {
+    if keyDown {
+      if flagsByKeyCode[keyCode] == nil {
+        activationOrder.append(keyCode)
+      }
+      flagsByKeyCode[keyCode] = flags
+    } else {
+      flagsByKeyCode.removeValue(forKey: keyCode)
+      activationOrder.removeAll { $0 == keyCode }
+    }
+  }
+
+  mutating func takeReleaseEvents() -> [KeystrokeModifierRelease] {
+    var releases: [KeystrokeModifierRelease] = []
+    for keyCode in activationOrder.reversed() {
+      flagsByKeyCode.removeValue(forKey: keyCode)
+      releases.append(KeystrokeModifierRelease(keyCode: keyCode, remainingFlags: flags))
+    }
+    activationOrder.removeAll()
+    return releases
+  }
+}
+
+final class KeystrokeInjector {
   private let delayBetweenKeys: TimeInterval = 0.075
 
   @MainActor func execute(
@@ -22,38 +60,34 @@ class KeystrokeInjector {
     vmId: UUID,
     guiManager: GUIManager
   ) async throws -> Int {
-    let (vmView, isHidden) = ensureView(vm: vm, vmId: vmId, guiManager: guiManager)
+    let vmView = guiManager.acquireKeystrokeView(vmId: vmId, virtualMachine: vm)
+    defer { guiManager.releaseKeystrokeView(vmId: vmId) }
 
-    defer {
-      if isHidden {
-        guiManager.removeHiddenView(vmId: vmId)
-      }
-    }
-
-    var activeModifiers: NSEvent.ModifierFlags = []
+    var modifierState = KeystrokeModifierState()
     var count = 0
 
     defer {
-      if !activeModifiers.isEmpty {
-        activeModifiers = []
-        try? sendFlagsChanged(modifiers: [], keyCode: 0, view: vmView)
+      for release in modifierState.takeReleaseEvents() {
+        try? sendFlagsChanged(
+          modifiers: release.remainingFlags,
+          keyCode: release.keyCode,
+          view: vmView
+        )
       }
     }
 
     for action in actions {
       switch action {
       case .keyPress(let keyCode, let characters):
-        try sendKeyPress(keyCode: keyCode, characters: characters, modifiers: activeModifiers, view: vmView)
+        try sendKeyPress(keyCode: keyCode, characters: characters, modifiers: modifierState.flags, view: vmView)
         count += 1
         try await Task.sleep(nanoseconds: UInt64(delayBetweenKeys * 1_000_000_000))
 
       case .modifierChange(let flags, let keyCode, let keyDown):
-        if keyDown {
-          activeModifiers.insert(flags)
-        } else {
-          activeModifiers.remove(flags)
-        }
-        try sendFlagsChanged(modifiers: activeModifiers, keyCode: keyCode, view: vmView)
+        var proposedState = modifierState
+        proposedState.apply(flags: flags, keyCode: keyCode, keyDown: keyDown)
+        try sendFlagsChanged(modifiers: proposedState.flags, keyCode: keyCode, view: vmView)
+        modifierState = proposedState
         count += 1
         try await Task.sleep(nanoseconds: UInt64(delayBetweenKeys * 1_000_000_000))
 
@@ -66,18 +100,6 @@ class KeystrokeInjector {
   }
 
   // MARK: - Private
-
-  @MainActor private func ensureView(
-    vm: VZVirtualMachine,
-    vmId: UUID,
-    guiManager: GUIManager
-  ) -> (VZVirtualMachineView, Bool) {
-    if let existingView = guiManager.getVMView(vmId) {
-      return (existingView, false)
-    }
-    let view = guiManager.ensureHiddenView(vmId: vmId, virtualMachine: vm)
-    return (view, true)
-  }
 
   @MainActor private func sendKeyPress(
     keyCode: UInt16,

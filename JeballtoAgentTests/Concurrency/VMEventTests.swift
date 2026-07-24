@@ -29,6 +29,7 @@ struct VMEventTests {
       "INSTALL_PROGRESS"
     ),
     (VMEvent.installCompleted(vmId: UUID()), "INSTALL_COMPLETED"),
+    (VMEvent.installCancelled(vmId: UUID()), "INSTALL_CANCELLED"),
     (VMEvent.installFailed(vmId: UUID(), error: "fail"), "INSTALL_FAILED"),
     (VMEvent.vmCloned(vmId: UUID(), sourceVmId: UUID(), name: "clone"), "VM_CLONED"),
     (VMEvent.vmResourcesUpdated(vmId: UUID()), "VM_RESOURCES_UPDATED"),
@@ -54,13 +55,18 @@ struct VMEventTests {
 
   @Test(arguments: [
     (VMEvent.jeballtofileStarted(executionId: UUID(), vmId: UUID()), "JEBALLTOFILE_STARTED"),
-    (VMEvent.jeballtofileStepStarted(executionId: UUID(), step: 0, stepType: "execute"), "JEBALLTOFILE_STEP_STARTED"),
     (
-      VMEvent.jeballtofileStepCompleted(executionId: UUID(), step: 0, stepType: "execute"),
+      VMEvent.jeballtofileStepStarted(executionId: UUID(), vmId: UUID(), step: 0, stepType: "execute"),
+      "JEBALLTOFILE_STEP_STARTED"
+    ),
+    (
+      VMEvent.jeballtofileStepCompleted(executionId: UUID(), vmId: UUID(), step: 0, stepType: "execute"),
       "JEBALLTOFILE_STEP_COMPLETED"
     ),
     (
-      VMEvent.jeballtofileStepFailed(executionId: UUID(), step: 0, stepType: "execute", error: "e"),
+      VMEvent.jeballtofileStepFailed(
+        executionId: UUID(), vmId: UUID(), step: 0, stepType: "execute", error: "e"
+      ),
       "JEBALLTOFILE_STEP_FAILED"
     ),
     (VMEvent.jeballtofileCompleted(executionId: UUID(), vmId: UUID()), "JEBALLTOFILE_COMPLETED"),
@@ -99,6 +105,7 @@ struct VMEventTests {
       ).vmId == id
     )
     #expect(VMEvent.installCompleted(vmId: id).vmId == id)
+    #expect(VMEvent.installCancelled(vmId: id).vmId == id)
     #expect(VMEvent.installFailed(vmId: id, error: "e").vmId == id)
     #expect(VMEvent.vmCloned(vmId: id, sourceVmId: sourceId, name: "c").vmId == id)
     #expect(VMEvent.vmResourcesUpdated(vmId: id).vmId == id)
@@ -107,7 +114,7 @@ struct VMEventTests {
   }
 
   @Test
-  func vmIdIsNilForImageAndStepEvents() {
+  func vmIdIsNilForImageEvents() {
     let events: [VMEvent] = [
       .imagePullStarted(reference: "r"),
       .imagePulled(reference: "r"),
@@ -116,14 +123,37 @@ struct VMEventTests {
       .imagePushed(reference: "r"),
       .imagePushFailed(reference: "r", error: "e"),
       .imageDeleted(reference: "r"),
-      .jeballtofileStepStarted(executionId: UUID(), step: 0, stepType: "execute"),
-      .jeballtofileStepCompleted(executionId: UUID(), step: 0, stepType: "execute"),
-      .jeballtofileStepFailed(executionId: UUID(), step: 0, stepType: "execute", error: "e"),
     ]
 
     for event in events {
       #expect(event.vmId == nil, "Expected nil vmId for \(event.eventType)")
     }
+  }
+
+  @Test
+  func jeballtofileStepEventsExposeVmId() {
+    let executionId = UUID()
+    let vmId = UUID()
+
+    #expect(VMEvent.jeballtofileStepStarted(
+      executionId: executionId,
+      vmId: vmId,
+      step: 0,
+      stepType: "execute"
+    ).vmId == vmId)
+    #expect(VMEvent.jeballtofileStepCompleted(
+      executionId: executionId,
+      vmId: vmId,
+      step: 0,
+      stepType: "execute"
+    ).vmId == vmId)
+    #expect(VMEvent.jeballtofileStepFailed(
+      executionId: executionId,
+      vmId: vmId,
+      step: 0,
+      stepType: "execute",
+      error: "e"
+    ).vmId == vmId)
   }
 
   @Test
