@@ -34,8 +34,10 @@ enum APIRouteErrorMapper {
       HTTPResponse.error(invalidStateCode, message: error.localizedDescription, statusCode: 409)
     case .concurrentVMLimitReached:
       HTTPResponse.error(concurrentLimitCode, message: error.localizedDescription, statusCode: 409)
-    case .invalidResources:
+    case .invalidResources, .invalidInstallationSource:
       HTTPResponse.error(defaultCode, message: error.localizedDescription, statusCode: 400)
+    case .timeout:
+      HTTPResponse.error(defaultCode, message: error.localizedDescription, statusCode: 504)
     case .operationFailed:
       HTTPResponse.error(defaultCode, message: error.localizedDescription, statusCode: 500)
     }
@@ -59,9 +61,25 @@ enum APIRouteErrorMapper {
       return HTTPResponse.error(defaultCode, message: error.localizedDescription, statusCode: 500)
     case .invalidReference:
       return HTTPResponse.error("INVALID_REFERENCE", message: error.localizedDescription, statusCode: 400)
+    case .invalidImage:
+      return HTTPResponse.error("INVALID_IMAGE", message: error.localizedDescription, statusCode: 400)
+    case .unsupportedImageFormat:
+      return HTTPResponse.error("UNSUPPORTED_IMAGE_FORMAT", message: error.localizedDescription, statusCode: 400)
     case .pullFailed, .pushFailed, .deleteFailed:
       return HTTPResponse.error(defaultCode, message: error.localizedDescription, statusCode: 500)
-    case .registryUnreachable:
+    case .pushCommitOutcomeUnknown:
+      return HTTPResponse.error(
+        "IMAGE_PUSH_COMMIT_OUTCOME_UNKNOWN",
+        message: error.localizedDescription,
+        statusCode: 500
+      )
+    case .pushPartiallyCommitted:
+      return HTTPResponse.error(
+        "IMAGE_PUSH_PARTIALLY_COMMITTED",
+        message: error.localizedDescription,
+        statusCode: 500
+      )
+    case .registryUnavailable:
       return HTTPResponse.error(defaultCode, message: error.localizedDescription, statusCode: 503)
     case .timeout:
       return HTTPResponse.error(defaultCode, message: error.localizedDescription, statusCode: 504)
@@ -71,10 +89,15 @@ enum APIRouteErrorMapper {
   }
 
   static func commandExecutor(_ error: CommandExecutorError, defaultCode: String = "EXECUTE_FAILED") -> HTTPResponse {
-    HTTPResponse.error(
-      error.isTimeout ? "EXECUTE_TIMEOUT" : defaultCode,
-      message: error.localizedDescription,
-      statusCode: error.isTimeout ? 504 : 500
-    )
+    switch error {
+    case .sshNotConfigured:
+      HTTPResponse.error("SSH_NOT_CONFIGURED", message: error.localizedDescription, statusCode: 409)
+    case .invalidUsername, .invalidCommand, .invalidPassword, .invalidTimeout:
+      HTTPResponse.error("INVALID_REQUEST", message: error.localizedDescription, statusCode: 400)
+    case .timeout:
+      HTTPResponse.error("EXECUTE_TIMEOUT", message: error.localizedDescription, statusCode: 504)
+    case .processLaunchFailed, .askpassScriptFailed:
+      HTTPResponse.error(defaultCode, message: error.localizedDescription, statusCode: 500)
+    }
   }
 }

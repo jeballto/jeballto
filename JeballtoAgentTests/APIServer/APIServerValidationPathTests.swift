@@ -159,6 +159,27 @@ struct APIServerValidationPathTests {
   }
 
   @Test
+  func createVMRejectsExplicitlyEmptyImage() async throws {
+    try await withTemporaryDirectory { root in
+      let server = makeTestAPIServer(root: root)
+
+      let response = await server.handleCreateVM(HTTPRequest(
+        method: "POST",
+        path: "/v1/vms",
+        headers: [:],
+        body: Data(#"{"name":"blank-alias","image":""}"#.utf8),
+        queryParameters: [:]
+      ))
+      let error = try decodedError(response)
+
+      #expect(response.statusCode == 400)
+      #expect(error.error.code == "INVALID_REQUEST")
+      #expect(error.error.message.contains("image must not be empty"))
+      #expect(try await server.vmManager.vmCount() == 0)
+    }
+  }
+
+  @Test
   func executeRouteRequiresCommandExecutionCapability() async throws {
     try await withTemporaryDirectory { root in
       let capabilities = VirtualizationCapabilities(
@@ -240,7 +261,10 @@ struct APIServerValidationPathTests {
           method: "POST",
           path: "/v1/jeballtofiles",
           headers: ["content-type": "application/json"],
-          body: Data(#"{"name":"workflow","steps":[{"type":"execute","command":"true"}]}"#.utf8),
+          body: Data(
+            #"{"name":"workflow","steps":[{"type":"install"},{"type":"start"},{"type":"execute","command":"true"}]}"#
+              .utf8
+          ),
           queryParameters: [:]
         )
       )
@@ -307,6 +331,178 @@ struct APIServerValidationPathTests {
   }
 
   @Test
+  func queryValidationFailuresMapTo400() async throws {
+    try await withTemporaryDirectory { root in
+      let server = makeTestAPIServer(root: root)
+      let vmId = UUID()
+
+      let invalidLimit = await server.handleListVMs(
+        HTTPRequest(method: "GET", path: "/v1/vms", headers: [:], body: nil, queryParameters: ["limit": "0"])
+      )
+      let invalidForce = await server.handleDeleteVM(
+        HTTPRequest(
+          method: "DELETE",
+          path: "/v1/vms/\(vmId.uuidString)",
+          headers: [:],
+          body: nil,
+          queryParameters: ["force": "yes"]
+        )
+      )
+
+      let limitError = try decodedError(invalidLimit)
+      let forceError = try decodedError(invalidForce)
+
+      #expect(invalidLimit.statusCode == 400)
+      #expect(limitError.error.code == "INVALID_QUERY_PARAMETER")
+      #expect(invalidForce.statusCode == 400)
+      #expect(forceError.error.code == "INVALID_QUERY_PARAMETER")
+    }
+  }
+
+  @Test
+  func eventLimitValidationPrecedesResourceLookup() async throws {
+    try await withTemporaryDirectory { root in
+      let server = makeTestAPIServer(root: root)
+      let response = await server.handleGetEvents(HTTPRequest(
+        method: "GET",
+        path: "/v1/vms/\(UUID().uuidString)/events",
+        headers: [:],
+        body: nil,
+        queryParameters: ["limit": "0"]
+      ))
+      let error = try decodedError(response)
+
+      #expect(response.statusCode == 400)
+      #expect(error.error.code == "INVALID_QUERY_PARAMETER")
+    }
+  }
+
+  @Test
+  func networkingConfigPatchIsPersistedForNextRestart() async throws {
+    try await withTemporaryDirectory { root in
+      let server = makeTestAPIServer(root: root)
+      let body = Data(#"{"networking":{"autoEnableSSHForwarding":true}}"#.utf8)
+
+      let response = await server.handleUpdateConfig(
+        HTTPRequest(method: "PATCH", path: "/v1/config", headers: [:], body: body, queryParameters: [:])
+      )
+      let config = try JSONDecoder().decode(ConfigResponse.self, from: #require(response.body))
+      let persisted = try Config.load(from: "\(root)/config.json")
+
+      #expect(response.statusCode == 200)
+      #expect(config.networking.autoEnableSSHForwarding)
+      #expect(persisted.networking.autoEnableSSHForwarding)
+    }
+  }
+
+  @Test
+  func networkingConfigPatchRejectsAPIPortOverlapAsClientError() async throws {
+    try await withTemporaryDirectory { root in
+      let server = makeTestAPIServer(root: root)
+      let body = Data(#"{"networking":{"sshPortRangeStart":18080,"sshPortRangeEnd":18080}}"#.utf8)
+
+      let response = await server.handleUpdateConfig(
+        HTTPRequest(method: "PATCH", path: "/v1/config", headers: [:], body: body, queryParameters: [:])
+      )
+      let error = try decodedError(response)
+
+      #expect(response.statusCode == 400)
+      #expect(error.error.code == "INVALID_REQUEST")
+      #expect(error.error.message.contains("api.port"))
+    }
+  }
+
+  @Test(arguments: [
+    #"{}"#,
+    #"{"api":{"host":"127.0.0.1"}}"#,
+    #"{"logging":{}}"#,
+    #"{"networking":{"unknown":true}}"#,
+    #"{"images":{"maxParallelImageBlobTransfers":null}}"#,
+  ])
+  func configPatchRejectsRequestsWithoutEffectiveSupportedFields(_ json: String) async throws {
+    try await withTemporaryDirectory { root in
+      let server = makeTestAPIServer(root: root)
+      let initialRevision = server.configurationSnapshot().revision
+
+      let response = await server.handleUpdateConfig(
+        HTTPRequest(
+          method: "PATCH",
+          path: "/v1/config",
+          headers: [:],
+          body: Data(json.utf8),
+          queryParameters: [:]
+        )
+      )
+      let error = try decodedError(response)
+
+      #expect(response.statusCode == 400)
+      #expect(error.error.code == "INVALID_REQUEST")
+      #expect(error.error.message.contains("supported config field"))
+      #expect(server.configurationSnapshot().revision == initialRevision)
+      #expect(FileManager.default.fileExists(atPath: "\(root)/config.json") == false)
+    }
+  }
+
+  @Test
+  func configPatchAcceptsExplicitNullableClears() async throws {
+    try await withTemporaryDirectory { root in
+      let server = makeTestAPIServer(root: root) { config in
+        config.logging.timezone = "UTC"
+        config.images.defaultRegistry = "registry.example.com"
+      }
+      let body = Data(#"{"logging":{"timezone":null},"images":{"defaultRegistry":null}}"#.utf8)
+
+      let response = await server.handleUpdateConfig(
+        HTTPRequest(method: "PATCH", path: "/v1/config", headers: [:], body: body, queryParameters: [:])
+      )
+      let config = try JSONDecoder().decode(ConfigResponse.self, from: #require(response.body))
+      let persisted = try Config.load(from: "\(root)/config.json")
+
+      #expect(response.statusCode == 200)
+      #expect(config.logging.timezone == nil)
+      #expect(config.images.defaultRegistry == nil)
+      #expect(persisted.logging.timezone == nil)
+      #expect(persisted.images.defaultRegistry == nil)
+    }
+  }
+
+  @Test
+  func concurrentConfigPatchesPreserveIndependentChangesInDiskAndRuntime() async throws {
+    try await withTemporaryDirectory { root in
+      let server = makeTestAPIServer(root: root)
+      defer { Logger.shared.logLevel = .info }
+      let loggingRequest = HTTPRequest(
+        method: "PATCH",
+        path: "/v1/config",
+        headers: [:],
+        body: Data(#"{"logging":{"level":"debug"}}"#.utf8),
+        queryParameters: [:]
+      )
+      let imageRequest = HTTPRequest(
+        method: "PATCH",
+        path: "/v1/config",
+        headers: [:],
+        body: Data(#"{"images":{"maxParallelImageBlobTransfers":7}}"#.utf8),
+        queryParameters: [:]
+      )
+
+      async let loggingResponse = server.handleUpdateConfig(loggingRequest)
+      async let imageResponse = server.handleUpdateConfig(imageRequest)
+      let (loggingResult, imageResult) = await (loggingResponse, imageResponse)
+      let responses = [loggingResult, imageResult]
+
+      let persisted = try Config.load(from: "\(root)/config.json")
+      let runtimeImages = await server.imageManager.currentImageConfig()
+      #expect(responses.allSatisfy { $0.statusCode == 200 })
+      #expect(persisted.logging.level == "debug")
+      #expect(persisted.images.maxParallelImageBlobTransfers == 7)
+      #expect(server.config.logging.level == "debug")
+      #expect(runtimeImages.maxParallelImageBlobTransfers == 7)
+      #expect(Logger.shared.logLevel == .debug)
+    }
+  }
+
+  @Test
   func createAndExecuteValidationFailuresMapTo400() async throws {
     try await withTemporaryDirectory { root in
       let server = makeTestAPIServer(root: root)
@@ -339,6 +535,38 @@ struct APIServerValidationPathTests {
       #expect(resourcesError.error.code == "INVALID_RESOURCES")
       #expect(invalidExecuteResponse.statusCode == 400)
       #expect(executeError.error.code == "INVALID_REQUEST")
+    }
+  }
+
+  @Test
+  func pullTimeoutAndReferenceValidationUseDistinctErrorCodes() async throws {
+    try await withTemporaryDirectory { root in
+      let server = makeTestAPIServer(root: root)
+      let invalidTimeoutResponse = await server.handlePullImage(
+        HTTPRequest(
+          method: "POST",
+          path: "/v1/images/pull",
+          headers: [:],
+          body: Data(#"{"reference":"registry.example.com/vm:latest","timeout":0}"#.utf8),
+          queryParameters: [:]
+        )
+      )
+      let invalidReferenceResponse = await server.handlePullImage(
+        HTTPRequest(
+          method: "POST",
+          path: "/v1/images/pull",
+          headers: [:],
+          body: Data(#"{"reference":"not valid","timeout":10}"#.utf8),
+          queryParameters: [:]
+        )
+      )
+
+      let invalidTimeout = try decodedError(invalidTimeoutResponse)
+      let invalidReference = try decodedError(invalidReferenceResponse)
+      #expect(invalidTimeoutResponse.statusCode == 400)
+      #expect(invalidTimeout.error.code == "INVALID_REQUEST")
+      #expect(invalidReferenceResponse.statusCode == 400)
+      #expect(invalidReference.error.code == "INVALID_REFERENCE")
     }
   }
 
@@ -454,7 +682,10 @@ struct APIServerValidationPathTests {
         instance.stateMachine.forceState(.stopped)
         instance.definition.updateState(.stopped)
       }
-      try await server.vmManager.updateVMDefinition(definition.id, definition: MainActor.run { instance.definition })
+      try await server.vmManager.replaceDefinitionForTesting(
+        definition.id,
+        definition: MainActor.run { instance.definition }
+      )
 
       let response = await server.handleStopVM(
         HTTPRequest(
@@ -475,7 +706,39 @@ struct APIServerValidationPathTests {
   }
 
   @Test
-  func forceStoppingInstallingVMCancelsTrackedInstallationTask() async throws {
+  func executingWithoutSSHForwardingReturnsConflict() async throws {
+    try await withTemporaryDirectory { root in
+      let server = makeTestAPIServer(root: root)
+      let definition = try await server.vmManager.createVM(name: "no-ssh-vm", resources: .default)
+      let instance = try await server.vmManager.getVMInstance(definition.id)
+
+      await MainActor.run {
+        instance.stateMachine.forceState(.running)
+        instance.definition.updateState(.running)
+      }
+      try await server.vmManager.replaceDefinitionForTesting(
+        definition.id,
+        definition: MainActor.run { instance.definition }
+      )
+
+      let response = await server.handleExecuteCommand(
+        HTTPRequest(
+          method: "POST",
+          path: "/v1/vms/\(definition.id.uuidString)/execute",
+          headers: [:],
+          body: Data(#"{"command":"true"}"#.utf8),
+          queryParameters: [:]
+        )
+      )
+      let error = try decodedError(response)
+
+      #expect(response.statusCode == 409)
+      #expect(error.error.code == "SSH_NOT_CONFIGURED")
+    }
+  }
+
+  @Test
+  func forceStoppingOrphanInstallingVMReturnsItToCreated() async throws {
     try await withTemporaryDirectory { root in
       let server = makeTestAPIServer(root: root)
       let definition = try await server.vmManager.createVM(name: "installing-vm", resources: .default)
@@ -484,26 +747,23 @@ struct APIServerValidationPathTests {
       try await MainActor.run {
         try instance.stateMachine.transition(to: .installing)
         instance.definition.updateState(.installing)
+        instance.definition.updateInstallation(
+          VMInstallation(state: .installing, message: "Installing")
+        )
       }
-      try await server.vmManager.updateVMDefinition(definition.id, definition: MainActor.run { instance.definition })
-
-      let installTask = Task<Void, Never> {
-        do {
-          try await Task.sleep(nanoseconds: 60_000_000_000)
-        } catch {}
-      }
-      let claimedTask = server.claimInstallationTask(definition.id) { _ in installTask }
-      #expect(claimedTask != nil)
+      try await server.vmManager.replaceDefinitionForTesting(
+        definition.id,
+        definition: MainActor.run { instance.definition }
+      )
 
       try await server.vmManager.forceStopVM(definition.id)
-
-      await Task.yield()
-
-      #expect(installTask.isCancelled)
-      #expect(server.cancelInstallationTask(definition.id) == false)
+      #expect(instance.currentState == .created)
+      #expect(try await server.vmManager.getVM(definition.id).installation?.state == .interrupted)
     }
   }
+}
 
+extension APIServerValidationPathTests {
   @Test
   func pushImageFromErrorStateVMReturns409() async throws {
     try await withTemporaryDirectory { root in
@@ -537,7 +797,12 @@ struct APIServerValidationPathTests {
       try await vmManager.loadPersistedVMs()
 
       let imageStore = ImageStore(storagePath: config.images.imageStorageDir)
-      let orasClient = OrasClient(config: config.images)
+      let orasClient = OrasClient(
+        config: config.images,
+        temporaryRoot: URL(fileURLWithPath: root, isDirectory: true)
+          .appendingPathComponent("cache/ImageWork/sessions/test", isDirectory: true),
+        credentialStore: makeTestRegistryCredentialStore()
+      )
       let imageManager = ImageManager(
         imageStore: imageStore,
         orasClient: orasClient,
@@ -625,6 +890,17 @@ struct APIServerValidationPathTests {
         }
       }
       #expect(eventPublished)
+
+      let repeatedCancel = await server.handleCancelJeballtofile(
+        HTTPRequest(
+          method: "POST",
+          path: "/v1/jeballtofiles/\(executionId.uuidString)/cancel",
+          headers: [:],
+          body: nil,
+          queryParameters: [:]
+        )
+      )
+      #expect(repeatedCancel.statusCode == 409)
     }
   }
 
