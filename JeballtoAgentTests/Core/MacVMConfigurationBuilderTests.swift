@@ -5,6 +5,31 @@ import Testing
 @Suite(.tags(.core))
 struct MacVMConfigurationBuilderTests {
   @Test
+  func assemblerRejectsOversizedPlatformIdentityBeforeDecodingIt() throws {
+    try withTemporaryDirectory(prefix: "avf-platform-identity") { root in
+      let id = UUID()
+      let paths = VMPaths.forVM(id: id, baseDir: root)
+      try FileManager.default.createDirectory(atPath: paths.bundlePath, withIntermediateDirectories: true)
+      try Data(repeating: 0, count: 1_048_577)
+        .write(to: URL(fileURLWithPath: paths.hardwareModelPath))
+      let definition = VMDefinition(
+        id: id,
+        name: "oversized-platform",
+        state: .stopped,
+        resources: .default,
+        network: VMNetwork(macAddress: "02:00:00:00:00:01"),
+        paths: paths
+      )
+
+      #expect(throws: AVFError.self) {
+        _ = try AVFConfigurationAssembler().createConfiguration(
+          from: MacVMConfigurationBuilder().makeRuntimeSpec(for: definition)
+        )
+      }
+    }
+  }
+
+  @Test
   func runtimeSpecPreservesCurrentStableDefaults() {
     let definition = makeDefinition()
     let spec = MacVMConfigurationBuilder().makeRuntimeSpec(for: definition)

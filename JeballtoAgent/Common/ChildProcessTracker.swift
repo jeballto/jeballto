@@ -5,66 +5,123 @@ import Foundation
 /// on app shutdown or Task cancellation.
 ///
 /// Usage:
-/// - Register a process before it runs: `ChildProcessTracker.shared.track(process)`
-/// - Unregister when done: `ChildProcessTracker.shared.untrack(process)`
+/// - Register a process immediately after a successful launch: `ChildProcessTracker.shared.track(process)`
+/// - Unregister from its termination handler: `ChildProcessTracker.shared.untrack(process)`
 /// - On shutdown: `ChildProcessTracker.shared.terminateAll()`
 final class ChildProcessTracker: @unchecked Sendable {
   static let shared = ChildProcessTracker()
 
   private static let forceKillDelayNanoseconds: UInt64 = 1_000_000_000
 
+  private enum ShutdownState: Equatable {
+    case running
+    case terminating
+    case forceKilling
+  }
+
   private let lock = NSLock()
   private var processes: Set<ObjectWrapper> = []
+  private var shutdownState = ShutdownState.running
 
-  private init() {}
+  init() {}
 
-  /// Registers a running process for tracking
+  var trackedProcessCount: Int {
+    lock.withLock { processes.count }
+  }
+
+  /// Registers a running process for tracking.
+  /// Processes launched during shutdown are terminated immediately.
   func track(_ process: Process) {
     let wrapper = ObjectWrapper(process)
-    lock.lock()
-    processes.insert(wrapper)
-    lock.unlock()
+    let state = lock.withLock {
+      processes.insert(wrapper)
+      return shutdownState
+    }
+
+    guard process.isRunning else {
+      untrack(process)
+      return
+    }
+
+    switch state {
+    case .running:
+      break
+    case .terminating:
+      terminate(process, scheduleForceKill: false)
+    case .forceKilling:
+      forceKill(process)
+    }
   }
 
-  /// Removes a process from tracking (call when process completes normally)
+  /// Removes a process after its termination handler has observed process exit.
   func untrack(_ process: Process) {
     let wrapper = ObjectWrapper(process)
-    lock.lock()
-    processes.remove(wrapper)
-    lock.unlock()
-  }
-
-  /// Terminates all tracked child processes. Called on app shutdown.
-  func terminateAll() {
-    lock.lock()
-    let current = processes
-    processes.removeAll()
-    lock.unlock()
-
-    for wrapper in current where wrapper.process.isRunning {
-      logInfo("Terminating child process (pid \(wrapper.process.processIdentifier))", category: "ChildProcessTracker")
-      wrapper.process.terminate()
-      scheduleForceKillIfNeeded(wrapper.process)
+    lock.withLock { () in
+      _ = processes.remove(wrapper)
     }
   }
 
-  /// Terminates a specific tracked process (e.g. on Task cancellation)
+  /// Starts shutdown and sends SIGTERM to all tracked child processes.
+  /// Processes remain tracked until their termination handlers call `untrack`.
+  func terminateAll() {
+    let current = lock.withLock { () -> Set<ObjectWrapper> in
+      if shutdownState == .running {
+        shutdownState = .terminating
+      }
+      return processes
+    }
+
+    for wrapper in current {
+      terminate(wrapper.process, scheduleForceKill: false)
+    }
+  }
+
+  /// Synchronously sends SIGKILL to every process that is still tracked.
+  /// New processes tracked after this point are also killed immediately.
+  func forceKillAll() {
+    let current = lock.withLock { () -> Set<ObjectWrapper> in
+      shutdownState = .forceKilling
+      return processes
+    }
+
+    for wrapper in current {
+      forceKill(wrapper.process)
+    }
+  }
+
+  /// Terminates a specific tracked process, for example on Task cancellation.
+  /// The process remains tracked until its termination handler observes exit.
   func terminateIfRunning(_ process: Process) {
-    if process.isRunning {
-      logInfo("Cancelling child process (pid \(process.processIdentifier))", category: "ChildProcessTracker")
-      process.terminate()
+    terminate(process, scheduleForceKill: true)
+  }
+
+  private func terminate(_ process: Process, scheduleForceKill: Bool) {
+    guard process.isRunning else { return }
+    let pid = process.processIdentifier
+    logInfo("Terminating child process (pid \(pid))", category: "ChildProcessTracker")
+    process.terminate()
+    if scheduleForceKill {
       scheduleForceKillIfNeeded(process)
     }
-    untrack(process)
+  }
+
+  private func forceKill(_ process: Process) {
+    guard process.isRunning else { return }
+    let pid = process.processIdentifier
+    logWarning("Force killing child process (pid \(pid))", category: "ChildProcessTracker")
+    guard kill(pid, SIGKILL) != -1 || errno == ESRCH else {
+      logWarning(
+        "Failed to force kill child process (pid \(pid)): \(String(cString: strerror(errno)))",
+        category: "ChildProcessTracker"
+      )
+      return
+    }
   }
 
   private func scheduleForceKillIfNeeded(_ process: Process) {
-    let pid = process.processIdentifier
-    Task.detached {
+    Task<Void, Never>.detached { [self] in
       try? await Task.sleep(nanoseconds: Self.forceKillDelayNanoseconds)
-      guard process.isRunning else { return }
-      logWarning("Force killing child process (pid \(pid))", category: "ChildProcessTracker")
-      kill(pid, SIGKILL)
+      forceKill(process)
     }
   }
 }

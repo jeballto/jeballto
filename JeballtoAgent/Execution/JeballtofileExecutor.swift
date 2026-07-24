@@ -1,95 +1,140 @@
 import Foundation
 
 /// Orchestrates the execution of a Jeballtofile blueprint step by step
-class JeballtofileExecutor {
+final class JeballtofileExecutor: @unchecked Sendable {
   let execution: JeballtofileExecution
   private let steps: [JeballtofileStep]
   private let source: String?
   private let vmManager: VMManager
   private let eventBus: EventBus
+  private let onTerminal: @Sendable (UUID) -> Void
+  private let taskLock = NSLock()
   private var task: Task<Void, Never>?
+  private var finished = false
+
+  var isFinished: Bool {
+    taskLock.withLock { finished }
+  }
 
   init(
     execution: JeballtofileExecution,
     steps: [JeballtofileStep],
     source: String?,
     vmManager: VMManager,
-    eventBus: EventBus
+    eventBus: EventBus,
+    onTerminal: @escaping @Sendable (UUID) -> Void
   ) {
     self.execution = execution
     self.steps = steps
     self.source = source
     self.vmManager = vmManager
     self.eventBus = eventBus
+    self.onTerminal = onTerminal
   }
 
   /// Starts asynchronous execution of all steps
   func start() {
-    task = Task<Void, Never> { [weak self] in
+    taskLock.lock()
+    guard task == nil, finished == false else {
+      taskLock.unlock()
+      return
+    }
+    let executionId = execution.id
+    let vmId = execution.vmId
+    guard execution.status == .running else {
+      finished = true
+      taskLock.unlock()
+      onTerminal(executionId)
+      return
+    }
+    eventBus.publish(.jeballtofileStarted(executionId: executionId, vmId: vmId))
+    logInfo("Jeballtofile execution \(executionId) started for VM \(vmId)", category: "Jeballtofile")
+    let newTask = Task<Void, Never> { [weak self] in
       await self?.run()
     }
+    task = newTask
+    taskLock.unlock()
   }
 
   /// Cancels execution and marks the current step as cancelled when the task observes cancellation.
-  func cancel() {
-    execution.cancel()
-    task?.cancel()
+  @discardableResult
+  func cancel() -> Bool {
+    guard execution.cancel() else { return false }
+    taskLock.withLock { task }?.cancel()
+    publishCancellation(executionId: execution.id, vmId: execution.vmId, step: execution.currentStep)
+    return true
   }
 
   func waitUntilFinished() async {
-    await task?.value
+    let current = taskLock.withLock { task }
+    await current?.value
   }
 
   private func run() async {
     let executionId = execution.id
     let vmId = execution.vmId
-
-    eventBus.publish(.jeballtofileStarted(executionId: executionId, vmId: vmId))
-    logInfo("Jeballtofile execution \(executionId) started for VM \(vmId)", category: "Jeballtofile")
+    defer {
+      taskLock.withLock { finished = true }
+      if execution.status != .running {
+        onTerminal(executionId)
+      }
+    }
 
     for (index, step) in steps.enumerated() {
-      if execution.isCancelled {
-        publishCancellation(executionId: executionId, vmId: vmId, step: index)
-        return
-      }
+      if execution.isCancelled { return }
 
-      execution.startStep(index, type: step.type)
-      eventBus.publish(.jeballtofileStepStarted(executionId: executionId, step: index, stepType: step.type.rawValue))
-      logInfo(
-        "Jeballtofile \(executionId) step \(index): \(step.type.rawValue)",
-        category: "Jeballtofile"
-      )
+      guard execution.startStep(index, type: step.type) else { return }
 
       do {
+        try Task.checkCancellation()
+        eventBus.publish(.jeballtofileStepStarted(
+          executionId: executionId,
+          vmId: vmId,
+          step: index,
+          stepType: step.type.rawValue
+        ))
+        logInfo(
+          "Jeballtofile \(executionId) step \(index): \(step.type.rawValue)",
+          category: "Jeballtofile"
+        )
         let message = try await executeStep(step, vmId: vmId)
-        execution.completeStep(index, message: message)
+        try Task.checkCancellation()
+        if execution.isCancelled { throw CancellationError() }
+        guard execution.completeStep(index, message: message) else { return }
         eventBus.publish(.jeballtofileStepCompleted(
-          executionId: executionId, step: index, stepType: step.type.rawValue
+          executionId: executionId, vmId: vmId, step: index, stepType: step.type.rawValue
         ))
       } catch is CancellationError {
-        execution.cancelStep(index, message: "Cancelled by user")
-        publishCancellation(executionId: executionId, vmId: vmId, step: index)
+        if execution.cancelStep(index, message: "Cancelled by user") {
+          publishCancellation(executionId: executionId, vmId: vmId, step: index)
+        }
         return
       } catch {
         let errorMessage = error.localizedDescription
-        execution.failStep(index, error: errorMessage)
-        eventBus.publish(.jeballtofileStepFailed(
-          executionId: executionId, step: index, stepType: step.type.rawValue, error: errorMessage
-        ))
-        eventBus.publish(.jeballtofileFailed(
-          executionId: executionId, vmId: vmId, step: index, error: errorMessage
-        ))
-        logError(
-          "Jeballtofile \(executionId) failed at step \(index) (\(step.type.rawValue)): \(errorMessage)",
-          category: "Jeballtofile"
-        )
+        if execution.failStep(index, error: errorMessage) {
+          eventBus.publish(.jeballtofileStepFailed(
+            executionId: executionId,
+            vmId: vmId,
+            step: index,
+            stepType: step.type.rawValue,
+            error: errorMessage
+          ))
+          eventBus.publish(.jeballtofileFailed(
+            executionId: executionId, vmId: vmId, step: index, error: errorMessage
+          ))
+          logError(
+            "Jeballtofile \(executionId) failed at step \(index) (\(step.type.rawValue)): \(errorMessage)",
+            category: "Jeballtofile"
+          )
+        }
         return
       }
     }
 
-    execution.complete()
-    eventBus.publish(.jeballtofileCompleted(executionId: executionId, vmId: vmId))
-    logInfo("Jeballtofile execution \(executionId) completed successfully", category: "Jeballtofile")
+    if execution.complete() {
+      eventBus.publish(.jeballtofileCompleted(executionId: executionId, vmId: vmId))
+      logInfo("Jeballtofile execution \(executionId) completed successfully", category: "Jeballtofile")
+    }
   }
 
   private func publishCancellation(executionId: UUID, vmId: UUID, step: Int) {
@@ -100,7 +145,7 @@ class JeballtofileExecutor {
   private func executeStep(_ step: JeballtofileStep, vmId: UUID) async throws -> String {
     switch step.type {
     case .install:
-      let effectiveSource = resolveIPSWSource(source)
+      let effectiveSource = try IPSWSourceValidator.normalized(source)
       try await vmManager.installVM(vmId, ipswSource: effectiveSource)
       return "macOS installation completed"
 
@@ -132,7 +177,7 @@ class JeballtofileExecutor {
         throw JeballtofileExecutorError.invalidStep("Missing command")
       }
       let user = step.user ?? "admin"
-      let password = step.password ?? "admin"
+      let password = step.password
       let timeout = TimeInterval(step.timeout ?? 30)
       let result = try await vmManager.executeCommand(
         vmId,
@@ -157,12 +202,8 @@ class JeballtofileExecutor {
   }
 
   /// Resolves source field to the effective IPSW source path/URL (strips file:// scheme)
-  private func resolveIPSWSource(_ source: String?) -> String? {
-    guard let source, !source.isEmpty else { return nil }
-    if let url = URL(string: source), url.scheme?.lowercased() == "file" {
-      return url.path
-    }
-    return source
+  static func resolveIPSWSource(_ source: String?) -> String? {
+    try? IPSWSourceValidator.normalized(source)
   }
 }
 
