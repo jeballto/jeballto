@@ -2,320 +2,31 @@ import CryptoKit
 import Darwin
 import Foundation
 
-// swiftlint:disable file_length
-
-let jeballtoImageArtifactType = "application/vnd.jeballto.vm.bundle"
-let jeballtoImageConfigMediaType = "application/vnd.jeballto.vm.bundle.config+json"
-let jeballtoImageChunkMediaType = "application/vnd.jeballto.vm.bundle.chunk+zstd"
-
-struct VMImageLayer: Sendable {
-  let absolutePath: String
-  let relativePath: String
-  let mediaType: String
+private struct VMImagePackInventory {
+  let files: [(relativePath: String, fileSize: UInt64)]
+  let totalChunks: Int
+  let totalBytes: UInt64
 }
 
-struct VMImagePackage: Sendable {
-  let stagingDirectory: String
-  let configPath: String
-  let layers: [VMImageLayer]
-  let metadata: [String: String]
-}
-
-struct VMImageBundleConfig: Codable, Equatable, Sendable {
-  struct Compression: Codable, Equatable, Sendable {
-    let algorithm: String
-    let level: Int
-  }
-
-  let artifactType: String
-  let chunkSize: UInt64
-  let compression: Compression
-  let files: [VMImagePackedFile]
-}
-
-struct VMImagePackedFile: Codable, Equatable, Sendable {
-  let path: String
-  let size: UInt64
-  let chunks: [VMImagePackedChunk]
-}
-
-struct VMImagePackedChunk: Codable, Equatable, Sendable {
-  let index: Int
-  let offset: UInt64
-  let uncompressedSize: UInt64
-  let uncompressedDigest: String
-  let compressedSize: UInt64?
-  let compressedDigest: String?
-  let layerPath: String?
-  let zero: Bool
-}
-
-private struct PackedChunkResult: Sendable {
-  let chunk: VMImagePackedChunk
-  let layer: VMImageLayer?
-}
-
-private struct PackChunkRequest: Sendable {
-  let index: Int
-  let absolutePath: String
-  let relativePath: String
-  let fileSize: UInt64
-  let chunkSize: UInt64
-  let chunksDirectory: String
-  let compressionLevel: Int
-  let cachedChunk: VMImagePackedChunk?
-  let zstdClient: ZstdClient
-  let timeout: TimeInterval?
-}
-
-private struct UnpackChunkRequest: Sendable {
-  let packedFile: VMImagePackedFile
-  let chunk: VMImagePackedChunk
-  let layerDirectory: String
-  let outputPath: String
-  let fetchLayer: VMImageLayerFetcher?
-  let zstdClient: ZstdClient
-  let decompressionLimiter: ImageConcurrencyLimiter
-  let diskWriteLimiter: ImageConcurrencyLimiter
-  let timeout: TimeInterval?
-}
-
-typealias VMImageLayerFetcher = @Sendable (
-  _ packedFile: VMImagePackedFile,
-  _ chunk: VMImagePackedChunk,
-  _ destinationPath: String
-) async throws -> Void
-
-struct VMImagePackProgressUpdate: Sendable {
-  let chunksCompletedDelta: Int?
-  let chunksTotal: Int?
-  let bytesCompletedDelta: UInt64?
-  let bytesTotal: UInt64?
-}
-
-typealias VMImagePackProgressSink = @Sendable (VMImagePackProgressUpdate) async -> Void
-
-enum VMImagePackagerError: Error, LocalizedError {
-  case invalidBundle(String)
-  case invalidConfig(String)
-  case digestMismatch(String)
-  case unsupportedCompression(String)
-
-  var errorDescription: String? {
-    switch self {
-    case .invalidBundle(let message): "Invalid VM image bundle: \(message)"
-    case .invalidConfig(let message): "Invalid VM image config: \(message)"
-    case .digestMismatch(let message): "VM image digest mismatch: \(message)"
-    case .unsupportedCompression(let message): "Unsupported VM image compression: \(message)"
-    }
-  }
-}
-
-private enum VMImageConfigValidator {
-  private struct ValidationContext {
-    var seenFilePaths: Set<String> = []
-    var seenLayerPaths: Set<String> = []
-  }
-
-  static func validate(_ config: VMImageBundleConfig) throws {
-    var context = ValidationContext()
-    for packedFile in config.files {
-      try validate(packedFile, config: config, context: &context)
-    }
-  }
-
-  static func validateRelativePath(_ path: String) throws {
-    guard !path.isEmpty,
-          !path.hasPrefix("/"),
-          !path.contains("\0"),
-          !path.split(separator: "/").contains("..") else
-    {
-      throw VMImagePackagerError.invalidConfig("Unsafe relative path: \(path)")
-    }
-  }
-
-  private static func validate(
-    _ packedFile: VMImagePackedFile,
-    config: VMImageBundleConfig,
-    context: inout ValidationContext
-  ) throws {
-    try validateRelativePath(packedFile.path)
-    guard context.seenFilePaths.insert(packedFile.path).inserted else {
-      throw VMImagePackagerError.invalidConfig("Duplicate file path: \(packedFile.path)")
-    }
-
-    let expectedChunkCount = expectedChunkCount(fileSize: packedFile.size, chunkSize: config.chunkSize)
-    guard UInt64(packedFile.chunks.count) == expectedChunkCount else {
-      throw VMImagePackagerError.invalidConfig(
-        "Chunk count mismatch for \(packedFile.path): expected \(expectedChunkCount), "
-          + "found \(packedFile.chunks.count)"
-      )
-    }
-
-    let orderedChunks = packedFile.chunks.sorted { lhs, rhs in
-      lhs.index < rhs.index
-    }
-    for (expectedIndex, chunk) in orderedChunks.enumerated() {
-      try validateChunk(
-        chunk,
-        in: packedFile,
-        config: config,
-        expectedIndex: expectedIndex,
-        seenLayerPaths: &context.seenLayerPaths
-      )
-    }
-  }
-
-  private static func expectedChunkCount(fileSize: UInt64, chunkSize: UInt64) -> UInt64 {
-    fileSize == 0 ? 1 : ((fileSize - 1) / chunkSize) + 1
-  }
-
-  private static func validateChunk(
-    _ chunk: VMImagePackedChunk,
-    in packedFile: VMImagePackedFile,
-    config: VMImageBundleConfig,
-    expectedIndex: Int,
-    seenLayerPaths: inout Set<String>
-  ) throws {
-    try validateChunkLayout(chunk, in: packedFile, config: config, expectedIndex: expectedIndex)
-    guard isValidSHA256Digest(chunk.uncompressedDigest) else {
-      throw VMImagePackagerError.invalidConfig(
-        "Invalid uncompressed digest for \(packedFile.path) chunk \(chunk.index)"
-      )
-    }
-
-    if chunk.zero {
-      try validateZeroChunk(chunk, in: packedFile)
-      return
-    }
-
-    try validateNonzeroChunk(chunk, in: packedFile, seenLayerPaths: &seenLayerPaths)
-  }
-
-  private static func validateChunkLayout(
-    _ chunk: VMImagePackedChunk,
-    in packedFile: VMImagePackedFile,
-    config: VMImageBundleConfig,
-    expectedIndex: Int
-  ) throws {
-    guard chunk.index >= 0 else {
-      throw VMImagePackagerError.invalidConfig("Negative chunk index for \(packedFile.path)")
-    }
-    guard chunk.index == expectedIndex else {
-      throw VMImagePackagerError.invalidConfig(
-        "Chunk indexes for \(packedFile.path) must be contiguous starting at 0"
-      )
-    }
-
-    let (expectedOffset, offsetOverflow) = UInt64(expectedIndex)
-      .multipliedReportingOverflow(by: config.chunkSize)
-    guard !offsetOverflow else {
-      throw VMImagePackagerError.invalidConfig(
-        "Chunk offset overflow for \(packedFile.path) chunk \(chunk.index)"
-      )
-    }
-    guard chunk.offset == expectedOffset else {
-      throw VMImagePackagerError.invalidConfig(
-        "Unexpected offset for \(packedFile.path) chunk \(chunk.index): expected \(expectedOffset), "
-          + "found \(chunk.offset)"
-      )
-    }
-
-    let expectedSize = packedFile.size == 0
-      ? 0
-      : min(config.chunkSize, packedFile.size - expectedOffset)
-    guard chunk.uncompressedSize == expectedSize else {
-      throw VMImagePackagerError.invalidConfig(
-        "Unexpected size for \(packedFile.path) chunk \(chunk.index): expected \(expectedSize), "
-          + "found \(chunk.uncompressedSize)"
-      )
-    }
-  }
-
-  private static func validateZeroChunk(_ chunk: VMImagePackedChunk, in packedFile: VMImagePackedFile) throws {
-    guard chunk.compressedSize == nil,
-          chunk.compressedDigest == nil,
-          chunk.layerPath == nil else
-    {
-      throw VMImagePackagerError.invalidConfig(
-        "Zero chunk for \(packedFile.path) chunk \(chunk.index) must not include layer metadata"
-      )
-    }
-    guard chunk.uncompressedDigest == zeroDigest(size: chunk.uncompressedSize) else {
-      throw VMImagePackagerError.invalidConfig(
-        "Zero chunk for \(packedFile.path) chunk \(chunk.index) has an invalid uncompressed digest"
-      )
-    }
-  }
-
-  private static func validateNonzeroChunk(
-    _ chunk: VMImagePackedChunk,
-    in packedFile: VMImagePackedFile,
-    seenLayerPaths: inout Set<String>
-  ) throws {
-    guard chunk.uncompressedSize > 0 else {
-      throw VMImagePackagerError.invalidConfig(
-        "Nonzero chunk for \(packedFile.path) chunk \(chunk.index) is empty"
-      )
-    }
-    guard let compressedSize = chunk.compressedSize, compressedSize > 0 else {
-      throw VMImagePackagerError.invalidConfig(
-        "Missing compressed size for \(packedFile.path) chunk \(chunk.index)"
-      )
-    }
-    guard let compressedDigest = chunk.compressedDigest, isValidSHA256Digest(compressedDigest) else {
-      throw VMImagePackagerError.invalidConfig(
-        "Invalid compressed digest for \(packedFile.path) chunk \(chunk.index)"
-      )
-    }
-    guard let layerPath = chunk.layerPath else {
-      throw VMImagePackagerError.invalidConfig("Missing layer path for \(packedFile.path) chunk \(chunk.index)")
-    }
-    try validateRelativePath(layerPath)
-    guard layerPath.hasPrefix("chunks/") else {
-      throw VMImagePackagerError.invalidConfig("Layer path must be under chunks/: \(layerPath)")
-    }
-    guard seenLayerPaths.insert(layerPath).inserted else {
-      throw VMImagePackagerError.invalidConfig("Duplicate layer path: \(layerPath)")
-    }
-  }
-
-  private static func isValidSHA256Digest(_ digest: String) -> Bool {
-    let prefix = "sha256:"
-    let lowercaseHex = Set("0123456789abcdef")
-    guard digest.hasPrefix(prefix), digest.count == prefix.count + 64 else { return false }
-    return digest.dropFirst(prefix.count).allSatisfy { character in
-      lowercaseHex.contains(character)
-    }
-  }
-
-  private static func zeroDigest(size: UInt64) -> String {
-    let bufferSize = 1024 * 1024
-    let zeroBuffer = Data(repeating: 0, count: bufferSize)
-    var remaining = size
-    var hasher = SHA256()
-
-    while remaining > 0 {
-      let count = Int(min(UInt64(bufferSize), remaining))
-      if count == bufferSize {
-        hasher.update(data: zeroBuffer)
-      } else {
-        hasher.update(data: zeroBuffer.prefix(count))
-      }
-      remaining -= UInt64(count)
-    }
-
-    return hexDigest(hasher.finalize())
-  }
-
-  private static func hexDigest(_ digest: some Sequence<UInt8>) -> String {
-    "sha256:" + digest.map { String(format: "%02x", $0) }.joined()
-  }
-}
-
-struct VMImagePackager {
+/// Immutable packaging configuration. FileManager operations are independent and the mutable
+/// compression work is isolated inside ZstdClient process invocations.
+struct VMImagePackager: @unchecked Sendable {
+  static let formatName = "Jeballto VM Bundle Format"
+  static let currentFormatVersion = 1
+  static var currentFormatDisplayName: String { "\(formatName) v\(currentFormatVersion)" }
+  static let maxConfigSize: UInt64 = 4 * 1024 * 1024
+  static let maximumFileCount = 64
+  static let maximumChunkCount = 65536
+  static let maximumCompressedLayerSize: UInt64 = 2 * 1024 * 1024 * 1024
+  static let maximumUncompressedSize: UInt64 = 9 * 1024 * 1024 * 1024 * 1024
+  static let maximumTotalBlobSize: UInt64 = 9 * 1024 * 1024 * 1024 * 1024
+  static let minimumChunkSize: UInt64 = 1024 * 1024
+  static let maximumChunkSize: UInt64 = 1024 * 1024 * 1024
   static let defaultChunkSize: UInt64 = 256 * 1024 * 1024
   static let defaultCompressionLevel = 3
+  /// Free space required beyond the unpacked image itself, covering filesystem metadata and the
+  /// compressed blobs that remain on disk while the unpack runs.
+  static let unpackFreeSpaceHeadroom: UInt64 = 1024 * 1024 * 1024
 
   static func automaticParallelChunkLimit(
     activeProcessorCount: Int = ProcessInfo.processInfo
@@ -331,6 +42,9 @@ struct VMImagePackager {
   private let maxParallelUnpackChunks: Int?
   private let maxParallelDecompressions: Int?
   private let maxParallelDiskWrites: Int?
+  private let compressionLimiter: ImageConcurrencyLimiter?
+  private let decompressionLimiter: ImageConcurrencyLimiter?
+  private let diskWriteLimiter: ImageConcurrencyLimiter?
   private let fileManager: FileManager
 
   init(
@@ -341,6 +55,9 @@ struct VMImagePackager {
     maxParallelUnpackChunks: Int? = nil,
     maxParallelDecompressions: Int? = nil,
     maxParallelDiskWrites: Int? = nil,
+    compressionLimiter: ImageConcurrencyLimiter? = nil,
+    decompressionLimiter: ImageConcurrencyLimiter? = nil,
+    diskWriteLimiter: ImageConcurrencyLimiter? = nil,
     fileManager: FileManager = .default
   ) {
     self.zstdClient = zstdClient
@@ -350,12 +67,18 @@ struct VMImagePackager {
     self.maxParallelUnpackChunks = maxParallelUnpackChunks
     self.maxParallelDecompressions = maxParallelDecompressions
     self.maxParallelDiskWrites = maxParallelDiskWrites
+    self.compressionLimiter = compressionLimiter
+    self.decompressionLimiter = decompressionLimiter
+    self.diskWriteLimiter = diskWriteLimiter
     self.fileManager = fileManager
   }
+}
 
+extension VMImagePackager {
   func packBundle(
     bundlePath: String,
     stagingRoot: String,
+    resources: VMResources = .default,
     timeout: TimeInterval? = nil,
     progressSink: VMImagePackProgressSink? = nil
   ) async throws -> VMImagePackage {
@@ -364,6 +87,7 @@ struct VMImagePackager {
       bundlePath: bundlePath,
       stagingDirectory: stagingDirectory,
       removeStagingDirectoryOnFailure: true,
+      resources: resources,
       timeout: timeout,
       progressSink: progressSink
     )
@@ -372,6 +96,7 @@ struct VMImagePackager {
   func packBundle(
     bundlePath: String,
     stagingDirectory: String,
+    resources: VMResources = .default,
     timeout: TimeInterval? = nil,
     progressSink: VMImagePackProgressSink? = nil
   ) async throws -> VMImagePackage {
@@ -379,13 +104,19 @@ struct VMImagePackager {
       bundlePath: bundlePath,
       stagingDirectory: stagingDirectory,
       removeStagingDirectoryOnFailure: false,
+      resources: resources,
       timeout: timeout,
       progressSink: progressSink
     )
   }
 
-  func sourceFingerprint(bundlePath: String) throws -> String {
-    guard chunkSize > 0 else { throw VMImagePackagerError.invalidConfig("Chunk size must be positive") }
+  func sourceFingerprint(bundlePath: String, resources: VMResources = .default) throws -> String {
+    guard (Self.minimumChunkSize ... Self.maximumChunkSize).contains(chunkSize) else {
+      throw VMImagePackagerError.invalidConfig("Chunk size must be between 1MB and 1GB")
+    }
+    guard resources.validate() else {
+      throw VMImagePackagerError.invalidConfig("Image resources are outside supported bounds")
+    }
 
     var hasher = SHA256()
     func append(_ value: String) {
@@ -397,11 +128,14 @@ struct VMImagePackager {
     append("chunkSize=\(chunkSize)")
     append("compression=zstd")
     append("compressionLevel=\(compressionLevel)")
+    append("cpuCount=\(resources.cpuCount)")
+    append("memorySize=\(resources.memorySize)")
+    append("diskSize=\(resources.diskSize)")
 
     for relativePath in try listRegularFiles(in: bundlePath) {
       let absolutePath = "\(bundlePath)/\(relativePath)"
       let attrs = try fileManager.attributesOfItem(atPath: absolutePath)
-      let size = attrs[.size] as? UInt64 ?? UInt64(attrs[.size] as? Int64 ?? 0)
+      let size = try Self.fileSize(from: attrs, atPath: absolutePath)
       let modifiedAt = attrs[.modificationDate] as? Date ?? Date(timeIntervalSince1970: 0)
       append(relativePath)
       append(String(size))
@@ -415,35 +149,34 @@ struct VMImagePackager {
     bundlePath: String,
     stagingDirectory: String,
     removeStagingDirectoryOnFailure: Bool,
+    resources: VMResources,
     timeout: TimeInterval?,
     progressSink: VMImagePackProgressSink?
   ) async throws -> VMImagePackage {
-    guard chunkSize > 0 else { throw VMImagePackagerError.invalidConfig("Chunk size must be positive") }
+    guard (Self.minimumChunkSize ... Self.maximumChunkSize).contains(chunkSize) else {
+      throw VMImagePackagerError.invalidConfig("Chunk size must be between 1MB and 1GB")
+    }
+    guard resources.validate() else {
+      throw VMImagePackagerError.invalidConfig("Image resources are outside supported bounds")
+    }
 
     let chunksDirectory = "\(stagingDirectory)/chunks"
+    try fileManager.createDirectory(
+      atPath: stagingDirectory,
+      withIntermediateDirectories: true,
+      attributes: [.posixPermissions: 0o700]
+    )
+    try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: stagingDirectory)
     try fileManager.createDirectory(atPath: chunksDirectory, withIntermediateDirectories: true)
 
     do {
-      let relativeFiles = try listRegularFiles(in: bundlePath)
-      guard !relativeFiles.isEmpty else {
-        throw VMImagePackagerError.invalidBundle("No files found in \(bundlePath)")
-      }
-      let files = try relativeFiles.map { relativePath in
-        let absolutePath = "\(bundlePath)/\(relativePath)"
-        return try (relativePath: relativePath, fileSize: Self.fileSize(atPath: absolutePath, fileManager: fileManager))
-      }
-      let totalChunks = files.reduce(0) { total, file in
-        total + chunkCount(forFileSize: file.fileSize)
-      }
-      let totalBytes = files.reduce(UInt64(0)) { total, file in
-        total + file.fileSize
-      }
+      let inventory = try makePackInventory(bundlePath: bundlePath)
       await progressSink?(
         VMImagePackProgressUpdate(
           chunksCompletedDelta: nil,
-          chunksTotal: totalChunks,
+          chunksTotal: inventory.totalChunks,
           bytesCompletedDelta: nil,
-          bytesTotal: totalBytes
+          bytesTotal: inventory.totalBytes
         )
       )
 
@@ -451,7 +184,7 @@ struct VMImagePackager {
       var packedFiles: [VMImagePackedFile] = []
       var layers: [VMImageLayer] = []
 
-      for file in files {
+      for file in inventory.files {
         let relativePath = file.relativePath
         let absolutePath = "\(bundlePath)/\(relativePath)"
         let packed = try await packFile(
@@ -469,6 +202,7 @@ struct VMImagePackager {
 
       let config = VMImageBundleConfig(
         artifactType: jeballtoImageArtifactType,
+        resources: resources,
         chunkSize: chunkSize,
         compression: .init(algorithm: "zstd", level: compressionLevel),
         files: packedFiles
@@ -477,7 +211,12 @@ struct VMImagePackager {
       let configPath = "\(stagingDirectory)/vm-bundle-config.json"
       let encoder = JSONEncoder()
       encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-      try encoder.encode(config).write(to: URL(fileURLWithPath: configPath), options: .atomic)
+      try VMImageConfigValidator.validate(config)
+      let configData = try encoder.encode(config)
+      guard UInt64(configData.count) <= Self.maxConfigSize else {
+        throw VMImagePackagerError.invalidConfig("Generated image config exceeds the 4MB limit")
+      }
+      try configData.write(to: URL(fileURLWithPath: configPath), options: .atomic)
 
       return VMImagePackage(
         stagingDirectory: stagingDirectory,
@@ -486,6 +225,11 @@ struct VMImagePackager {
         metadata: [
           "imageFormat": "chunked-zstd",
           "artifactType": jeballtoImageArtifactType,
+          "formatVersion": String(Self.currentFormatVersion),
+          "architecture": "arm64",
+          "cpuCount": String(resources.cpuCount),
+          "memorySize": String(resources.memorySize),
+          "diskSize": String(resources.diskSize),
           "chunkSize": String(chunkSize),
           "compression": "zstd",
         ]
@@ -496,6 +240,46 @@ struct VMImagePackager {
       }
       throw error
     }
+  }
+
+  private func makePackInventory(bundlePath: String) throws -> VMImagePackInventory {
+    let relativeFiles = try listRegularFiles(in: bundlePath)
+    guard relativeFiles.isEmpty == false else {
+      throw VMImagePackagerError.invalidBundle("No files found in \(bundlePath)")
+    }
+    guard relativeFiles.count <= Self.maximumFileCount else {
+      throw VMImagePackagerError.invalidBundle("Bundle contains more than \(Self.maximumFileCount) files")
+    }
+    let files = try relativeFiles.map { relativePath in
+      let absolutePath = "\(bundlePath)/\(relativePath)"
+      return try (
+        relativePath: relativePath,
+        fileSize: Self.fileSize(atPath: absolutePath, fileManager: fileManager)
+      )
+    }
+    let missingOrEmptyRequiredFiles = requiredVMImageBundleFileNames.filter { requiredPath in
+      files.first { $0.relativePath == requiredPath }.map { $0.fileSize == 0 } ?? true
+    }
+    guard missingOrEmptyRequiredFiles.isEmpty else {
+      throw VMImagePackagerError.invalidBundle(
+        "Required VM bundle files are missing or empty: \(missingOrEmptyRequiredFiles.joined(separator: ", "))"
+      )
+    }
+    let totalChunks = try files.reduce(0) { total, file in
+      let (result, overflow) = try total.addingReportingOverflow(chunkCount(forFileSize: file.fileSize))
+      guard overflow == false, result <= Self.maximumChunkCount else {
+        throw VMImagePackagerError.invalidBundle("Bundle requires more than \(Self.maximumChunkCount) chunks")
+      }
+      return result
+    }
+    let totalBytes = try files.reduce(UInt64(0)) { total, file in
+      let (result, overflow) = total.addingReportingOverflow(file.fileSize)
+      guard overflow == false, result <= Self.maximumUncompressedSize else {
+        throw VMImagePackagerError.invalidBundle("Bundle exceeds the supported 9TB size")
+      }
+      return result
+    }
+    return VMImagePackInventory(files: files, totalChunks: totalChunks, totalBytes: totalBytes)
   }
 
   func unpackBundle(pulledDirectory: String, configPath: String, outputBundlePath: String, timeout: TimeInterval? = nil)
@@ -528,15 +312,40 @@ struct VMImagePackager {
     )
   }
 
-  private func decodeConfig(atPath configPath: String) throws -> VMImageBundleConfig {
+  func decodeConfig(atPath configPath: String) throws -> VMImageBundleConfig {
+    let configSize = try Self.fileSize(atPath: configPath, fileManager: fileManager)
+    guard configSize <= Self.maxConfigSize else {
+      throw VMImagePackagerError.invalidConfig("Image config exceeds the 4MB limit")
+    }
     let configData = try Data(contentsOf: URL(fileURLWithPath: configPath))
-    let config = try JSONDecoder().decode(VMImageBundleConfig.self, from: configData)
+    let config: VMImageBundleConfig
+    do {
+      config = try JSONDecoder().decode(VMImageBundleConfig.self, from: configData)
+    } catch let error as VMImagePackagerError {
+      throw error
+    } catch let error as DecodingError {
+      throw VMImagePackagerError.invalidConfig(Self.configDecodingErrorDescription(error))
+    } catch {
+      throw VMImagePackagerError.invalidConfig("Failed to decode image config: \(error.localizedDescription)")
+    }
 
+    guard config.formatVersion == Self.currentFormatVersion else {
+      throw VMImagePackagerError.unsupportedFormat(
+        "version \(config.formatVersion) is not supported; this agent supports "
+          + Self.currentFormatDisplayName
+      )
+    }
     guard config.artifactType == jeballtoImageArtifactType else {
       throw VMImagePackagerError.invalidConfig("Unsupported image config")
     }
-    guard config.chunkSize > 0 else {
-      throw VMImagePackagerError.invalidConfig("Chunk size must be positive")
+    guard config.architecture == "arm64" else {
+      throw VMImagePackagerError.invalidConfig("Unsupported image architecture \(config.architecture)")
+    }
+    guard config.resources.validate() else {
+      throw VMImagePackagerError.invalidConfig("Image resources are outside supported bounds")
+    }
+    guard (Self.minimumChunkSize ... Self.maximumChunkSize).contains(config.chunkSize) else {
+      throw VMImagePackagerError.invalidConfig("Chunk size must be between 1MB and 1GB")
     }
     guard config.files.isEmpty == false else {
       throw VMImagePackagerError.invalidConfig("Image config must include at least one file")
@@ -548,6 +357,30 @@ struct VMImagePackager {
     return config
   }
 
+  private static func configDecodingErrorDescription(_ error: DecodingError) -> String {
+    switch error {
+    case .keyNotFound(let key, let context):
+      let path = configFieldPath(context.codingPath, appending: key)
+      return "Missing required field '\(path)'"
+    case .typeMismatch(_, let context):
+      let path = configFieldPath(context.codingPath)
+      return "Field '\(path)' has an invalid type: \(context.debugDescription)"
+    case .valueNotFound(_, let context):
+      let path = configFieldPath(context.codingPath)
+      return "Field '\(path)' must not be null: \(context.debugDescription)"
+    case .dataCorrupted(let context):
+      let path = configFieldPath(context.codingPath)
+      return "Invalid value at '\(path)': \(context.debugDescription)"
+    @unknown default:
+      return "Failed to decode image config"
+    }
+  }
+
+  private static func configFieldPath(_ codingPath: [CodingKey], appending key: CodingKey? = nil) -> String {
+    let path = codingPath.map(\.stringValue) + [key?.stringValue].compactMap { $0 }
+    return path.isEmpty ? "<root>" : path.joined(separator: ".")
+  }
+
   private func unpackBundle(
     config: VMImageBundleConfig,
     layerDirectory: String,
@@ -556,9 +389,38 @@ struct VMImagePackager {
     timeout: TimeInterval?
   ) async throws {
     let outputParent = (outputBundlePath as NSString).deletingLastPathComponent
+    let requiredPhysicalBytes = try config.files.reduce(UInt64(0)) { fileTotal, file in
+      try file.chunks.reduce(fileTotal) { chunkTotal, chunk in
+        guard chunk.zero == false else { return chunkTotal }
+        let (result, overflow) = chunkTotal.addingReportingOverflow(chunk.uncompressedSize)
+        guard !overflow else {
+          throw VMImagePackagerError.invalidConfig("Uncompressed image size overflow")
+        }
+        return result
+      }
+    }
+    let outputParentURL = URL(fileURLWithPath: outputParent, isDirectory: true)
+    // Use volumeAvailableCapacity, not ...ForImportantUsage: the latter counts purgeable space the
+    // unpack cannot actually claim, so it can report room the kernel then refuses with ENOSPC.
+    if let available = try? outputParentURL.resourceValues(forKeys: [.volumeAvailableCapacityKey])
+      .volumeAvailableCapacity,
+      available >= 0
+    {
+      let (required, overflow) = requiredPhysicalBytes.addingReportingOverflow(Self.unpackFreeSpaceHeadroom)
+      if overflow || UInt64(available) < required {
+        throw VMImagePackagerError.invalidBundle(
+          "Insufficient disk space: need \(requiredPhysicalBytes) bytes plus "
+            + "\(Self.unpackFreeSpaceHeadroom) bytes headroom, \(available) bytes available"
+        )
+      }
+    }
     let outputName = (outputBundlePath as NSString).lastPathComponent
     let tempOutputBundlePath = "\(outputParent)/.\(outputName).unpack-\(UUID().uuidString)"
-    try fileManager.createDirectory(atPath: tempOutputBundlePath, withIntermediateDirectories: true)
+    try fileManager.createDirectory(
+      atPath: tempOutputBundlePath,
+      withIntermediateDirectories: true,
+      attributes: [.posixPermissions: 0o700]
+    )
     defer {
       try? fileManager.removeItem(atPath: tempOutputBundlePath)
     }
@@ -568,7 +430,13 @@ struct VMImagePackager {
       let outputPath = "\(tempOutputBundlePath)/\(packedFile.path)"
       let outputFileParent = (outputPath as NSString).deletingLastPathComponent
       try fileManager.createDirectory(atPath: outputFileParent, withIntermediateDirectories: true)
-      fileManager.createFile(atPath: outputPath, contents: nil)
+      guard fileManager.createFile(
+        atPath: outputPath,
+        contents: nil,
+        attributes: [.posixPermissions: 0o600]
+      ) else {
+        throw VMImagePackagerError.invalidBundle("Failed to create output file \(packedFile.path)")
+      }
 
       let outputHandle = try FileHandle(forWritingTo: URL(fileURLWithPath: outputPath))
       do {
@@ -606,7 +474,7 @@ struct VMImagePackager {
     timeout: TimeInterval?,
     progressSink: VMImagePackProgressSink?
   ) async throws -> (file: VMImagePackedFile, layers: [VMImageLayer]) {
-    let chunkCount = chunkCount(forFileSize: fileSize)
+    let chunkCount = try chunkCount(forFileSize: fileSize)
     var results: [PackedChunkResult] = []
     results.reserveCapacity(chunkCount)
     let zstdClient = zstdClient
@@ -633,6 +501,7 @@ struct VMImagePackager {
           compressionLevel: compressionLevel,
           cachedChunk: cachedChunksByIndex[index],
           zstdClient: zstdClient,
+          compressionLimiter: compressionLimiter,
           timeout: timeout
         )
         group.addTask {
@@ -664,6 +533,7 @@ struct VMImagePackager {
               compressionLevel: compressionLevel,
               cachedChunk: cachedChunksByIndex[index],
               zstdClient: zstdClient,
+              compressionLimiter: compressionLimiter,
               timeout: timeout
             )
             group.addTask {
@@ -684,8 +554,12 @@ struct VMImagePackager {
     return (VMImagePackedFile(path: relativePath, size: fileSize, chunks: chunks), layers)
   }
 
-  private func chunkCount(forFileSize fileSize: UInt64) -> Int {
-    fileSize == 0 ? 1 : Int((fileSize + chunkSize - 1) / chunkSize)
+  private func chunkCount(forFileSize fileSize: UInt64) throws -> Int {
+    let count = fileSize == 0 ? UInt64(1) : ((fileSize - 1) / chunkSize) + 1
+    guard count <= UInt64(Int.max) else {
+      throw VMImagePackagerError.invalidBundle("File requires too many chunks")
+    }
+    return Int(count)
   }
 
   private func decodeCachedFilesByPath(stagingDirectory: String) throws -> [String: VMImagePackedFile] {
@@ -720,8 +594,10 @@ struct VMImagePackager {
     let chunks = packedFile.chunks.filter { $0.zero == false }
     guard chunks.isEmpty == false else { return }
     let zstdClient = zstdClient
-    let decompressionLimiter = ImageConcurrencyLimiter(limit: effectiveDecompressionLimit())
-    let diskWriteLimiter = ImageConcurrencyLimiter(limit: effectiveDiskWriteLimit())
+    let decompressionLimiter = decompressionLimiter
+      ?? ImageConcurrencyLimiter(limit: effectiveDecompressionLimit())
+    let diskWriteLimiter = diskWriteLimiter
+      ?? ImageConcurrencyLimiter(limit: effectiveDiskWriteLimit())
     let limit = min(effectiveUnpackChunkLimit(), chunks.count)
 
     try await withThrowingTaskGroup(of: Void.self) { group in
@@ -818,7 +694,7 @@ struct VMImagePackager {
           index: request.index,
           offset: offset,
           uncompressedSize: size,
-          uncompressedDigest: scannedChunk.digest,
+          uncompressedDigest: VMImageConfigValidator.zeroDigest(size: size),
           compressedSize: nil,
           compressedDigest: nil,
           layerPath: nil,
@@ -839,14 +715,27 @@ struct VMImagePackager {
 
     let chunkInfo: ZstdRangeDigest
     do {
-      chunkInfo = try await request.zstdClient.compressRange(
-        inputPath: request.absolutePath,
-        offset: offset,
-        size: size,
-        outputPath: compressedPath,
-        level: request.compressionLevel,
-        timeout: request.timeout
-      )
+      if let compressionLimiter = request.compressionLimiter {
+        chunkInfo = try await compressionLimiter.withPermit {
+          try await request.zstdClient.compressRange(
+            inputPath: request.absolutePath,
+            offset: offset,
+            size: size,
+            outputPath: compressedPath,
+            level: request.compressionLevel,
+            timeout: request.timeout
+          )
+        }
+      } else {
+        chunkInfo = try await request.zstdClient.compressRange(
+          inputPath: request.absolutePath,
+          offset: offset,
+          size: size,
+          outputPath: compressedPath,
+          level: request.compressionLevel,
+          timeout: request.timeout
+        )
+      }
     } catch {
       try? FileManager.default.removeItem(atPath: compressedPath)
       throw error
@@ -859,6 +748,12 @@ struct VMImagePackager {
     }
 
     let compressedSize = try Self.fileSize(atPath: compressedPath)
+    guard compressedSize <= Self.maximumCompressedLayerSize else {
+      try? FileManager.default.removeItem(atPath: compressedPath)
+      throw VMImagePackagerError.invalidBundle(
+        "Compressed chunk for \(request.relativePath) exceeds the supported 2GB layer size"
+      )
+    }
     let compressedDigest = try sha256File(atPath: compressedPath)
     return PackedChunkResult(
       chunk: VMImagePackedChunk(
@@ -874,7 +769,9 @@ struct VMImagePackager {
       layer: VMImageLayer(
         absolutePath: compressedPath,
         relativePath: layerPath,
-        mediaType: jeballtoImageChunkMediaType
+        mediaType: jeballtoImageChunkMediaType,
+        digest: compressedDigest,
+        size: compressedSize
       )
     )
   }
@@ -918,7 +815,9 @@ struct VMImagePackager {
       layer: VMImageLayer(
         absolutePath: compressedPath,
         relativePath: layerPath,
-        mediaType: jeballtoImageChunkMediaType
+        mediaType: jeballtoImageChunkMediaType,
+        digest: compressedDigest,
+        size: compressedSize
       )
     )
   }
@@ -962,14 +861,29 @@ struct VMImagePackager {
         throw VMImagePackagerError.digestMismatch("Compressed digest mismatch for \(layerPath)")
       }
 
-      let actualRaw = try await request.decompressionLimiter.withPermit {
-        try await request.zstdClient.decompressToFileRange(
-          inputPath: compressedPath,
-          destinationPath: request.outputPath,
-          offset: chunk.offset,
-          diskWriteLimiter: request.diskWriteLimiter,
-          timeout: request.timeout
-        )
+      let actualRaw: ZstdRangeDigest
+      do {
+        actualRaw = try await request.decompressionLimiter.withPermit {
+          try await request.zstdClient.decompressToFileRange(
+            inputPath: compressedPath,
+            destinationPath: request.outputPath,
+            offset: chunk.offset,
+            expectedSize: chunk.uncompressedSize,
+            diskWriteLimiter: request.diskWriteLimiter,
+            timeout: request.timeout
+          )
+        }
+      } catch let error as ZstdError {
+        switch error {
+        case .commandFailed(let exitCode, let stderr) where exitCode > 0:
+          throw VMImagePackagerError.invalidConfig(
+            "Layer \(layerPath) is not valid zstd data: \(stderr.prefix(500))"
+          )
+        case .streamingFailed(let message) where message.hasPrefix("Decompressed output "):
+          throw VMImagePackagerError.invalidConfig("Layer \(layerPath) has invalid output: \(message)")
+        default:
+          throw error
+        }
       }
       guard actualRaw.size == chunk.uncompressedSize else {
         throw VMImagePackagerError.digestMismatch("Uncompressed size mismatch for \(layerPath)")
@@ -985,7 +899,9 @@ struct VMImagePackager {
       throw error
     }
   }
+}
 
+private extension VMImagePackager {
   private func listRegularFiles(in bundlePath: String) throws -> [String] {
     var isDirectory: ObjCBool = false
     guard fileManager.fileExists(atPath: bundlePath, isDirectory: &isDirectory), isDirectory.boolValue else {
@@ -998,9 +914,22 @@ struct VMImagePackager {
     var files: [String] = []
     while let item = enumerator.nextObject() as? String {
       let path = "\(bundlePath)/\(item)"
-      var itemIsDirectory: ObjCBool = false
-      if fileManager.fileExists(atPath: path, isDirectory: &itemIsDirectory), !itemIsDirectory.boolValue {
+      var status = stat()
+      let result = path.withCString { Darwin.lstat($0, &status) }
+      guard result == 0 else {
+        throw VMImagePackagerError.invalidBundle(
+          "Cannot inspect \(item): \(String(cString: strerror(errno)))"
+        )
+      }
+      switch status.st_mode & S_IFMT {
+      case S_IFDIR:
+        continue
+      case S_IFREG:
         files.append(item)
+      default:
+        throw VMImagePackagerError.invalidBundle(
+          "Bundle contains unsupported non-regular item: \(item)"
+        )
       }
     }
 
@@ -1017,7 +946,8 @@ struct VMImagePackager {
     defer { try? handle.close() }
     var hasher = SHA256()
     while true {
-      let data = try handle.read(upToCount: 4 * 1024 * 1024) ?? Data()
+      try Task.checkCancellation()
+      let data = try readFileChunk(from: handle, upToCount: 4 * 1024 * 1024) ?? Data()
       guard !data.isEmpty else { break }
       hasher.update(data: data)
     }
@@ -1030,7 +960,14 @@ struct VMImagePackager {
 
   private static func fileSize(atPath path: String, fileManager: FileManager = .default) throws -> UInt64 {
     let attrs = try fileManager.attributesOfItem(atPath: path)
-    return attrs[.size] as? UInt64 ?? UInt64(attrs[.size] as? Int64 ?? 0)
+    return try fileSize(from: attrs, atPath: path)
+  }
+
+  private static func fileSize(from attributes: [FileAttributeKey: Any], atPath path: String) throws -> UInt64 {
+    guard let number = attributes[.size] as? NSNumber, number.doubleValue >= 0 else {
+      throw VMImagePackagerError.invalidBundle("Invalid file size metadata for \(path)")
+    }
+    return number.uint64Value
   }
 
   private static func layerName(for relativePath: String, index: Int) -> String {

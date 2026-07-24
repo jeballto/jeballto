@@ -72,10 +72,76 @@ struct KeystrokeParserTests {
   }
 
   @Test
+  func multipleSequencesShareOneOverallActionLimit() {
+    let first = String(repeating: "a", count: 6000)
+    let second = String(repeating: "b", count: 6000)
+
+    #expect(throws: KeystrokeParserError.self) {
+      _ = try VMManager.parseKeystrokeSequences([first, second])
+    }
+  }
+
+  @Test
   func excessiveWaitDurationThrows() {
     #expect(throws: KeystrokeParserError.self) {
       _ = try KeystrokeParser.parse("<wait301s>")
     }
+  }
+
+  @Test
+  func releasingOnePhysicalShiftKeepsTheOtherShiftActive() {
+    let leftShift = NSEvent.ModifierFlags.shift
+      .union(NSEvent.ModifierFlags(rawValue: 0x000002))
+    let rightShift = NSEvent.ModifierFlags.shift
+      .union(NSEvent.ModifierFlags(rawValue: 0x000004))
+    var state = KeystrokeModifierState()
+
+    state.apply(flags: leftShift, keyCode: 0x38, keyDown: true)
+    state.apply(flags: rightShift, keyCode: 0x3C, keyDown: true)
+    state.apply(flags: leftShift, keyCode: 0x38, keyDown: false)
+
+    #expect(state.flags.contains(.shift))
+    #expect(state.flags.contains(NSEvent.ModifierFlags(rawValue: 0x000004)))
+    #expect(state.flags.contains(NSEvent.ModifierFlags(rawValue: 0x000002)) == false)
+  }
+
+  @Test
+  func cleanupReleasesEachPhysicalModifierInReverseActivationOrder() {
+    let command = NSEvent.ModifierFlags.command
+      .union(NSEvent.ModifierFlags(rawValue: 0x000008))
+    let shift = NSEvent.ModifierFlags.shift
+      .union(NSEvent.ModifierFlags(rawValue: 0x000004))
+    var state = KeystrokeModifierState()
+    state.apply(flags: command, keyCode: 0x37, keyDown: true)
+    state.apply(flags: shift, keyCode: 0x3C, keyDown: true)
+
+    let releases = state.takeReleaseEvents()
+
+    #expect(releases == [
+      KeystrokeModifierRelease(keyCode: 0x3C, remainingFlags: command),
+      KeystrokeModifierRelease(keyCode: 0x37, remainingFlags: []),
+    ])
+    #expect(state.flags.isEmpty)
+  }
+
+  @Test
+  func unsupportedCharacterThrowsInsteadOfTypingA() {
+    #expect(throws: KeystrokeParserError.self) {
+      _ = try KeystrokeParser.parse("emoji: 🧨")
+    }
+    #expect(throws: KeystrokeParserError.self) {
+      _ = try KeystrokeParser.parse("İ")
+    }
+  }
+
+  @Test
+  func escapedAngleBracketsAreTypedLiterally() throws {
+    let actions = try KeystrokeParser.parse(#"\<literal\>"#)
+    let characters = actions.compactMap { action -> String? in
+      if case .keyPress(_, let characters) = action { return characters }
+      return nil
+    }.joined()
+    #expect(characters == "<literal>")
   }
 
   @Test(arguments: [
