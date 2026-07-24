@@ -9,7 +9,7 @@ struct HTTPRequestDecoder: Sendable {
   }
 
   static let maxRequestBodySize = 1_048_576
-  static let maxHeaderSize = 65_536
+  static let maxHeaderSize = 65536
 
   static let malformedRequestResponse = HTTPResponse.error(
     "INVALID_REQUEST",

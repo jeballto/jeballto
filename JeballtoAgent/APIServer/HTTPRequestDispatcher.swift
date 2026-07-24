@@ -88,9 +88,9 @@ final class HTTPRequestDispatcher: @unchecked Sendable {
   private func dispatchToRoute(_ request: HTTPRequest) async -> HTTPResponse {
     switch router.resolve(request) {
     case .handler(let handler):
-      return await invokeRouteHandler(handler, request: request)
+      await invokeRouteHandler(handler, request: request)
     case .response(let response):
-      return response
+      response
     }
   }
 

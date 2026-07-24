@@ -108,7 +108,7 @@ final class HTTPRequestReader: @unchecked Sendable {
     accumulatedData: Data,
     completion: @escaping @Sendable (Result<Data, HTTPResponse>?) -> Void
   ) {
-    connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { data, _, isComplete, error in
+    connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, isComplete, error in
       switch self.evaluate(
         accumulatedData: accumulatedData,
         receivedData: data,
