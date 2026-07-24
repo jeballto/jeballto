@@ -120,11 +120,12 @@ enum IPSWCacheLayout {
   }
 
   private static func readableStem(for filename: String) -> String {
-    let stem: String
-    if let extensionSeparator = filename.lastIndex(of: "."), extensionSeparator != filename.startIndex {
-      stem = String(filename[..<extensionSeparator])
+    let stem: String = if let extensionSeparator = filename.lastIndex(of: "."),
+                          extensionSeparator != filename.startIndex
+    {
+      String(filename[..<extensionSeparator])
     } else {
-      stem = filename
+      filename
     }
     return stem.isEmpty ? "restore" : stem
   }

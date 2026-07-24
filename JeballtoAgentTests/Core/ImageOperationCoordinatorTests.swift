@@ -144,7 +144,7 @@ struct ImageOperationCoordinatorTests {
     }
 
     await coordinator.resumeAdmissions()
-    let resumed = try await start(on: coordinator) { _ in self.makeRecord() }
+    let resumed = try await start(on: coordinator) { _ in makeRecord() }
     _ = await coordinator.wait(for: resumed.id)
     #expect(await coordinator.status(for: resumed.id)?.state == .completed)
   }
@@ -167,7 +167,7 @@ struct ImageOperationCoordinatorTests {
     let coordinator = ImageOperationCoordinator(maxTerminalOperations: 3)
 
     for index in 0 ..< 6 {
-      let operation = try await start(on: coordinator) { _ in self.makeRecord() }
+      let operation = try await start(on: coordinator) { _ in makeRecord() }
       _ = await coordinator.wait(for: operation.id)
       #expect(index >= 0)
     }
