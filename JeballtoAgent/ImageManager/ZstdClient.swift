@@ -24,18 +24,33 @@ struct ZstdRangeDigest: Equatable, Sendable {
   let isZero: Bool
 }
 
+private struct ZstdDecompressionContext: @unchecked Sendable {
+  let process: Process
+  let exitObserver: ProcessExitObserver
+  let stderrCollector: LimitedPipeOutputCollector
+  let stdoutPipe: Pipe
+  let destinationPath: String
+  let offset: UInt64
+  let expectedSize: UInt64
+  let diskWriteLimiter: ImageConcurrencyLimiter?
+  let timeout: TimeInterval?
+}
+
 struct ZstdClient: Sendable {
   private let configuredPath: String?
+  private let childProcessLease: ImageWorkChildProcessLease?
   private static let defaultTimeout: TimeInterval? = nil
   private static let maxOutputSize = 1024 * 1024
   private static let bufferSize = 1024 * 1024
 
-  init(configuredPath: String? = nil) {
+  init(configuredPath: String? = nil, childProcessLease: ImageWorkChildProcessLease? = nil) {
     self.configuredPath = configuredPath
+    self.childProcessLease = childProcessLease
   }
 
-  init(config: ImageConfig) {
+  init(config: ImageConfig, childProcessLease: ImageWorkChildProcessLease? = nil) {
     configuredPath = config.zstdPath
+    self.childProcessLease = childProcessLease
   }
 
   func scanRange(inputPath: String, offset: UInt64, size: UInt64) throws -> ZstdRangeDigest {
@@ -48,15 +63,18 @@ struct ZstdClient: Sendable {
     defer { try? inputHandle.close() }
     try inputHandle.seek(toOffset: offset)
 
+    guard let boundedSize = Int(exactly: size) else {
+      throw ZstdError.streamingFailed("Requested range is too large to process")
+    }
     var hasher = SHA256()
-    var remaining = Int(size)
+    var remaining = boundedSize
     var bytesRead: UInt64 = 0
     var isZero = true
 
     while remaining > 0 {
       try Task.checkCancellation()
       let readSize = min(Self.bufferSize, remaining)
-      guard let data = try inputHandle.read(upToCount: readSize), !data.isEmpty else {
+      guard let data = try readFileChunk(from: inputHandle, upToCount: readSize), !data.isEmpty else {
         throw ZstdError.streamingFailed("Unexpected EOF in \(inputPath)")
       }
       hasher.update(data: data)
@@ -81,27 +99,39 @@ struct ZstdClient: Sendable {
     let zstdPath = try resolveZstdPath()
     let process = Process()
     process.executableURL = URL(fileURLWithPath: zstdPath)
-    process.arguments = ["-q", "-f", "-\(level)", "-", "-o", outputPath]
+    process.arguments = configuredPath == nil
+      ? ["-q", "--single-thread", "-f", "-\(level)", "-", "-o", outputPath]
+      : ["-q", "-f", "-\(level)", "-", "-o", outputPath]
+    if configuredPath == nil {
+      process.environment = bundledToolEnvironment()
+    }
 
     let stdinPipe = Pipe()
     let stderrPipe = Pipe()
     process.standardInput = stdinPipe
     process.standardOutput = FileHandle.nullDevice
     process.standardError = stderrPipe
+    let childLaunchReservation = try childProcessLease?.prepare(process)
+    defer { childLaunchReservation?.processDidExit() }
 
-    let exitObserver = ZstdProcessExitObserver()
-    let stderrCollector = ZstdLimitedPipeCollector(maxOutputSize: Self.maxOutputSize)
+    let exitObserver = ProcessExitObserver()
+    let stderrCollector = LimitedPipeOutputCollector(maxOutputSize: Self.maxOutputSize)
     process.terminationHandler = { process in
+      ChildProcessTracker.shared.untrack(process)
       exitObserver.finish(process.terminationStatus)
     }
     stderrCollector.start(stderrPipe.fileHandleForReading)
 
     do {
       try process.run()
+      childLaunchReservation?.processDidLaunch()
     } catch {
+      childLaunchReservation?.cancelBeforeLaunch()
       stderrCollector.stop()
       throw ZstdError.commandFailed(exitCode: -1, stderr: "Failed to launch zstd: \(error.localizedDescription)")
     }
+    try? stdinPipe.fileHandleForReading.close()
+    try? stderrPipe.fileHandleForWriting.close()
 
     ChildProcessTracker.shared.track(process)
 
@@ -120,10 +150,8 @@ struct ZstdClient: Sendable {
       } onCancel: {
         ChildProcessTracker.shared.terminateIfRunning(process)
       }
-      ChildProcessTracker.shared.untrack(process)
       return digest
     } catch {
-      ChildProcessTracker.shared.untrack(process)
       ChildProcessTracker.shared.terminateIfRunning(process)
       stderrCollector.stop()
       try? stdinPipe.fileHandleForWriting.close()
@@ -133,8 +161,8 @@ struct ZstdClient: Sendable {
 
   private static func collectCompressionResult(
     process: Process,
-    exitObserver: ZstdProcessExitObserver,
-    stderrCollector: ZstdLimitedPipeCollector,
+    exitObserver: ProcessExitObserver,
+    stderrCollector: LimitedPipeOutputCollector,
     stdinPipe: Pipe,
     inputPath: String,
     offset: UInt64,
@@ -144,13 +172,24 @@ struct ZstdClient: Sendable {
     try await withThrowingTaskGroup(of: ZstdCompressionEvent.self) { group in
       group.addTask {
         defer { try? stdinPipe.fileHandleForWriting.close() }
-        let digest = try writeRangeToPipe(
-          inputPath: inputPath,
-          offset: offset,
-          size: size,
-          pipe: stdinPipe
-        )
-        return .streamed(digest)
+        do {
+          let digest = try writeRangeToPipe(
+            inputPath: inputPath,
+            offset: offset,
+            size: size,
+            pipe: stdinPipe
+          )
+          return .streamed(digest)
+        } catch is CancellationError {
+          throw CancellationError()
+        } catch let error as ZstdError {
+          throw error
+        } catch {
+          throw ZstdError.streamingFailed(
+            "Failed to stream \(size)-byte range at offset \(offset) from \(inputPath) into zstd: "
+              + error.localizedDescription
+          )
+        }
       }
       group.addTask {
         let status = try await waitForProcess(
@@ -175,10 +214,14 @@ struct ZstdClient: Sendable {
 
           if let streamedDigest, let exitCode {
             group.cancelAll()
-            let stderr = stderrCollector.stopAndReadRemaining()
+            let stderr = await stderrCollector.finish()
             guard exitCode == 0 else {
-              let stderrText = String(data: stderr, encoding: .utf8) ?? ""
+              let suffix = stderr.wasTruncated ? " (output truncated)" : ""
+              let stderrText = String(decoding: stderr.data, as: UTF8.self) + suffix
               throw ZstdError.commandFailed(exitCode: exitCode, stderr: stderrText)
+            }
+            guard stderr.wasTruncated == false else {
+              throw ZstdError.streamingFailed("zstd standard error exceeded the 1MB limit or did not close after exit")
             }
             return streamedDigest
           }
@@ -201,6 +244,7 @@ struct ZstdClient: Sendable {
     inputPath: String,
     destinationPath: String,
     offset: UInt64,
+    expectedSize: UInt64,
     diskWriteLimiter: ImageConcurrencyLimiter? = nil,
     timeout: TimeInterval? = nil
   ) async throws -> ZstdRangeDigest {
@@ -208,49 +252,59 @@ struct ZstdClient: Sendable {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: zstdPath)
     process.arguments = ["-q", "-d", "-c", inputPath]
+    if configuredPath == nil {
+      process.environment = bundledToolEnvironment()
+    }
     process.standardInput = FileHandle.nullDevice
 
     let stdoutPipe = Pipe()
     let stderrPipe = Pipe()
     process.standardOutput = stdoutPipe
     process.standardError = stderrPipe
+    let childLaunchReservation = try childProcessLease?.prepare(process)
+    defer { childLaunchReservation?.processDidExit() }
 
-    let exitObserver = ZstdProcessExitObserver()
-    let stderrCollector = ZstdLimitedPipeCollector(maxOutputSize: Self.maxOutputSize)
+    let exitObserver = ProcessExitObserver()
+    let stderrCollector = LimitedPipeOutputCollector(maxOutputSize: Self.maxOutputSize)
 
     process.terminationHandler = { process in
+      ChildProcessTracker.shared.untrack(process)
       exitObserver.finish(process.terminationStatus)
     }
     stderrCollector.start(stderrPipe.fileHandleForReading)
 
     do {
       try process.run()
+      childLaunchReservation?.processDidLaunch()
     } catch {
+      childLaunchReservation?.cancelBeforeLaunch()
       stderrCollector.stop()
       throw ZstdError.commandFailed(exitCode: -1, stderr: "Failed to launch zstd: \(error.localizedDescription)")
     }
+    try? stdoutPipe.fileHandleForWriting.close()
+    try? stderrPipe.fileHandleForWriting.close()
 
     ChildProcessTracker.shared.track(process)
 
     do {
       let digest = try await withTaskCancellationHandler {
-        try await Self.collectDecompressionResult(
+        let context = ZstdDecompressionContext(
           process: process,
           exitObserver: exitObserver,
           stderrCollector: stderrCollector,
           stdoutPipe: stdoutPipe,
           destinationPath: destinationPath,
           offset: offset,
+          expectedSize: expectedSize,
           diskWriteLimiter: diskWriteLimiter,
           timeout: timeout ?? Self.defaultTimeout
         )
+        return try await Self.collectDecompressionResult(context)
       } onCancel: {
         ChildProcessTracker.shared.terminateIfRunning(process)
       }
-      ChildProcessTracker.shared.untrack(process)
       return digest
     } catch {
-      ChildProcessTracker.shared.untrack(process)
       stderrCollector.stop()
       ChildProcessTracker.shared.terminateIfRunning(process)
       throw error
@@ -258,30 +312,35 @@ struct ZstdClient: Sendable {
   }
 
   private static func collectDecompressionResult(
-    process: Process,
-    exitObserver: ZstdProcessExitObserver,
-    stderrCollector: ZstdLimitedPipeCollector,
-    stdoutPipe: Pipe,
-    destinationPath: String,
-    offset: UInt64,
-    diskWriteLimiter: ImageConcurrencyLimiter?,
-    timeout: TimeInterval?
+    _ context: ZstdDecompressionContext
   ) async throws -> ZstdRangeDigest {
     try await withThrowingTaskGroup(of: ZstdDecompressionEvent.self) { group in
       group.addTask {
-        let digest = try await writePipeToFileRange(
-          pipe: stdoutPipe,
-          destinationPath: destinationPath,
-          offset: offset,
-          diskWriteLimiter: diskWriteLimiter
-        )
-        return .streamed(digest)
+        do {
+          let digest = try await writePipeToFileRange(
+            pipe: context.stdoutPipe,
+            destinationPath: context.destinationPath,
+            offset: context.offset,
+            expectedSize: context.expectedSize,
+            diskWriteLimiter: context.diskWriteLimiter
+          )
+          return .streamed(digest)
+        } catch is CancellationError {
+          throw CancellationError()
+        } catch let error as ZstdError {
+          throw error
+        } catch {
+          throw ZstdError.streamingFailed(
+            "Failed to write decompressed \(context.expectedSize)-byte range at offset \(context.offset) to "
+              + "\(context.destinationPath): \(error.localizedDescription)"
+          )
+        }
       }
       group.addTask {
         let status = try await waitForProcess(
-          exitObserver: exitObserver,
-          process: process,
-          timeout: timeout,
+          exitObserver: context.exitObserver,
+          process: context.process,
+          timeout: context.timeout,
           timeoutDescription: "zstd decompress"
         )
         return .exited(status)
@@ -300,16 +359,20 @@ struct ZstdClient: Sendable {
 
           if let streamedDigest, let exitCode {
             group.cancelAll()
-            let stderr = stderrCollector.stopAndReadRemaining()
+            let stderr = await context.stderrCollector.finish()
             guard exitCode == 0 else {
-              let stderrText = String(data: stderr, encoding: .utf8) ?? ""
+              let suffix = stderr.wasTruncated ? " (output truncated)" : ""
+              let stderrText = String(decoding: stderr.data, as: UTF8.self) + suffix
               throw ZstdError.commandFailed(exitCode: exitCode, stderr: stderrText)
+            }
+            guard stderr.wasTruncated == false else {
+              throw ZstdError.streamingFailed("zstd standard error exceeded the 1MB limit or did not close after exit")
             }
             return streamedDigest
           }
         }
       } catch {
-        ChildProcessTracker.shared.terminateIfRunning(process)
+        ChildProcessTracker.shared.terminateIfRunning(context.process)
         group.cancelAll()
         if Task.isCancelled {
           throw CancellationError()
@@ -351,6 +414,9 @@ struct ZstdClient: Sendable {
     guard size > 0 else {
       return ZstdRangeDigest(size: 0, digest: emptyDigest, isZero: true)
     }
+    guard let boundedSize = Int(exactly: size) else {
+      throw ZstdError.streamingFailed("Requested range is too large to process")
+    }
 
     let inputHandle = try FileHandle(forReadingFrom: URL(fileURLWithPath: inputPath))
     disableFileCache(for: inputHandle)
@@ -358,14 +424,14 @@ struct ZstdClient: Sendable {
     try inputHandle.seek(toOffset: offset)
 
     var hasher = SHA256()
-    var remaining = Int(size)
+    var remaining = boundedSize
     var bytesWritten: UInt64 = 0
     var isZero = true
 
     while remaining > 0 {
       try Task.checkCancellation()
       let readSize = min(Self.bufferSize, remaining)
-      guard let data = try inputHandle.read(upToCount: readSize), !data.isEmpty else {
+      guard let data = try readFileChunk(from: inputHandle, upToCount: readSize), !data.isEmpty else {
         throw ZstdError.streamingFailed("Unexpected EOF in \(inputPath)")
       }
       hasher.update(data: data)
@@ -384,6 +450,7 @@ struct ZstdClient: Sendable {
     pipe: Pipe,
     destinationPath: String,
     offset: UInt64,
+    expectedSize: UInt64,
     diskWriteLimiter: ImageConcurrencyLimiter?
   ) async throws -> ZstdRangeDigest {
     let inputHandle = pipe.fileHandleForReading
@@ -398,8 +465,15 @@ struct ZstdClient: Sendable {
 
     while true {
       try Task.checkCancellation()
-      let data = try inputHandle.read(upToCount: Self.bufferSize) ?? Data()
+      let data = try readFileChunk(from: inputHandle, upToCount: Self.bufferSize) ?? Data()
       guard !data.isEmpty else { break }
+      guard bytesWritten <= expectedSize,
+            UInt64(data.count) <= expectedSize - bytesWritten else
+      {
+        throw ZstdError.streamingFailed(
+          "Decompressed output exceeds the declared chunk size of \(expectedSize) bytes"
+        )
+      }
       hasher.update(data: data)
       if isZero, data.contains(where: { $0 != 0 }) {
         isZero = false
@@ -414,11 +488,17 @@ struct ZstdClient: Sendable {
       bytesWritten += UInt64(data.count)
     }
 
+    guard bytesWritten == expectedSize else {
+      throw ZstdError.streamingFailed(
+        "Decompressed output size mismatch: expected \(expectedSize) bytes, got \(bytesWritten)"
+      )
+    }
+
     return ZstdRangeDigest(size: bytesWritten, digest: hexDigest(hasher.finalize()), isZero: isZero)
   }
 
   private static func waitForProcess(
-    exitObserver: ZstdProcessExitObserver,
+    exitObserver: ProcessExitObserver,
     process: Process,
     timeout: TimeInterval?,
     timeoutDescription: String
@@ -483,103 +563,4 @@ private enum ZstdCompressionEvent {
 private enum ZstdDecompressionEvent {
   case streamed(ZstdRangeDigest)
   case exited(Int32)
-}
-
-private final class ZstdProcessExitObserver: @unchecked Sendable {
-  private let lock = NSLock()
-  private var status: Int32?
-  private var continuation: CheckedContinuation<Int32, Never>?
-
-  func finish(_ status: Int32) {
-    let continuation: CheckedContinuation<Int32, Never>?
-    lock.lock()
-    if self.status == nil {
-      self.status = status
-      continuation = self.continuation
-      self.continuation = nil
-    } else {
-      continuation = nil
-    }
-    lock.unlock()
-    continuation?.resume(returning: status)
-  }
-
-  func wait() async -> Int32 {
-    await withCheckedContinuation { continuation in
-      let existingStatus: Int32?
-      lock.lock()
-      if let status {
-        existingStatus = status
-      } else {
-        existingStatus = nil
-        self.continuation = continuation
-      }
-      lock.unlock()
-
-      if let existingStatus {
-        continuation.resume(returning: existingStatus)
-      }
-    }
-  }
-}
-
-private final class ZstdLimitedPipeCollector: @unchecked Sendable {
-  private let lock = NSLock()
-  private let maxOutputSize: Int
-  private var data = Data()
-  private weak var handle: FileHandle?
-
-  init(maxOutputSize: Int) {
-    self.maxOutputSize = maxOutputSize
-  }
-
-  func start(_ handle: FileHandle) {
-    lock.lock()
-    self.handle = handle
-    lock.unlock()
-
-    handle.readabilityHandler = { [weak self] handle in
-      let chunk = handle.availableData
-      guard !chunk.isEmpty else { return }
-      self?.append(chunk)
-    }
-  }
-
-  func stop() {
-    lock.lock()
-    let handle = handle
-    self.handle = nil
-    lock.unlock()
-    handle?.readabilityHandler = nil
-  }
-
-  func stopAndReadRemaining() -> Data {
-    lock.lock()
-    let handle = handle
-    self.handle = nil
-    lock.unlock()
-
-    handle?.readabilityHandler = nil
-    if let remaining = handle?.availableData, !remaining.isEmpty {
-      append(remaining)
-    }
-
-    lock.lock()
-    let output = data
-    lock.unlock()
-    return output
-  }
-
-  private func append(_ chunk: Data) {
-    lock.lock()
-    defer { lock.unlock() }
-
-    guard data.count < maxOutputSize else { return }
-    let remainingCapacity = maxOutputSize - data.count
-    if chunk.count <= remainingCapacity {
-      data.append(chunk)
-    } else {
-      data.append(chunk.prefix(remainingCapacity))
-    }
-  }
 }

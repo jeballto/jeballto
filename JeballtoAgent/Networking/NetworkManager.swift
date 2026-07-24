@@ -31,18 +31,22 @@ actor NetworkManager {
 
   /// Registers an existing MAC address (when loading persisted VMs)
   func registerMACAddress(_ macAddress: String) {
-    allocatedMACAddresses.insert(macAddress)
-    logDebug("Registered MAC address: \(macAddress)", category: "NetworkManager")
+    let normalized = macAddress.lowercased()
+    allocatedMACAddresses.insert(normalized)
+    logDebug("Registered MAC address: \(normalized)", category: "NetworkManager")
   }
 
   /// Releases a MAC address when a VM is deleted
   func releaseMACAddress(_ macAddress: String) {
-    allocatedMACAddresses.remove(macAddress)
-    logDebug("Released MAC address: \(macAddress)", category: "NetworkManager")
+    let normalized = macAddress.lowercased()
+    allocatedMACAddresses.remove(normalized)
+    logDebug("Released MAC address: \(normalized)", category: "NetworkManager")
   }
 
   /// Checks if a MAC address is already allocated
-  func isMACAddressAllocated(_ macAddress: String) -> Bool { allocatedMACAddresses.contains(macAddress) }
+  func isMACAddressAllocated(_ macAddress: String) -> Bool {
+    allocatedMACAddresses.contains(macAddress.lowercased())
+  }
 
   // MARK: - NAT IP Resolution
 
@@ -54,11 +58,17 @@ actor NetworkManager {
     maxAttempts: Int = 20,
     logFailure: Bool = true
   ) async -> String? {
+    guard maxAttempts > 0 else {
+      if logFailure {
+        logWarning("NAT IP resolution requires at least one attempt", category: "NetworkManager")
+      }
+      return nil
+    }
     let normalizedMAC = macAddress.lowercased()
 
     for attempt in 1 ... maxAttempts {
       if Task.isCancelled { return nil }
-      if let ip = lookupARPTable(macAddress: normalizedMAC) {
+      if let ip = await lookupARPTable(macAddress: normalizedMAC) {
         logInfo("Resolved NAT IP \(ip) for MAC \(normalizedMAC) (attempt \(attempt))", category: "NetworkManager")
         return ip
       }
@@ -102,40 +112,56 @@ actor NetworkManager {
   }
 
   /// Parses the system ARP table to find an IP for the given MAC address
-  private func lookupARPTable(macAddress: String) -> String? {
+  private func lookupARPTable(macAddress: String) async -> String? {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/usr/sbin/arp")
     process.arguments = ["-a", "-n"]
 
-    let pipe = Pipe()
-    process.standardOutput = pipe
-    process.standardError = FileHandle.nullDevice
+    let stdoutPipe = Pipe()
+    let stderrPipe = Pipe()
+    process.standardOutput = stdoutPipe
+    process.standardError = stderrPipe
+    process.standardInput = FileHandle.nullDevice
 
     do {
-      try process.run()
-      process.waitUntilExit()
+      let result = try await AsyncProcessRunner.run(
+        process: process,
+        stdoutPipe: stdoutPipe,
+        stderrPipe: stderrPipe,
+        options: AsyncProcessRunnerOptions(
+          timeout: 5,
+          timeoutDescription: "ARP table lookup",
+          maxOutputSize: 1024 * 1024
+        )
+      )
+      guard result.exitCode == 0 else {
+        logWarning("arp exited with status \(result.exitCode)", category: "NetworkManager")
+        return nil
+      }
+      guard let output = String(data: result.stdout, encoding: .utf8) else { return nil }
+      return parseARPOutput(output, normalizedTarget: normalizeMAC(macAddress))
+    } catch is CancellationError {
+      return nil
     } catch {
       logError("Failed to run arp: \(error)", category: "NetworkManager")
       return nil
     }
+  }
 
-    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-    guard let output = String(data: data, encoding: .utf8) else { return nil }
-
+  private func parseARPOutput(_ output: String, normalizedTarget: String) -> String? {
     // macOS arp strips leading zeros from MAC octets (e.g. 0c -> c),
     // so normalize both sides before comparing.
-    let normalizedTarget = normalizeMAC(macAddress)
-
     // ARP output format: ? (192.168.64.2) at aa:bb:cc:dd:ee:ff on bridge100 ...
     for line in output.components(separatedBy: "\n") {
       let fields = line.lowercased().split(separator: " ").map(String.init)
       guard let atIndex = fields.firstIndex(of: "at"),
             atIndex + 1 < fields.count,
-            fields[atIndex + 1] == normalizedTarget else { continue }
+            normalizeMAC(fields[atIndex + 1]) == normalizedTarget else { continue }
 
       // Extract IP between parentheses
       if let openParen = line.firstIndex(of: "("),
-         let closeParen = line.firstIndex(of: ")")
+         let closeParen = line.firstIndex(of: ")"),
+         openParen < closeParen
       {
         let ipStart = line.index(after: openParen)
         let ip = String(line[ipStart ..< closeParen])
