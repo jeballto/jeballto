@@ -1,14 +1,17 @@
 import Cocoa
+import Darwin
 import ServiceManagement
 import Sparkle
 import UniformTypeIdentifiers
 
-class StatusBarManager: NSObject, NSMenuDelegate {
+@MainActor
+final class StatusBarManager: NSObject, NSMenuDelegate {
   private var statusItem: NSStatusItem?
   private var apiToken: String?
   private var vmManager: VMManager?
-  private var serverStartTime: Date?
+  private var serverStartUptime: TimeInterval?
   private var updaterManager: UpdaterManager?
+  private var logDirectory = "\(NSHomeDirectory())/Library/Logs/Jeballto"
   private var countRefreshTimer: Timer?
 
   // Menu items that get updated dynamically
@@ -22,7 +25,7 @@ class StatusBarManager: NSObject, NSMenuDelegate {
   private var cachedRunningVMs: Int = 0
   private var cachedTotalVMs: Int = 0
 
-  deinit {
+  isolated deinit {
     countRefreshTimer?.invalidate()
   }
 
@@ -109,10 +112,17 @@ class StatusBarManager: NSObject, NSMenuDelegate {
     logInfo("Status bar icon configured", category: "StatusBar")
   }
 
-  func configure(token: String, vmManager: VMManager, serverStartTime: Date, initialVMCount: Int) {
+  func configure(
+    token: String,
+    vmManager: VMManager,
+    serverStartUptime: TimeInterval?,
+    initialVMCount: Int,
+    logDirectory: String
+  ) {
     apiToken = token
     self.vmManager = vmManager
-    self.serverStartTime = serverStartTime
+    self.serverStartUptime = serverStartUptime
+    self.logDirectory = logDirectory
     cachedTotalVMs = initialVMCount
 
     // Immediately reflect that initialization is complete
@@ -139,8 +149,8 @@ class StatusBarManager: NSObject, NSMenuDelegate {
     loginItemMenuItem?.state = SMAppService.mainApp.status == .enabled ? .on : .off
     betaUpdatesMenuItem?.state = updaterManager?.isBetaUpdatesEnabled == true ? .on : .off
 
-    if let startTime = serverStartTime {
-      let seconds = Int(Date().timeIntervalSince(startTime))
+    if let startUptime = serverStartUptime {
+      let seconds = max(0, Int(ProcessInfo.processInfo.systemUptime - startUptime))
       uptimeMenuItem?.title = "Uptime: \(formatUptime(seconds))"
     }
   }
@@ -148,19 +158,24 @@ class StatusBarManager: NSObject, NSMenuDelegate {
   private func startCountRefreshTimer() {
     countRefreshTimer?.invalidate()
     countRefreshTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
-      self?.refreshCachedCounts()
+      MainActor.assumeIsolated {
+        self?.refreshCachedCounts()
+      }
     }
   }
 
   private func refreshCachedCounts() {
     guard let vmManager else { return }
-    Task<Void, Never> {
+    Task<Void, Never> { [weak self] in
       let running = await vmManager.runningVMCount()
-      let total = await vmManager.vmCount()
-      await MainActor.run {
-        self.cachedRunningVMs = running
-        self.cachedTotalVMs = total
-        self.vmsMenuItem?.title = "VMs: \(running) running / \(total) total"
+      do {
+        let total = try await vmManager.vmCount()
+        guard let self else { return }
+        cachedRunningVMs = running
+        cachedTotalVMs = total
+        vmsMenuItem?.title = "VMs: \(running) running / \(total) total"
+      } catch {
+        logError("Failed to refresh VM count: \(error.localizedDescription)", category: "StatusBar")
       }
     }
   }
@@ -239,21 +254,19 @@ class StatusBarManager: NSObject, NSMenuDelegate {
   }
 
   @objc private func openCache() {
-    let path = "\(NSHomeDirectory())/Library/Caches/Jeballto"
-    let url = URL(fileURLWithPath: path, isDirectory: true)
+    let url = JeballtoCachePaths.root
     NSWorkspace.shared.open(url)
     logInfo("Opened Cache directory", category: "StatusBar")
   }
 
   @objc private func openLogs() {
-    let path = "\(NSHomeDirectory())/Library/Logs/Jeballto"
-    let url = URL(fileURLWithPath: path, isDirectory: true)
+    let url = URL(fileURLWithPath: logDirectory, isDirectory: true)
     NSWorkspace.shared.open(url)
     logInfo("Opened Logs directory", category: "StatusBar")
   }
 
   @objc private func exportLogs() {
-    let logDir = "\(NSHomeDirectory())/Library/Logs/Jeballto"
+    let logDir = logDirectory
     let fm = FileManager.default
 
     guard let entries = try? fm.contentsOfDirectory(atPath: logDir) else {
@@ -276,12 +289,14 @@ class StatusBarManager: NSObject, NSMenuDelegate {
       NSApp.activate(ignoringOtherApps: true)
       guard panel.runModal() == .OK, let destURL = panel.url else { return }
 
-      do {
-        let content = try Data(contentsOf: URL(fileURLWithPath: "\(logDir)/\(logFiles[0])"))
-        try content.write(to: destURL)
-        logInfo("Logs exported to \(destURL.path)", category: "StatusBar")
-      } catch {
-        logError("Failed to export logs: \(error)", category: "StatusBar")
+      let sourceURL = URL(fileURLWithPath: logDir, isDirectory: true).appendingPathComponent(logFiles[0])
+      Task<Void, Never> {
+        do {
+          try await Self.copyLogFile(from: sourceURL, to: destURL)
+          logInfo("Logs exported to \(destURL.path)", category: "StatusBar")
+        } catch {
+          logError("Failed to export logs: \(error.localizedDescription)", category: "StatusBar")
+        }
       }
     } else {
       panel.nameFieldStringValue = "jeballto-logs.zip"
@@ -289,22 +304,163 @@ class StatusBarManager: NSObject, NSMenuDelegate {
       NSApp.activate(ignoringOtherApps: true)
       guard panel.runModal() == .OK, let destURL = panel.url else { return }
 
-      let process = Process()
-      process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
-      process.arguments = ["-c", "-k", "--sequesterRsrc", logDir, destURL.path]
-
-      do {
-        try process.run()
-        process.waitUntilExit()
-        if process.terminationStatus == 0 {
+      let sourceURLs = logFiles.map {
+        URL(fileURLWithPath: logDir, isDirectory: true).appendingPathComponent($0)
+      }
+      Task<Void, Never> {
+        do {
+          try await Self.archiveLogs(sourceURLs, to: destURL)
           logInfo("Logs exported to \(destURL.path)", category: "StatusBar")
-        } else {
-          logError("ditto exited with status \(process.terminationStatus)", category: "StatusBar")
+        } catch {
+          logError("Failed to export logs: \(error.localizedDescription)", category: "StatusBar")
         }
-      } catch {
-        logError("Failed to export logs: \(error)", category: "StatusBar")
       }
     }
+  }
+
+  @concurrent private nonisolated static func copyLogFile(
+    from sourceURL: URL,
+    to destinationURL: URL
+  ) async throws {
+    guard sourceURL.standardizedFileURL != destinationURL.standardizedFileURL else {
+      throw StatusBarError.invalidLogDestination(destinationURL.path)
+    }
+    try validateLogFile(sourceURL)
+
+    let temporaryURL = temporaryExportURL(for: destinationURL)
+    defer { try? FileManager.default.removeItem(at: temporaryURL) }
+
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/cp")
+    process.arguments = ["-f", sourceURL.path, temporaryURL.path]
+    process.standardInput = FileHandle.nullDevice
+    let stdoutPipe = Pipe()
+    let stderrPipe = Pipe()
+    process.standardOutput = stdoutPipe
+    process.standardError = stderrPipe
+
+    let result = try await AsyncProcessRunner.run(
+      process: process,
+      stdoutPipe: stdoutPipe,
+      stderrPipe: stderrPipe,
+      options: AsyncProcessRunnerOptions(
+        timeout: 120,
+        timeoutDescription: "log file export",
+        maxOutputSize: 1024 * 1024
+      )
+    )
+    guard result.exitCode == 0 else {
+      throw StatusBarError.logCopyFailed(
+        exitCode: result.exitCode,
+        output: processOutput(result)
+      )
+    }
+    try promoteExport(at: temporaryURL, to: destinationURL)
+  }
+
+  @concurrent private nonisolated static func archiveLogs(
+    _ sourceURLs: [URL],
+    to destinationURL: URL
+  ) async throws {
+    guard sourceURLs.isEmpty == false else {
+      throw StatusBarError.logArchivePreparationFailed("No log files were selected")
+    }
+    for sourceURL in sourceURLs {
+      guard sourceURL.standardizedFileURL != destinationURL.standardizedFileURL else {
+        throw StatusBarError.invalidLogDestination(destinationURL.path)
+      }
+      try validateLogFile(sourceURL)
+    }
+
+    let stagingRoot = FileManager.default.temporaryDirectory
+      .appendingPathComponent("jeballto-log-export-\(UUID().uuidString)", isDirectory: true)
+    let stagingDirectory = stagingRoot.appendingPathComponent("Jeballto Logs", isDirectory: true)
+    do {
+      try FileManager.default.createDirectory(
+        at: stagingDirectory,
+        withIntermediateDirectories: true,
+        attributes: [.posixPermissions: 0o700]
+      )
+      for sourceURL in sourceURLs {
+        let stagedURL = stagingDirectory.appendingPathComponent(sourceURL.lastPathComponent)
+        try FileManager.default.copyItem(at: sourceURL, to: stagedURL)
+      }
+    } catch {
+      try? FileManager.default.removeItem(at: stagingRoot)
+      throw StatusBarError.logArchivePreparationFailed(error.localizedDescription)
+    }
+    defer { try? FileManager.default.removeItem(at: stagingRoot) }
+
+    let temporaryURL = temporaryExportURL(for: destinationURL)
+    defer { try? FileManager.default.removeItem(at: temporaryURL) }
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+    process.arguments = ["-c", "-k", "--sequesterRsrc", stagingDirectory.path, temporaryURL.path]
+    process.standardInput = FileHandle.nullDevice
+    let stdoutPipe = Pipe()
+    let stderrPipe = Pipe()
+    process.standardOutput = stdoutPipe
+    process.standardError = stderrPipe
+
+    let result = try await AsyncProcessRunner.run(
+      process: process,
+      stdoutPipe: stdoutPipe,
+      stderrPipe: stderrPipe,
+      options: AsyncProcessRunnerOptions(
+        timeout: 120,
+        timeoutDescription: "log archive export",
+        maxOutputSize: 1024 * 1024
+      )
+    )
+    guard result.exitCode == 0 else {
+      throw StatusBarError.logArchiveFailed(
+        exitCode: result.exitCode,
+        output: processOutput(result)
+      )
+    }
+    try promoteExport(at: temporaryURL, to: destinationURL)
+  }
+
+  private nonisolated static func validateLogFile(_ url: URL) throws {
+    let name = url.lastPathComponent
+    guard name.hasPrefix("agent-"), name.hasSuffix(".log") else {
+      throw StatusBarError.logFileUnavailable(url.path, "The file name is not a Jeballto agent log")
+    }
+    var info = stat()
+    guard lstat(url.path, &info) == 0 else {
+      throw StatusBarError.logFileUnavailable(url.path, String(cString: strerror(errno)))
+    }
+    guard info.st_mode & S_IFMT == S_IFREG else {
+      throw StatusBarError.logFileUnavailable(
+        url.path,
+        "The path is not a regular file; symbolic links and special files are refused"
+      )
+    }
+  }
+
+  private nonisolated static func temporaryExportURL(for destinationURL: URL) -> URL {
+    destinationURL.deletingLastPathComponent()
+      .appendingPathComponent(".\(destinationURL.lastPathComponent).\(UUID().uuidString).tmp")
+  }
+
+  private nonisolated static func promoteExport(at temporaryURL: URL, to destinationURL: URL) throws {
+    do {
+      if FileManager.default.fileExists(atPath: destinationURL.path) {
+        _ = try FileManager.default.replaceItemAt(destinationURL, withItemAt: temporaryURL)
+      } else {
+        try FileManager.default.moveItem(at: temporaryURL, to: destinationURL)
+      }
+    } catch {
+      throw StatusBarError.logExportPromotionFailed(destinationURL.path, error.localizedDescription)
+    }
+  }
+
+  private nonisolated static func processOutput(_ result: ProcessExecutionResult) -> String {
+    let data = result.stderr.isEmpty ? result.stdout : result.stderr
+    let output = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+    let suffix = result.stderr.isEmpty ? result.stdoutTruncated : result.stderrTruncated
+    let description = output.isEmpty ? "No error output" : output
+    return suffix ? "\(description) (output truncated)" : description
   }
 
   @objc private func showAbout() {
@@ -345,6 +501,32 @@ class StatusBarManager: NSObject, NSMenuDelegate {
       return "\(minutes)m \(seconds)s"
     } else {
       return "\(seconds)s"
+    }
+  }
+}
+
+private enum StatusBarError: Error, LocalizedError {
+  case invalidLogDestination(String)
+  case logFileUnavailable(String, String)
+  case logCopyFailed(exitCode: Int32, output: String)
+  case logArchivePreparationFailed(String)
+  case logArchiveFailed(exitCode: Int32, output: String)
+  case logExportPromotionFailed(String, String)
+
+  var errorDescription: String? {
+    switch self {
+    case .invalidLogDestination(let path):
+      "Refusing to replace an active log file at \(path)"
+    case .logFileUnavailable(let path, let reason):
+      "Log file is unavailable at \(path): \(reason)"
+    case .logCopyFailed(let exitCode, let output):
+      "Log copy process exited with status \(exitCode): \(output)"
+    case .logArchivePreparationFailed(let reason):
+      "Failed to prepare selected logs for export: \(reason)"
+    case .logArchiveFailed(let exitCode, let output):
+      "Log archive process exited with status \(exitCode): \(output)"
+    case .logExportPromotionFailed(let path, let reason):
+      "Failed to save exported logs at \(path): \(reason)"
     }
   }
 }

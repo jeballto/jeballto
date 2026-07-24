@@ -1,14 +1,17 @@
 import Foundation
 
 actor ImageConcurrencyLimiter {
-  private let limit: Int
-  private var available: Int
-  private let retryDelay: UInt64 = 1_000_000
+  private var limit: Int
+  private var inUse = 0
+  private var waiters: [(id: UUID, continuation: CheckedContinuation<Void, Error>)] = []
 
   init(limit: Int) {
-    let boundedLimit = max(1, limit)
-    self.limit = boundedLimit
-    available = boundedLimit
+    self.limit = max(1, limit)
+  }
+
+  func updateLimit(_ newLimit: Int) {
+    limit = max(1, newLimit)
+    resumeWaitersIfPossible()
   }
 
   func withPermit<T: Sendable>(
@@ -21,17 +24,43 @@ actor ImageConcurrencyLimiter {
   }
 
   private func acquire() async throws {
-    while true {
-      try Task.checkCancellation()
-      if available > 0 {
-        available -= 1
-        return
+    try Task.checkCancellation()
+    if inUse < limit {
+      inUse += 1
+      return
+    }
+
+    let waiterId = UUID()
+    try await withTaskCancellationHandler {
+      try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+        if Task.isCancelled {
+          continuation.resume(throwing: CancellationError())
+        } else {
+          waiters.append((waiterId, continuation))
+        }
       }
-      try await Task.sleep(nanoseconds: retryDelay)
+    } onCancel: {
+      Task<Void, Never> { await self.cancelWaiter(waiterId) }
     }
   }
 
   private func release() {
-    available = min(limit, available + 1)
+    precondition(inUse > 0, "Image concurrency permit released without being acquired")
+    inUse -= 1
+    resumeWaitersIfPossible()
+  }
+
+  private func cancelWaiter(_ id: UUID) {
+    guard let index = waiters.firstIndex(where: { $0.id == id }) else { return }
+    let waiter = waiters.remove(at: index)
+    waiter.continuation.resume(throwing: CancellationError())
+  }
+
+  private func resumeWaitersIfPossible() {
+    while inUse < limit, waiters.isEmpty == false {
+      let waiter = waiters.removeFirst()
+      inUse += 1
+      waiter.continuation.resume()
+    }
   }
 }

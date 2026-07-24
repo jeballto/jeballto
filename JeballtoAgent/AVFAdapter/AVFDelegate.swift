@@ -3,7 +3,7 @@ import Virtualization
 
 /// Delegate implementation for VZVirtualMachine that integrates with the EventBus
 /// See: https://developer.apple.com/documentation/virtualization/vzvirtualmachinedelegate
-class AVFDelegate: NSObject, VZVirtualMachineDelegate {
+final class AVFDelegate: NSObject, VZVirtualMachineDelegate {
   /// VM identifier for event correlation
   let vmId: UUID
 
@@ -30,8 +30,6 @@ class AVFDelegate: NSObject, VZVirtualMachineDelegate {
     let errorMessage = "Virtual machine \(vmId.uuidString) stopped with error: \(error.localizedDescription)"
     logError(errorMessage, category: "AVF")
 
-    eventBus.publish(.errorOccurred(vmId: vmId, error: error.localizedDescription))
-
     onError?(error)
   }
 
@@ -53,10 +51,5 @@ class AVFDelegate: NSObject, VZVirtualMachineDelegate {
   ) {
     let errorMessage = "Network device disconnected for VM \(vmId.uuidString): \(error.localizedDescription)"
     logWarning(errorMessage, category: "AVF")
-
-    // Publish error event for network issue
-    eventBus.publish(
-      .errorOccurred(vmId: vmId, error: "Network attachment disconnected: \(error.localizedDescription)")
-    )
   }
 }
