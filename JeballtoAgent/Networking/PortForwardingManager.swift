@@ -42,14 +42,16 @@ actor PortForwardingManager {
 
   /// Registers an existing port (when loading persisted VMs)
   func registerPort(_ port: Int) {
-    allocatedPorts.insert(port)
-    logDebug("Registered SSH port: \(port)", category: "PortForwarding")
+    if allocatedPorts.insert(port).inserted {
+      logDebug("Registered SSH port: \(port)", category: "PortForwarding")
+    }
   }
 
   /// Releases a port when VM is deleted
   func releasePort(_ port: Int) {
-    allocatedPorts.remove(port)
-    logDebug("Released SSH port: \(port)", category: "PortForwarding")
+    if allocatedPorts.remove(port) != nil {
+      logDebug("Released SSH port: \(port)", category: "PortForwarding")
+    }
   }
 
   /// Checks if a port is already allocated
@@ -57,15 +59,40 @@ actor PortForwardingManager {
 
   // MARK: - SSH Port Forwarding Setup
 
+  /// Atomically allocates a port and starts SSH forwarding.
+  /// Returns the existing active port when forwarding is already configured for the VM.
+  func allocateAndSetupSSHForwarding(vmId: UUID, vmIPAddress: String) throws -> Int? {
+    if let existing = activeProxies[vmId] {
+      if existing.isRunning {
+        return existing.localPort
+      }
+      let port = existing.localPort
+      existing.stop()
+      activeProxies.removeValue(forKey: vmId)
+      releasePort(port)
+    }
+
+    guard let port = allocatePort() else { return nil }
+    do {
+      try setupSSHForwarding(vmId: vmId, vmIPAddress: vmIPAddress, sshPort: port)
+      return port
+    } catch {
+      releasePort(port)
+      throw error
+    }
+  }
+
   /// Sets up SSH port forwarding for a VM
   /// Creates TCP proxy: localhost:sshPort -> VM_NAT_IP:22
-  func setupSSHForwarding(vmId: UUID, vmIPAddress: String, sshPort: Int) throws {
+  private func setupSSHForwarding(vmId: UUID, vmIPAddress: String, sshPort: Int) throws {
     let forwardInfo = "localhost:\(sshPort) -> \(vmIPAddress):22"
     logInfo("Setting up SSH forwarding for VM \(vmId): \(forwardInfo)", category: "PortForwarding")
 
     // Check if proxy already exists
-    if activeProxies[vmId] != nil {
-      logWarning("SSH forwarding already active for VM \(vmId)", category: "PortForwarding")
+    if let existing = activeProxies[vmId] {
+      guard existing.localPort == sshPort, existing.isRunning else {
+        throw TCPProxyError.forwardingAlreadyActive(vmId: vmId, port: existing.localPort)
+      }
       return
     }
 
@@ -73,9 +100,9 @@ actor PortForwardingManager {
     let proxy = TCPProxy(localPort: sshPort, remoteHost: vmIPAddress, remotePort: 22, vmId: vmId)
 
     // Set failure callback to clean up stale state if listener dies
-    proxy.onFailure = { [weak self] in
-      guard let self else { return }
-      Task { await self.handleProxyFailure(vmId: vmId, type: .ssh) }
+    proxy.onFailure = { [weak self, weak proxy] in
+      guard let self, let proxy else { return }
+      Task<Void, Never> { await self.handleProxyFailure(vmId: vmId, type: .ssh, failedProxy: proxy) }
     }
 
     // Start proxy
@@ -99,12 +126,13 @@ actor PortForwardingManager {
       proxy.stop()
       activeProxies.removeValue(forKey: vmId)
       releasePort(port)
+      eventBus.publish(.sshPortReleased(vmId: vmId))
       logInfo("SSH forwarding stopped for VM \(vmId), port \(port) released", category: "PortForwarding")
     }
   }
 
   /// Checks if SSH forwarding is active for a VM
-  func isSSHForwardingActive(vmId: UUID) -> Bool { activeProxies[vmId] != nil }
+  func isSSHForwardingActive(vmId: UUID) -> Bool { activeProxies[vmId]?.isRunning == true }
 
   // MARK: - VNC Port Allocation
 
@@ -122,14 +150,16 @@ actor PortForwardingManager {
 
   /// Registers an existing VNC port (when loading persisted VMs)
   func registerVNCPort(_ port: Int) {
-    allocatedVNCPorts.insert(port)
-    logDebug("Registered VNC port: \(port)", category: "PortForwarding")
+    if allocatedVNCPorts.insert(port).inserted {
+      logDebug("Registered VNC port: \(port)", category: "PortForwarding")
+    }
   }
 
   /// Releases a VNC port
   func releaseVNCPort(_ port: Int) {
-    allocatedVNCPorts.remove(port)
-    logDebug("Released VNC port: \(port)", category: "PortForwarding")
+    if allocatedVNCPorts.remove(port) != nil {
+      logDebug("Released VNC port: \(port)", category: "PortForwarding")
+    }
   }
 
   /// Checks if a VNC port is already allocated
@@ -137,15 +167,40 @@ actor PortForwardingManager {
 
   // MARK: - VNC Port Forwarding Setup
 
+  /// Atomically allocates a port and starts VNC forwarding.
+  /// Returns the existing active port when forwarding is already configured for the VM.
+  func allocateAndSetupVNCForwarding(vmId: UUID, vmIPAddress: String) throws -> Int? {
+    if let existing = activeVNCProxies[vmId] {
+      if existing.isRunning {
+        return existing.localPort
+      }
+      let port = existing.localPort
+      existing.stop()
+      activeVNCProxies.removeValue(forKey: vmId)
+      releaseVNCPort(port)
+    }
+
+    guard let port = allocateVNCPort() else { return nil }
+    do {
+      try setupVNCForwarding(vmId: vmId, vmIPAddress: vmIPAddress, vncPort: port)
+      return port
+    } catch {
+      releaseVNCPort(port)
+      throw error
+    }
+  }
+
   /// Sets up VNC port forwarding for a VM
   /// Creates TCP proxy: localhost:vncPort -> VM_NAT_IP:5900
-  func setupVNCForwarding(vmId: UUID, vmIPAddress: String, vncPort: Int) throws {
+  private func setupVNCForwarding(vmId: UUID, vmIPAddress: String, vncPort: Int) throws {
     let forwardInfo = "localhost:\(vncPort) -> \(vmIPAddress):5900"
     logInfo("Setting up VNC forwarding for VM \(vmId): \(forwardInfo)", category: "PortForwarding")
 
     // Check if proxy already exists
-    if activeVNCProxies[vmId] != nil {
-      logWarning("VNC forwarding already active for VM \(vmId)", category: "PortForwarding")
+    if let existing = activeVNCProxies[vmId] {
+      guard existing.localPort == vncPort, existing.isRunning else {
+        throw TCPProxyError.forwardingAlreadyActive(vmId: vmId, port: existing.localPort)
+      }
       return
     }
 
@@ -153,9 +208,9 @@ actor PortForwardingManager {
     let proxy = TCPProxy(localPort: vncPort, remoteHost: vmIPAddress, remotePort: 5900, vmId: vmId)
 
     // Set failure callback to clean up stale state if listener dies
-    proxy.onFailure = { [weak self] in
-      guard let self else { return }
-      Task { await self.handleProxyFailure(vmId: vmId, type: .vnc) }
+    proxy.onFailure = { [weak self, weak proxy] in
+      guard let self, let proxy else { return }
+      Task<Void, Never> { await self.handleProxyFailure(vmId: vmId, type: .vnc, failedProxy: proxy) }
     }
 
     // Start proxy
@@ -179,20 +234,21 @@ actor PortForwardingManager {
       proxy.stop()
       activeVNCProxies.removeValue(forKey: vmId)
       releaseVNCPort(port)
+      eventBus.publish(.vncPortReleased(vmId: vmId))
       logInfo("VNC forwarding stopped for VM \(vmId), port \(port) released", category: "PortForwarding")
     }
   }
 
   /// Checks if VNC forwarding is active for a VM
-  func isVNCForwardingActive(vmId: UUID) -> Bool { activeVNCProxies[vmId] != nil }
+  func isVNCForwardingActive(vmId: UUID) -> Bool { activeVNCProxies[vmId]?.isRunning == true }
 
   // MARK: - Statistics
 
   /// Returns number of active SSH forwarding sessions
-  var activeForwardingCount: Int { activeProxies.count }
+  var activeForwardingCount: Int { activeProxies.values.count(where: \.isRunning) }
 
   /// Returns number of active VNC forwarding sessions
-  var activeVNCForwardingCount: Int { activeVNCProxies.count }
+  var activeVNCForwardingCount: Int { activeVNCProxies.values.count(where: \.isRunning) }
 
   /// Returns all allocated ports
   func getAllocatedPorts() -> [Int] { Array(allocatedPorts).sorted() }
@@ -204,27 +260,22 @@ actor PortForwardingManager {
 
   private enum ProxyType { case ssh, vnc }
 
-  /// Cleans up a proxy that failed unexpectedly (listener died)
-  private func handleProxyFailure(vmId: UUID, type: ProxyType) {
+  /// Marks a proxy unavailable after its listener dies. The port reservation remains owned by the VM until a
+  /// caller explicitly disables or repairs forwarding, preventing another VM from taking a still-persisted port.
+  private func handleProxyFailure(vmId: UUID, type: ProxyType, failedProxy: TCPProxy) {
     switch type {
     case .ssh:
-      if let proxy = activeProxies.removeValue(forKey: vmId) {
-        let port = proxy.localPort
-        releasePort(port)
-        logWarning(
-          "SSH proxy failed for VM \(vmId) on port \(port), cleaned up stale state",
-          category: "PortForwarding"
-        )
-      }
+      guard activeProxies[vmId] === failedProxy else { return }
+      logWarning(
+        "SSH proxy failed for VM \(vmId) on port \(failedProxy.localPort), forwarding is unavailable until repaired",
+        category: "PortForwarding"
+      )
     case .vnc:
-      if let proxy = activeVNCProxies.removeValue(forKey: vmId) {
-        let port = proxy.localPort
-        releaseVNCPort(port)
-        logWarning(
-          "VNC proxy failed for VM \(vmId) on port \(port), cleaned up stale state",
-          category: "PortForwarding"
-        )
-      }
+      guard activeVNCProxies[vmId] === failedProxy else { return }
+      logWarning(
+        "VNC proxy failed for VM \(vmId) on port \(failedProxy.localPort), forwarding is unavailable until repaired",
+        category: "PortForwarding"
+      )
     }
   }
 
