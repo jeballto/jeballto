@@ -18,16 +18,14 @@ struct EventBusTests {
     let vmId = UUID()
     bus.publish(.vmCreated(vmId: vmId, name: "one"))
 
-    let delivered = await waitUntil {
-      recorder.count == 1
-    }
-    #expect(delivered)
+    await bus.waitUntilIdle()
+    #expect(recorder.count == 1)
 
     bus.unsubscribe(token)
     #expect(bus.subscriberCount == 0)
 
     bus.publish(.vmCreated(vmId: UUID(), name: "two"))
-    try? await Task.sleep(nanoseconds: 50_000_000)
+    await bus.waitUntilIdle()
 
     #expect(recorder.count == 1)
   }
@@ -43,8 +41,8 @@ struct EventBusTests {
     bus.publish(.vmRunning(vmId: vm1))
     bus.publish(.vmCreated(vmId: vm2, name: "two"))
 
-    let trimmed = await waitUntil { bus.eventCount == 3 }
-    #expect(trimmed)
+    await bus.waitUntilIdle()
+    #expect(bus.eventCount == 3)
 
     let all = bus.getAllEvents(limit: 10)
     #expect(all.count == 3)
@@ -63,8 +61,8 @@ struct EventBusTests {
       bus.publish(.stateChanged(vmId: vmId, from: .created, to: .stopped))
     }
 
-    let ready = await waitUntil { bus.eventCount == 5 }
-    #expect(ready)
+    await bus.waitUntilIdle()
+    #expect(bus.eventCount == 5)
 
     let limited = bus.getEvents(forVM: vmId, limit: 2)
     #expect(limited.count == 2)
@@ -78,11 +76,34 @@ struct EventBusTests {
     bus.publish(.imagePulled(reference: "registry.example.com/vm:latest"))
     bus.publish(.imagePushFailed(reference: "registry.example.com/vm:latest", error: "timeout"))
 
-    let ready = await waitUntil { bus.eventCount == 2 }
-    #expect(ready)
+    await bus.waitUntilIdle()
+    #expect(bus.eventCount == 2)
 
     let vmEvents = bus.getEvents(forVM: vmId, limit: 10)
     #expect(vmEvents.isEmpty)
+  }
+
+  @Test
+  func subscriberDeliveryPreservesPublishOrder() async throws {
+    let bus = EventBus(maxHistorySize: 20)
+    let recorder = EventRecorder()
+    let vmId = UUID()
+
+    bus.subscribe { event in
+      recorder.append(event)
+    }
+
+    bus.publish(.vmCreated(vmId: vmId, name: "one"))
+    bus.publish(.vmStarting(vmId: vmId))
+    bus.publish(.vmRunning(vmId: vmId))
+
+    await bus.waitUntilIdle()
+    #expect(recorder.count == 3)
+    #expect(recorder.events == [
+      .vmCreated(vmId: vmId, name: "one"),
+      .vmStarting(vmId: vmId),
+      .vmRunning(vmId: vmId),
+    ])
   }
 
   @Test
@@ -91,29 +112,46 @@ struct EventBusTests {
     bus.publish(.vmCreated(vmId: UUID(), name: "one"))
     bus.publish(.vmCreated(vmId: UUID(), name: "two"))
 
-    let hasEvents = await waitUntil { bus.eventCount == 2 }
-    #expect(hasEvents)
+    await bus.waitUntilIdle()
+    #expect(bus.eventCount == 2)
 
     bus.clearHistory()
-    let cleared = await waitUntil { bus.eventCount == 0 }
-    #expect(cleared)
+    await bus.waitUntilIdle()
+    #expect(bus.eventCount == 0)
     #expect(bus.getAllEvents(limit: 10).isEmpty)
+  }
+
+  @Test
+  func negativeHistoryAndQueryLimitsAreSafe() async {
+    let bus = EventBus(maxHistorySize: -1)
+    bus.publish(.vmCreated(vmId: UUID(), name: "one"))
+
+    await bus.waitUntilIdle()
+    #expect(bus.eventCount == 0)
+    #expect(bus.getAllEvents(limit: -1).isEmpty)
+    #expect(bus.getEvents(forVM: UUID(), limit: -1).isEmpty)
   }
 }
 
 private final class EventRecorder: @unchecked Sendable {
   private let lock = NSLock()
-  private var events: [VMEvent] = []
+  private var recordedEvents: [VMEvent] = []
 
   var count: Int {
     lock.lock()
     defer { lock.unlock() }
-    return events.count
+    return recordedEvents.count
+  }
+
+  var events: [VMEvent] {
+    lock.lock()
+    defer { lock.unlock() }
+    return recordedEvents
   }
 
   func append(_ event: VMEvent) {
     lock.lock()
     defer { lock.unlock() }
-    events.append(event)
+    recordedEvents.append(event)
   }
 }
