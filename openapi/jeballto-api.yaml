@@ -53,19 +53,41 @@ paths:
       operationId: getHealth
       security: []
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
         '200':
           description: Agent is healthy
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/HealthResponse'
+        '500':
+          description: VM persistence could not be read while building the health response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: HEALTH_CHECK_FAILED
+                  message: Failed to load VM persistence
 
   /vms:
     post:
       tags:
         - vms
       summary: Create VM
-      description: Create a new virtual machine
+      description: >
+        Create a blank virtual machine or create one from a Jeballto OCI image.
+        When `image` is provided, the endpoint performs a validated blocking
+        pull before creating the VM. The image must use Jeballto VM Bundle
+        Format v1. No VM is created when the implicit pull fails.
       operationId: createVM
       requestBody:
         required: true
@@ -74,6 +96,31 @@ paths:
             schema:
               $ref: '#/components/schemas/CreateVMRequest'
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
+        '503':
+          description: Destructive maintenance is active or the image registry is unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                maintenance:
+                  value:
+                    error:
+                      code: MAINTENANCE_IN_PROGRESS
+                      message: The agent is performing destructive maintenance
+                registryUnavailable:
+                  value:
+                    error:
+                      code: IMAGE_PULL_FAILED
+                      message: Registry is unavailable
         '201':
           description: VM created successfully
           content:
@@ -81,13 +128,91 @@ paths:
               schema:
                 $ref: '#/components/schemas/VMResponse'
         '400':
-          $ref: '#/components/responses/BadRequest'
+          description: Invalid request, image reference, or Jeballto image artifact
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                invalidRequest:
+                  value:
+                    error:
+                      code: INVALID_REQUEST
+                      message: Invalid request
+                invalidReference:
+                  value:
+                    error:
+                      code: INVALID_REFERENCE
+                      message: 'Invalid image reference: registry is required'
+                unsupportedImageFormat:
+                  value:
+                    error:
+                      code: UNSUPPORTED_IMAGE_FORMAT
+                      message: >-
+                        Unsupported image format: unversioned images created
+                        before 1.0.0 are not supported; re-push the VM using
+                        Jeballto VM Bundle Format v1
+                invalidImage:
+                  value:
+                    error:
+                      code: INVALID_IMAGE
+                      message: 'Invalid image: Invalid VM image config'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '409':
-          $ref: '#/components/responses/CapabilityUnavailable'
+          description: A required capability is unavailable or the matching local image is in use
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                capabilityUnavailable:
+                  value:
+                    error:
+                      code: CAPABILITY_UNAVAILABLE
+                      message: Required image capability is unavailable
+                imageInUse:
+                  value:
+                    error:
+                      code: IMAGE_IN_USE
+                      message: The matching local image is in use
+        '499':
+          description: The implicit image pull used for VM creation was cancelled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: IMAGE_PULL_CANCELLED
+                  message: Image pull cancelled
         '500':
-          $ref: '#/components/responses/InternalError'
+          description: VM creation or its implicit image pull failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                createFailed:
+                  value:
+                    error:
+                      code: CREATE_FAILED
+                      message: VM creation failed
+                imagePullFailed:
+                  value:
+                    error:
+                      code: IMAGE_PULL_FAILED
+                      message: Image pull failed
+        '504':
+          description: The implicit image pull used for VM creation timed out
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: IMAGE_PULL_FAILED
+                  message: Image pull timed out
 
     get:
       tags:
@@ -114,12 +239,22 @@ paths:
             minimum: 0
             default: 0
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
         '200':
           description: List of VMs
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/VMListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '500':
@@ -130,10 +265,10 @@ paths:
         - vms
       summary: Wipe all VMs
       description: >
-        Delete all VMs and clear the database. Requires confirm=true query
-        parameter as a safety guard. Active asynchronous image operations are
-        cancelled before VM deletion starts. Each VM is force-stopped before
-        deletion.
+        Attempt to delete all VMs and clear their database records. Requires
+        confirm=true as a safety guard. Active image operations and
+        Jeballtofile executions are cancelled first. Each VM is force-stopped
+        before deletion. A 200 response can report per-VM failures.
       operationId: wipeAllVMs
       parameters:
         - name: confirm
@@ -145,6 +280,14 @@ paths:
             enum:
               - 'true'
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
         '200':
           description: Wipe completed
           content:
@@ -163,6 +306,16 @@ paths:
                   message: "Add ?confirm=true to confirm deletion of all VMs"
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Another destructive maintenance operation is already running
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: MAINTENANCE_IN_PROGRESS
+                  message: Another destructive maintenance operation is already running
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -176,6 +329,14 @@ paths:
       parameters:
         - $ref: '#/components/parameters/vmId'
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
         '200':
           description: VM details
           content:
@@ -196,8 +357,8 @@ paths:
         - vms
       summary: Delete VM
       description: >
-        Delete a virtual machine and its files. The VM must be stopped first
-        unless force=true is used, which auto-stops the VM before deletion.
+        Delete a virtual machine and its files. VMs in created, stopped, or error
+        state can be deleted directly. Use force=true to stop an active VM first.
       operationId: deleteVM
       parameters:
         - $ref: '#/components/parameters/vmId'
@@ -209,6 +370,16 @@ paths:
             type: boolean
             default: false
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
+        '503':
+          $ref: '#/components/responses/MaintenanceInProgress'
         '204':
           description: VM deleted successfully
         '400':
@@ -238,8 +409,11 @@ paths:
         Update name and/or resources (CPU, memory, disk) for a VM.
         Name can be changed in any non-deleted state.
         Resource changes require the VM to be stopped or created.
-        Disk can only be enlarged, not shrunk. Resource changes take effect on next VM start.
-        Guest OS filesystem must be expanded separately after disk resize.
+        Disk can only be enlarged, not shrunk. For a created VM, the requested
+        size is used when installation creates Disk.img. For a stopped,
+        installed VM, Disk.img is resized before the update succeeds. CPU and
+        memory changes take effect on next VM start. The guest OS filesystem
+        must be expanded separately after resizing an installed disk.
       operationId: updateVM
       parameters:
         - $ref: '#/components/parameters/vmId'
@@ -250,6 +424,16 @@ paths:
             schema:
               $ref: '#/components/schemas/UpdateVMRequest'
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
+        '503':
+          $ref: '#/components/responses/MaintenanceInProgress'
         '200':
           description: VM updated successfully
           content:
@@ -272,6 +456,8 @@ paths:
                 error:
                   code: INVALID_STATE
                   message: "VM must be stopped or created to update resources"
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -285,6 +471,16 @@ paths:
       parameters:
         - $ref: '#/components/parameters/vmId'
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
+        '503':
+          $ref: '#/components/responses/MaintenanceInProgress'
         '200':
           description: VM started
           content:
@@ -298,7 +494,7 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          description: VM limit reached or required capability is unavailable
+          description: VM limit reached, VM state conflict, or required capability is unavailable
           content:
             application/json:
               schema:
@@ -309,6 +505,11 @@ paths:
                     error:
                       code: VM_LIMIT_REACHED
                       message: Cannot start VM - 2 VMs already active (max 2)
+                invalidState:
+                  value:
+                    error:
+                      code: INVALID_STATE
+                      message: Cannot start VM from its current state
                 capabilityUnavailable:
                   value:
                     error:
@@ -322,13 +523,27 @@ paths:
       tags:
         - lifecycle
       summary: Stop VM
-      description: Stop a virtual machine. Idempotent when the VM is already stopped.
+      description: >
+        Stop a virtual machine. Idempotent when the VM is already stopped. In
+        error state, this is also the recovery action: a complete installed VM
+        becomes stopped, while an incomplete installation is cleaned and
+        becomes created so installation can be retried.
       operationId: stopVM
       parameters:
         - $ref: '#/components/parameters/vmId'
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
+        '503':
+          $ref: '#/components/responses/MaintenanceInProgress'
         '200':
-          description: VM stopped, or already stopped
+          description: VM stopped, already stopped, or recovered from error
           content:
             application/json:
               schema:
@@ -340,7 +555,22 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          $ref: '#/components/responses/CapabilityUnavailable'
+          description: VM state conflict or required capability is unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                invalidState:
+                  value:
+                    error:
+                      code: INVALID_STATE
+                      message: Cannot stop VM from its current state
+                capabilityUnavailable:
+                  value:
+                    error:
+                      code: CAPABILITY_UNAVAILABLE
+                      message: "macOSVirtualization is unavailable: Requires Apple Silicon"
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -354,6 +584,16 @@ paths:
       parameters:
         - $ref: '#/components/parameters/vmId'
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
+        '503':
+          $ref: '#/components/responses/MaintenanceInProgress'
         '200':
           description: VM paused
           content:
@@ -367,7 +607,22 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          $ref: '#/components/responses/CapabilityUnavailable'
+          description: VM state conflict or required capability is unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                invalidState:
+                  value:
+                    error:
+                      code: INVALID_STATE
+                      message: Cannot pause VM from its current state
+                capabilityUnavailable:
+                  value:
+                    error:
+                      code: CAPABILITY_UNAVAILABLE
+                      message: "macOSVirtualization is unavailable: Requires Apple Silicon"
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -381,6 +636,16 @@ paths:
       parameters:
         - $ref: '#/components/parameters/vmId'
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
+        '503':
+          $ref: '#/components/responses/MaintenanceInProgress'
         '200':
           description: VM resumed
           content:
@@ -394,7 +659,27 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          $ref: '#/components/responses/CapabilityUnavailable'
+          description: VM limit reached, VM state conflict, or required capability is unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                vmLimit:
+                  value:
+                    error:
+                      code: VM_LIMIT_REACHED
+                      message: Cannot resume VM - 2 VMs already active (max 2)
+                invalidState:
+                  value:
+                    error:
+                      code: INVALID_STATE
+                      message: Cannot resume VM from its current state
+                capabilityUnavailable:
+                  value:
+                    error:
+                      code: CAPABILITY_UNAVAILABLE
+                      message: "macOSVirtualization is unavailable: Requires Apple Silicon"
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -414,6 +699,16 @@ paths:
             schema:
               $ref: '#/components/schemas/InstallVMRequest'
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
+        '503':
+          $ref: '#/components/responses/MaintenanceInProgress'
         '202':
           description: Installation started
           content:
@@ -427,7 +722,7 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          description: VM limit reached, installation already running, or required capability is unavailable
+          description: VM limit reached, invalid VM state, or required capability is unavailable
           content:
             application/json:
               schema:
@@ -441,7 +736,7 @@ paths:
                 installInProgress:
                   value:
                     error:
-                      code: INSTALL_IN_PROGRESS
+                      code: INVALID_STATE
                       message: Installation is already in progress for this VM
                 capabilityUnavailable:
                   value:
@@ -461,6 +756,14 @@ paths:
       parameters:
         - $ref: '#/components/parameters/vmId'
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
         '200':
           description: Installation status
           content:
@@ -483,11 +786,19 @@ paths:
       summary: Get SSH info
       description: >
         Get SSH connection information. The VM must be installed (not in
-        CREATED or INSTALLING state).
+        created or installing state).
       operationId: getSSHInfo
       parameters:
         - $ref: '#/components/parameters/vmId'
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
         '200':
           description: SSH connection info
           content:
@@ -520,13 +831,38 @@ paths:
       description: >
         Enable SSH port forwarding for a VM. Allocates a host port from the
         configured SSH port range and creates a TCP proxy to the VM's SSH
-        server (port 22). The VM must be RUNNING and have a detected NAT IP.
+        server (port 22). The VM must be running and have a detected NAT IP.
         Idempotent - if SSH is already enabled, returns the current connection info.
         Remote Login must be enabled in the macOS guest.
       operationId: enableSSH
       parameters:
         - $ref: '#/components/parameters/vmId'
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
+        '503':
+          description: Destructive maintenance is active or no configured SSH port is available
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                maintenance:
+                  value:
+                    error:
+                      code: MAINTENANCE_IN_PROGRESS
+                      message: The agent is performing destructive maintenance
+                portCapacity:
+                  value:
+                    error:
+                      code: SSH_ENABLE_FAILED
+                      message: No available SSH ports in configured range
         '200':
           description: SSH forwarding enabled
           content:
@@ -540,7 +876,9 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          description: VM is not in RUNNING state or required capability is unavailable
+          description: >
+            VM is not running, NAT setup is not ready, another operation owns
+            this VM, or the required capability is unavailable
           content:
             application/json:
               schema:
@@ -550,12 +888,17 @@ paths:
                   value:
                     error:
                       code: INVALID_STATE
-                      message: "VM must be RUNNING to enable SSH forwarding"
+                      message: "VM must be running to enable SSH forwarding"
                 capabilityUnavailable:
                   value:
                     error:
                       code: CAPABILITY_UNAVAILABLE
                       message: "portForwarding is unavailable: Capability is disabled"
+                natNotReady:
+                  value:
+                    error:
+                      code: SSH_ENABLE_FAILED
+                      message: VM has no NAT IP address, wait for the VM to fully boot and retry
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -566,11 +909,21 @@ paths:
       description: >
         Disable SSH port forwarding for a VM. Stops the TCP proxy and
         releases the allocated port. The VM must be installed (not in
-        CREATED or INSTALLING state).
+        created or installing state).
       operationId: disableSSH
       parameters:
         - $ref: '#/components/parameters/vmId'
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
+        '503':
+          $ref: '#/components/responses/MaintenanceInProgress'
         '200':
           description: SSH forwarding disabled
           content:
@@ -579,7 +932,6 @@ paths:
                 $ref: '#/components/schemas/SSHInfoResponse'
               example:
                 host: "127.0.0.1"
-                port: 0
                 status: disabled
         '400':
           $ref: '#/components/responses/BadRequest'
@@ -588,7 +940,7 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          description: VM is not yet installed
+          description: VM is not installed or another operation currently owns this VM
           content:
             application/json:
               schema:
@@ -608,13 +960,38 @@ paths:
       description: >
         Enable VNC port forwarding for a VM. Allocates a host port from the
         configured VNC port range and creates a TCP proxy to the VM's VNC
-        server (port 5900). The VM must be RUNNING. Idempotent - if VNC is
+        server (port 5900). The VM must be running. Idempotent - if VNC is
         already enabled, returns the current connection info.
         Screen Sharing must be enabled in the macOS guest.
       operationId: enableVNC
       parameters:
         - $ref: '#/components/parameters/vmId'
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
+        '503':
+          description: Destructive maintenance is active or no configured VNC port is available
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                maintenance:
+                  value:
+                    error:
+                      code: MAINTENANCE_IN_PROGRESS
+                      message: The agent is performing destructive maintenance
+                portCapacity:
+                  value:
+                    error:
+                      code: VNC_ENABLE_FAILED
+                      message: No available VNC ports in configured range
         '200':
           description: VNC forwarding enabled
           content:
@@ -628,7 +1005,9 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          description: VM is not in RUNNING state or required capability is unavailable
+          description: >
+            VM is not running, NAT setup is not ready, another operation owns
+            this VM, or the required capability is unavailable
           content:
             application/json:
               schema:
@@ -638,12 +1017,17 @@ paths:
                   value:
                     error:
                       code: INVALID_STATE
-                      message: "VM must be RUNNING to enable VNC forwarding"
+                      message: "VM must be running to enable VNC forwarding"
                 capabilityUnavailable:
                   value:
                     error:
                       code: CAPABILITY_UNAVAILABLE
                       message: "portForwarding is unavailable: Capability is disabled"
+                natNotReady:
+                  value:
+                    error:
+                      code: VNC_ENABLE_FAILED
+                      message: VM has no NAT IP address, cannot set up VNC forwarding
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -654,11 +1038,21 @@ paths:
       description: >
         Disable VNC port forwarding for a VM. Stops the TCP proxy and
         releases the allocated port. The VM must be installed (not in
-        CREATED or INSTALLING state).
+        created or installing state).
       operationId: disableVNC
       parameters:
         - $ref: '#/components/parameters/vmId'
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
+        '503':
+          $ref: '#/components/responses/MaintenanceInProgress'
         '200':
           description: VNC forwarding disabled
           content:
@@ -672,7 +1066,7 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          description: VM is not yet installed
+          description: VM is not installed or another operation currently owns this VM
           content:
             application/json:
               schema:
@@ -690,11 +1084,19 @@ paths:
       summary: Get VNC info
       description: >
         Get VNC connection information. The VM must be installed (not in
-        CREATED or INSTALLING state).
+        created or installing state).
       operationId: getVNCInfo
       parameters:
         - $ref: '#/components/parameters/vmId'
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
         '200':
           description: VNC connection info
           content:
@@ -730,6 +1132,14 @@ paths:
       parameters:
         - $ref: '#/components/parameters/vmId'
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
         '200':
           description: VM state
           content:
@@ -742,8 +1152,6 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
-        '409':
-          $ref: '#/components/responses/CapabilityUnavailable'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -766,6 +1174,14 @@ paths:
             minimum: 1
             maximum: 1000
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
         '200':
           description: VM events
           content:
@@ -791,6 +1207,16 @@ paths:
       parameters:
         - $ref: '#/components/parameters/vmId'
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
+        '503':
+          $ref: '#/components/responses/MaintenanceInProgress'
         '200':
           description: GUI opened successfully
           content:
@@ -803,6 +1229,23 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          description: VM is not running or GUI display is unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                invalidState:
+                  value:
+                    error:
+                      code: INVALID_STATE
+                      message: VM must be running to open GUI
+                capabilityUnavailable:
+                  value:
+                    error:
+                      code: CAPABILITY_UNAVAILABLE
+                      message: "guiDisplay is unavailable: Capability is disabled"
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -815,6 +1258,16 @@ paths:
       parameters:
         - $ref: '#/components/parameters/vmId'
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
+        '503':
+          $ref: '#/components/responses/MaintenanceInProgress'
         '200':
           description: GUI closed successfully
           content:
@@ -839,6 +1292,14 @@ paths:
       parameters:
         - $ref: '#/components/parameters/vmId'
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
         '200':
           description: GUI status
           content:
@@ -862,11 +1323,19 @@ paths:
       description: |
         Captures a screenshot of the VM's display and returns it as a PNG image.
         Works headlessly without requiring a GUI window to be open. The VM must be
-        in RUNNING state. Useful for CI/CD debugging and automated visual testing.
+        in running state. Useful for CI/CD debugging and automated visual testing.
       operationId: captureScreenshot
       parameters:
         - $ref: '#/components/parameters/vmId'
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
         '200':
           description: Screenshot captured successfully
           content:
@@ -881,7 +1350,7 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          description: VM is not in RUNNING state or required capability is unavailable
+          description: VM is not in running state or required capability is unavailable
           content:
             application/json:
               schema:
@@ -891,7 +1360,7 @@ paths:
                   value:
                     error:
                       code: INVALID_STATE
-                      message: "VM must be RUNNING to capture screenshot"
+                      message: "VM must be running to capture screenshot"
                 capabilityUnavailable:
                   value:
                     error:
@@ -906,8 +1375,10 @@ paths:
         - lifecycle
       summary: Execute command via SSH
       description: |
-        Runs a shell command on the VM via SSH. Requires VM to be RUNNING
-        with SSH (Remote Login) enabled. Uses password authentication by default (admin/admin).
+        Runs a shell command on the VM via SSH. Requires VM to be running
+        with SSH (Remote Login) enabled. The default username is `admin`.
+        Password authentication is used only when `password` is supplied;
+        otherwise SSH keys are used.
       operationId: executeCommandOnVM
       parameters:
         - $ref: '#/components/parameters/vmId'
@@ -918,6 +1389,16 @@ paths:
             schema:
               $ref: '#/components/schemas/CommandExecuteRequest'
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
+        '503':
+          $ref: '#/components/responses/MaintenanceInProgress'
         '200':
           description: Command executed
           content:
@@ -931,7 +1412,9 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          description: VM is in wrong state for this operation or required capability is unavailable
+          description: >
+            VM is in the wrong state, SSH forwarding is not configured, or a
+            required capability is unavailable
           content:
             application/json:
               schema:
@@ -942,6 +1425,11 @@ paths:
                     error:
                       code: INVALID_STATE
                       message: "VM must be running for command execution"
+                sshNotConfigured:
+                  value:
+                    error:
+                      code: SSH_NOT_CONFIGURED
+                      message: SSH port not configured for this VM
                 capabilityUnavailable:
                   value:
                     error:
@@ -966,8 +1454,8 @@ paths:
         - lifecycle
       summary: Inject keystrokes
       description: |
-        Injects keystroke sequences into the VM. Works in both RUNNING
-        and INSTALLING states. Useful for automating macOS setup wizard before SSH is available.
+        Injects keystroke sequences into the VM. Works in both running
+        and installing states. Useful for automating macOS setup wizard before SSH is available.
 
         Keystroke DSL supports:
         - Plain text: each character is typed as keyDown+keyUp
@@ -990,6 +1478,16 @@ paths:
             schema:
               $ref: '#/components/schemas/KeystrokesRequest'
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
+        '503':
+          $ref: '#/components/responses/MaintenanceInProgress'
         '200':
           description: Keystrokes injected
           content:
@@ -1028,8 +1526,10 @@ paths:
         - vms
       summary: Clone VM
       description: >
-        Create a 1:1 copy of an existing VM with a new UUID, MachineIdentifier,
-        and MAC address. The source VM must be stopped unless force=true is used.
+        Copy an existing VM bundle with a new UUID, MachineIdentifier, and MAC
+        address. Optional CPU, memory, and enlarged disk values can override the
+        source resources. The clone can be ephemeral and can have its own maximum
+        lifetime. The source VM must be stopped unless force=true is used.
       operationId: cloneVM
       parameters:
         - $ref: '#/components/parameters/vmId'
@@ -1047,6 +1547,16 @@ paths:
             schema:
               $ref: '#/components/schemas/CloneVMRequest'
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
+        '503':
+          $ref: '#/components/responses/MaintenanceInProgress'
         '201':
           description: VM cloned successfully
           content:
@@ -1071,6 +1581,16 @@ paths:
                   message: "Source VM must be stopped before cloning (use force=true to auto-stop)"
         '500':
           $ref: '#/components/responses/InternalError'
+        '504':
+          description: Clone disk growth timed out
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: CLONE_FAILED
+                  message: Clone disk resize timed out
 
   /config:
     get:
@@ -1078,10 +1598,19 @@ paths:
         - config
       summary: Get config
       description: >
-        Returns the current runtime configuration. Sensitive values (API token,
-        file paths, binary paths) are intentionally excluded for security.
+        Returns the current configured values. Persisted networking changes may
+        still require an agent restart. Sensitive values (API token, file paths,
+        binary paths) are intentionally excluded for security.
       operationId: getConfig
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
         '200':
           description: Current configuration
           content:
@@ -1099,8 +1628,11 @@ paths:
       summary: Update config
       description: >
         Update writable configuration values. Only include fields to change.
-        Changes are persisted to disk and take effect immediately. Read-only
-        fields (api.port, api.host, etc.) cannot be updated via this endpoint.
+        The request must contain at least one effective writable field.
+        Logging and image changes are persisted to disk and take effect immediately.
+        Networking changes are persisted and take effect after an agent restart.
+        SSH and VNC ranges must not overlap each other or the API port.
+        Read-only fields (api.port, api.host, etc.) cannot be updated via this endpoint.
       operationId: updateConfig
       requestBody:
         required: true
@@ -1109,6 +1641,16 @@ paths:
             schema:
               $ref: '#/components/schemas/UpdateConfigRequest'
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
+        '503':
+          $ref: '#/components/responses/MaintenanceInProgress'
         '200':
           description: Configuration updated
           content:
@@ -1148,12 +1690,22 @@ paths:
             minimum: 0
             default: 0
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
         '200':
           description: List of images
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ImageListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '500':
@@ -1164,9 +1716,9 @@ paths:
         - images
       summary: Wipe all images
       description: >
-        Delete all locally stored OCI images. Requires confirm=true query
-        parameter as a safety guard. Active asynchronous image operations are
-        cancelled before image deletion starts.
+        Attempt to delete all locally stored OCI images. Requires confirm=true
+        as a safety guard. Active image operations are cancelled before image
+        deletion starts. A 200 response can report per-image failures.
       operationId: wipeAllImages
       parameters:
         - name: confirm
@@ -1178,6 +1730,14 @@ paths:
             enum:
               - 'true'
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
         '200':
           description: Wipe completed
           content:
@@ -1196,6 +1756,16 @@ paths:
                   message: "Add ?confirm=true to confirm deletion of all images"
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Another destructive maintenance operation is already running
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: MAINTENANCE_IN_PROGRESS
+                  message: Another destructive maintenance operation is already running
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -1209,6 +1779,14 @@ paths:
       parameters:
         - $ref: '#/components/parameters/imageId'
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
         '200':
           description: Image details
           content:
@@ -1220,7 +1798,7 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
         '404':
-          $ref: '#/components/responses/NotFound'
+          $ref: '#/components/responses/ImageNotFound'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -1234,6 +1812,16 @@ paths:
       parameters:
         - $ref: '#/components/parameters/imageId'
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
+        '503':
+          $ref: '#/components/responses/MaintenanceInProgress'
         '204':
           description: Image deleted successfully
         '400':
@@ -1241,7 +1829,7 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
         '404':
-          $ref: '#/components/responses/NotFound'
+          $ref: '#/components/responses/ImageNotFound'
         '409':
           description: Image is in use
           content:
@@ -1257,14 +1845,30 @@ paths:
         - images
       summary: Pull image
       description: >
-        Pull an OCI image from a registry. If the image already exists locally,
-        returns the existing record without re-pulling. The request always
-        creates a pull operation record. When `async` is false or omitted, the
-        endpoint blocks until the pull reaches a terminal status and returns
-        the final operation status with `image` populated on success. When
-        `async` is true, the endpoint returns immediately with the started
-        operation status and a `statusUrl`. By default there is no timeout
-        (unlimited). Use the optional `timeout` field to set a limit in seconds.
+        Pull an OCI image from a registry. Every tag is resolved to its current
+        registry digest. A valid local record is reused only when that digest
+        matches; a changed mutable tag replaces the stale local bundle.
+        Digest-pinned references reuse a valid matching local record. The
+        request always creates a pull operation record. When `async` is false
+        or omitted, the endpoint blocks until the pull reaches a terminal
+        status and returns the final operation status with `image` populated on
+        success. When `async` is true, the endpoint returns immediately with
+        the started operation status and a `statusUrl`. Without `timeout`, there
+        is no caller-supplied deadline for the complete pull. Registry
+        reachability checks and short ORAS metadata commands, including digest
+        resolution and manifest fetch, retain bounded internal deadlines. When
+        set, `timeout` applies across the pull, including reference resolution
+        and shared-resource waits, until durable commit. An internal deadline
+        can fail earlier, cancellation cleanup may finish later, and a durable
+        commit wins a concurrent timeout.
+        Jeballto VM Bundle Format v1 is required. The stable media type
+        family is `application/vnd.jeballto.vm.bundle`,
+        `application/vnd.jeballto.vm.bundle.config+json`, and
+        `application/vnd.jeballto.vm.bundle.chunk+zstd`. These media types
+        identify the artifact family; required config field `formatVersion`
+        selects its schema and chunk semantics. Pre-1.0 unversioned artifacts
+        and unknown format versions are rejected before chunk layers are
+        fetched. At most 8 pull and push operations may be active in total.
       operationId: pullImage
       requestBody:
         required: true
@@ -1273,6 +1877,31 @@ paths:
             schema:
               $ref: '#/components/schemas/PullImageRequest'
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
+        '503':
+          description: Destructive maintenance is active or the image registry is unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                maintenance:
+                  value:
+                    error:
+                      code: MAINTENANCE_IN_PROGRESS
+                      message: The agent is performing destructive maintenance
+                registryUnavailable:
+                  value:
+                    error:
+                      code: IMAGE_PULL_FAILED
+                      message: Registry is unavailable
         '200':
           description: Pull operation completed
           content:
@@ -1286,11 +1915,54 @@ paths:
               schema:
                 $ref: '#/components/schemas/ImageOperationStatusResponse'
         '400':
-          $ref: '#/components/responses/BadRequest'
+          description: Invalid request, reference, or Jeballto image artifact
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                invalidRequest:
+                  value:
+                    error:
+                      code: INVALID_REQUEST
+                      message: Timeout must be positive if specified
+                invalidReference:
+                  value:
+                    error:
+                      code: INVALID_REFERENCE
+                      message: Invalid image reference
+                unsupportedImageFormat:
+                  value:
+                    error:
+                      code: UNSUPPORTED_IMAGE_FORMAT
+                      message: >-
+                        Unsupported image format: unversioned images created
+                        before 1.0.0 are not supported; re-push the VM using
+                        Jeballto VM Bundle Format v1
+                invalidImage:
+                  value:
+                    error:
+                      code: INVALID_IMAGE
+                      message: 'Invalid image: Invalid VM image config'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '409':
-          $ref: '#/components/responses/CapabilityUnavailable'
+          description: A required capability is unavailable or the matching local image is in use
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                capabilityUnavailable:
+                  value:
+                    error:
+                      code: CAPABILITY_UNAVAILABLE
+                      message: Required image capability is unavailable
+                imageInUse:
+                  value:
+                    error:
+                      code: IMAGE_IN_USE
+                      message: The matching local image is in use
         '499':
           description: Image pull was cancelled
           content:
@@ -1325,6 +1997,14 @@ paths:
             type: boolean
             default: true
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
         '200':
           description: Image operation list
           content:
@@ -1345,11 +2025,22 @@ paths:
       description: >
         Cancel all currently active image pull operations. The request waits for
         task cleanup and child-process termination before returning terminal
-        statuses for the operations that were cancelled.
+        statuses for the targeted operations. A completed status can win the
+        cancellation race.
       operationId: cancelImagePullOperations
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
+        '503':
+          $ref: '#/components/responses/MaintenanceInProgress'
         '200':
-          description: Image pull operations cancelled
+          description: Terminal statuses after pull cancellation requests
           content:
             application/json:
               schema:
@@ -1371,6 +2062,14 @@ paths:
       parameters:
         - $ref: '#/components/parameters/imageOperationId'
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
         '200':
           description: Image pull operation status
           content:
@@ -1382,7 +2081,7 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
         '404':
-          $ref: '#/components/responses/NotFound'
+          $ref: '#/components/responses/ImageOperationNotFound'
         '500':
           $ref: '#/components/responses/InternalError'
     delete:
@@ -1392,13 +2091,24 @@ paths:
       description: >
         Cancel a running image pull operation. The request waits for task
         cleanup and child-process termination before returning the terminal
-        operation status.
+        operation status. The result can be completed if the durable commit won
+        the cancellation race.
       operationId: cancelImagePullOperation
       parameters:
         - $ref: '#/components/parameters/imageOperationId'
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
+        '503':
+          $ref: '#/components/responses/MaintenanceInProgress'
         '200':
-          description: Image pull operation cancelled
+          description: Terminal pull status after the cancellation request
           content:
             application/json:
               schema:
@@ -1408,7 +2118,7 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
         '404':
-          $ref: '#/components/responses/NotFound'
+          $ref: '#/components/responses/ImageOperationNotFound'
         '409':
           description: Image pull operation is not running
           content:
@@ -1426,16 +2136,28 @@ paths:
       description: >
         Push a VM bundle or existing local image to an OCI registry.
         Use the `source` field with format 'vm:<uuid>' or 'image:<uuid>'.
-        The VM must be stopped before pushing to ensure a consistent disk image.
+        A source VM must be stopped and its installed bundle must be complete.
         A connectivity check is performed before compression begins to fail fast
-        if the registry is unreachable. The bundle is split into
+        if the registry is unavailable. The bundle is split into
         zstd-compressed chunks during transfer. The request always creates a
         push operation record. When `async` is false or omitted, the endpoint
         blocks until the push reaches a terminal status and returns the final
         operation status with `image` populated on success. When `async` is
         true, the endpoint returns immediately with the started operation status
-        and a `statusUrl`. By default there is no timeout (unlimited). Use the
-        optional `timeout` field to set a limit in seconds.
+        and a `statusUrl`; source or registry preflight failures are then recorded
+        as a failed operation status. Without `timeout`, there is no caller-supplied
+        deadline for the complete push. Registry reachability preflight and short
+        ORAS metadata commands retain bounded internal deadlines. When set,
+        `timeout` starts before source reservation and applies through durable local
+        index finalization, subject to the commit-wins rules below. If it expires
+        before manifest publication, the operation is cancelled and reports a
+        timeout after cleanup. Blobs are uploaded first, then a validated durable
+        local bundle and complete staged index are prepared before the manifest is
+        published. The staged index is atomically finalized after manifest success.
+        Once manifest publication starts, an unconfirmed outcome or a confirmed
+        commit with failed local finalization wins a concurrent timeout and requires
+        reconciliation by inspecting or pulling the reference. At most 8 pull and
+        push operations may be active in total.
       operationId: pushImage
       requestBody:
         required: true
@@ -1444,6 +2166,14 @@ paths:
             schema:
               $ref: '#/components/schemas/PushImageRequest'
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
         '200':
           description: Push operation completed
           content:
@@ -1461,9 +2191,9 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
         '404':
-          $ref: '#/components/responses/NotFound'
+          $ref: '#/components/responses/ImagePushSourceNotFound'
         '409':
-          description: Source is not in a pushable state or required capability is unavailable
+          description: Source is not in a pushable state, is in use, or a required capability is unavailable
           content:
             application/json:
               schema:
@@ -1473,12 +2203,17 @@ paths:
                   value:
                     error:
                       code: INVALID_STATE
-                      message: "VM must be stopped or created before image export"
+                      message: "VM must be stopped before image export"
                 capabilityUnavailable:
                   value:
                     error:
                       code: CAPABILITY_UNAVAILABLE
                       message: "ociImagePackaging is unavailable: Capability is disabled"
+                imageInUse:
+                  value:
+                    error:
+                      code: IMAGE_IN_USE
+                      message: Source image is being deleted or exported
         '499':
           description: Image push was cancelled
           content:
@@ -1486,13 +2221,39 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '500':
-          $ref: '#/components/responses/InternalError'
-        '503':
-          description: Registry is unreachable
+          description: Push failed or its registry and local commit outcome requires reconciliation
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                commitOutcomeUnknown:
+                  value:
+                    error:
+                      code: IMAGE_PUSH_COMMIT_OUTCOME_UNKNOWN
+                      message: Registry manifest publication started, but its commit outcome could not be confirmed
+                partiallyCommitted:
+                  value:
+                    error:
+                      code: IMAGE_PUSH_PARTIALLY_COMMITTED
+                      message: Registry manifest committed, but the durable local image record could not be finalized
+        '503':
+          description: Destructive maintenance is active or the registry is unavailable during a blocking push
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                maintenance:
+                  value:
+                    error:
+                      code: MAINTENANCE_IN_PROGRESS
+                      message: The agent is performing destructive maintenance
+                registryUnavailable:
+                  value:
+                    error:
+                      code: IMAGE_PUSH_FAILED
+                      message: Registry is unavailable
         '504':
           description: Image push timed out
           content:
@@ -1519,6 +2280,14 @@ paths:
             type: boolean
             default: true
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
         '200':
           description: Image operation list
           content:
@@ -1539,11 +2308,22 @@ paths:
       description: >
         Cancel all currently active image push operations. The request waits for
         task cleanup and child-process termination before returning terminal
-        statuses for the operations that were cancelled.
+        statuses for the targeted operations. A completed status can win the
+        cancellation race.
       operationId: cancelImagePushOperations
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
+        '503':
+          $ref: '#/components/responses/MaintenanceInProgress'
         '200':
-          description: Image push operations cancelled
+          description: Terminal statuses after push cancellation requests
           content:
             application/json:
               schema:
@@ -1565,18 +2345,75 @@ paths:
       parameters:
         - $ref: '#/components/parameters/imageOperationId'
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
         '200':
           description: Image push operation status
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ImageOperationStatusResponse'
+              examples:
+                finalizing:
+                  summary: Active finalization remains at 0.99
+                  value:
+                    operationId: 5fe2fd40-9293-4f3f-abdd-844873b33934
+                    statusUrl: /v1/images/push/operations/5fe2fd40-9293-4f3f-abdd-844873b33934
+                    type: push
+                    reference: registry.example.com/vms/macos:latest
+                    source: vm:550e8400-e29b-41d4-a716-446655440000
+                    status: running
+                    stage: finalizing
+                    progress: 0.99
+                    stageProgress: 0
+                    chunksCompleted: 0
+                    bytesCompleted: 0
+                    startedAt: '2026-07-13T10:00:00Z'
+                    updatedAt: '2026-07-13T10:05:00Z'
+                completed:
+                  summary: Successful finalization is terminal at 1.0
+                  value:
+                    operationId: 5fe2fd40-9293-4f3f-abdd-844873b33934
+                    statusUrl: /v1/images/push/operations/5fe2fd40-9293-4f3f-abdd-844873b33934
+                    type: push
+                    reference: registry.example.com/vms/macos:latest
+                    source: vm:550e8400-e29b-41d4-a716-446655440000
+                    status: completed
+                    stage: finalizing
+                    progress: 1.0
+                    stageProgress: 1.0
+                    chunksCompleted: 0
+                    bytesCompleted: 0
+                    startedAt: '2026-07-13T10:00:00Z'
+                    updatedAt: '2026-07-13T10:06:00Z'
+                    completedAt: '2026-07-13T10:06:00Z'
+                    digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+                    image:
+                      id: a44fb6ea-59f6-478f-b9f7-c76fbdebcf2a
+                      reference: registry.example.com/vms/macos:latest
+                      digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+                      localPath: /Users/example/Library/Application Support/Jeballto/images/a44fb6ea-59f6-478f-b9f7-c76fbdebcf2a.bundle
+                      size: 68719476736
+                      resources:
+                        cpuCount: 4
+                        memorySize: 8589934592
+                        diskSize: 68719476736
+                      formatVersion: 1
+                      pushedAt: '2026-07-13T10:06:00Z'
+                      metadata:
+                        ownsLocalPath: 'true'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '404':
-          $ref: '#/components/responses/NotFound'
+          $ref: '#/components/responses/ImageOperationNotFound'
         '500':
           $ref: '#/components/responses/InternalError'
     delete:
@@ -1586,13 +2423,24 @@ paths:
       description: >
         Cancel a running image push operation. The request waits for task
         cleanup and child-process termination before returning the terminal
-        operation status.
+        operation status. The result can be completed if the durable commit won
+        the cancellation race.
       operationId: cancelImagePushOperation
       parameters:
         - $ref: '#/components/parameters/imageOperationId'
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
+        '503':
+          $ref: '#/components/responses/MaintenanceInProgress'
         '200':
-          description: Image push operation cancelled
+          description: Terminal push status after the cancellation request
           content:
             application/json:
               schema:
@@ -1602,7 +2450,7 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
         '404':
-          $ref: '#/components/responses/NotFound'
+          $ref: '#/components/responses/ImageOperationNotFound'
         '409':
           description: Image push operation is not running
           content:
@@ -1617,7 +2465,12 @@ paths:
       tags:
         - registries
       summary: Registry login
-      description: Authenticate to an OCI registry. Credentials are stored by oras.
+      description: >
+        Check registry availability, validate the supplied credentials through
+        an isolated ORAS login, and store a successful credential in Jeballto's
+        macOS Keychain service. The password is sent to ORAS through standard
+        input. Docker and standalone ORAS credential state is not read or
+        modified.
       operationId: registryLogin
       requestBody:
         required: true
@@ -1626,6 +2479,31 @@ paths:
             schema:
               $ref: '#/components/schemas/RegistryLoginRequest'
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
+        '503':
+          description: Destructive maintenance is active or the registry is unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                maintenance:
+                  value:
+                    error:
+                      code: MAINTENANCE_IN_PROGRESS
+                      message: The agent is performing destructive maintenance
+                registryUnavailable:
+                  value:
+                    error:
+                      code: REGISTRY_UNAVAILABLE
+                      message: Registry is unavailable
         '200':
           description: Authenticated
           content:
@@ -1644,15 +2522,26 @@ paths:
                 error:
                   code: REGISTRY_AUTH_FAILED
                   message: Authentication failed
+        '499':
+          description: Registry login was cancelled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '500':
           $ref: '#/components/responses/InternalError'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
 
   /registries/logout:
     post:
       tags:
         - registries
       summary: Registry logout
-      description: Remove stored credentials for an OCI registry
+      description: >
+        Remove only the matching credential from Jeballto's macOS Keychain
+        service. This does not contact the registry or alter Docker or
+        standalone ORAS credentials.
       operationId: registryLogout
       requestBody:
         required: true
@@ -1661,6 +2550,16 @@ paths:
             schema:
               $ref: '#/components/schemas/RegistryLogoutRequest'
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
+        '503':
+          $ref: '#/components/responses/MaintenanceInProgress'
         '200':
           description: Logged out
           content:
@@ -1671,6 +2570,12 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '499':
+          description: Registry logout was cancelled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -1693,10 +2598,26 @@ paths:
           application/yaml:
             schema:
               $ref: '#/components/schemas/JeballtofileRequest'
+          application/x-yaml:
+            schema:
+              $ref: '#/components/schemas/JeballtofileRequest'
           text/yaml:
             schema:
               $ref: '#/components/schemas/JeballtofileRequest'
+          text/x-yaml:
+            schema:
+              $ref: '#/components/schemas/JeballtofileRequest'
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
+        '503':
+          $ref: '#/components/responses/MaintenanceInProgress'
         '202':
           description: Jeballtofile execution started
           content:
@@ -1707,15 +2628,33 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: A host or runtime capability required by the blueprint is unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: CAPABILITY_UNAVAILABLE
+                  message: A capability required by the blueprint is unavailable
         '500':
           $ref: '#/components/responses/InternalError'
     get:
       tags:
         - jeballtofiles
       summary: List Jeballtofile executions
-      description: Returns all active and recent Jeballtofile executions.
+      description: Returns all active executions and the newest 100 terminal executions.
       operationId: listJeballtofiles
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
         '200':
           description: List of executions
           content:
@@ -1740,6 +2679,14 @@ paths:
             type: string
             format: uuid
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
         '200':
           description: Execution status
           content:
@@ -1768,6 +2715,16 @@ paths:
             type: string
             format: uuid
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
+        '503':
+          $ref: '#/components/responses/MaintenanceInProgress'
         '200':
           description: Execution deleted
           content:
@@ -1793,8 +2750,9 @@ paths:
         - jeballtofiles
       summary: Cancel a Jeballtofile execution
       description: >
-        Requests cancellation of a running Jeballtofile execution.
-        The current step is marked cancelled when the task observes cancellation.
+        Marks a running execution and its current in-progress step as cancelled,
+        then requests cooperative task cancellation. The response does not wait
+        for asynchronous work to finish unwinding.
       operationId: cancelJeballtofile
       parameters:
         - name: executionId
@@ -1804,6 +2762,16 @@ paths:
             type: string
             format: uuid
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
+        '503':
+          $ref: '#/components/responses/MaintenanceInProgress'
         '200':
           description: Cancellation requested
           content:
@@ -1833,6 +2801,14 @@ paths:
         app build and machine.
       operationId: getSystemCapabilities
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
         '200':
           description: System capabilities
           content:
@@ -1850,11 +2826,13 @@ paths:
         - system
       summary: Reset system
       description: >
-        Reset the agent to a clean state. Soft mode deletes all VMs, images, and
-        the IPSW cache but keeps configuration and logs. Hard mode deletes everything
-        the application stores and terminates the process so the next startup is
-        completely fresh. Active asynchronous image operations are cancelled
-        before reset cleanup starts. Requires confirm=true as a safety guard.
+        Reset agent-owned local state. Both modes first cancel tracked
+        installations, image operations, and Jeballtofile executions. Soft mode
+        attempts to delete all VMs and images and clear the IPSW cache while
+        preserving configuration and logs; partial failures are reported in a
+        200 response. Hard mode terminates only when every cleanup step succeeds.
+        A partial hard reset returns 500 and leaves the process running. Requires
+        confirm=true as a safety guard.
       operationId: systemReset
       parameters:
         - name: confirm
@@ -1872,8 +2850,18 @@ paths:
             schema:
               $ref: '#/components/schemas/SystemResetRequest'
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
         '200':
-          description: Reset completed (hard mode will terminate the process shortly after)
+          description: >
+            Soft reset attempt completed, or hard reset completed and will
+            terminate after the response is sent
           content:
             application/json:
               schema:
@@ -1882,8 +2870,27 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Another destructive maintenance operation is already running
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: MAINTENANCE_IN_PROGRESS
+                  message: Another destructive maintenance operation is already running
         '500':
-          $ref: '#/components/responses/InternalError'
+          description: >
+            Hard reset could not safely complete, so the process remains running
+            and the response reports the partial result. If VM or image removal
+            fails, configuration and indexes are preserved. A failure during later
+            cleanup may leave some data already removed; retry hard reset after
+            correcting the reported cause.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SystemResetResponse'
 
   /auth/verify:
     get:
@@ -1896,6 +2903,14 @@ paths:
         Returns 401 if the token is missing or invalid.
       operationId: verifyAuth
       responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '431':
+          $ref: '#/components/responses/RequestHeadersTooLarge'
         '200':
           description: Token is valid
           content:
@@ -1919,7 +2934,7 @@ components:
       scheme: bearer
       bearerFormat: token
       description: >
-        Bearer token from agent configuration.
+        Bearer token stored in the macOS Keychain. Copy it from the menu-bar item.
         Pass as: Authorization: Bearer <your-token>
 
   parameters:
@@ -1949,6 +2964,18 @@ components:
         format: uuid
 
   schemas:
+    RegistryHost:
+      type: string
+      minLength: 1
+      maxLength: 259
+      pattern: '^(?=[^:]{1,253}(?::(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*(?::(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?$'
+      description: >
+        Lowercase registry hostname with an optional port from 1 to 65535.
+        The hostname is at most 253 ASCII bytes; each DNS label is 1 to 63
+        bytes, starts and ends with an alphanumeric character, and otherwise
+        contains only lowercase alphanumeric characters or hyphens.
+      example: registry.example.com
+
     CreateVMRequest:
       type: object
       required:
@@ -1958,30 +2985,43 @@ components:
           type: string
           minLength: 1
           maxLength: 100
-          description: VM name
+          description: >
+            VM name. Uses Unicode alphanumeric characters plus hyphen,
+            underscore, space, and dot. Leading or trailing whitespace is not
+            allowed.
           example: my-macos-vm
         resources:
           allOf:
             - $ref: '#/components/schemas/VMResourcesDTO'
+          nullable: true
           description: >
-            Hardware resources. Must NOT be set together with `image` - use
-            PATCH /v1/vms/{id} to change resources after cloning from an image.
+            Hardware resources for a blank VM. Must NOT be set together with
+            `image`; image-based VMs restore the resources recorded in the image.
         image:
           type: string
           nullable: true
+          minLength: 1
+          maxLength: 1024
+          x-utf8-maxBytes: 1024
           description: >
             OCI image reference (e.g. registry.example.com/vms/macos:latest).
             When provided, the image is pulled if not already local and the
-            VM is created from it. The VM will be in STOPPED state (already installed).
-            Cannot be combined with `resources`.
+            VM is created from it using the resources recorded in Jeballto VM
+            Bundle Format v1. Unversioned and unknown formats are rejected.
+            The VM will be in stopped state (already installed).
+            Cannot be combined with `resources`. References are limited to
+            1,024 UTF-8 bytes; repository names are lowercase and at most 255
+            bytes; tags are at most 128 ASCII characters; digests use
+            `sha256:` followed by 64 lowercase hex digits.
           example: registry.example.com/vms/macos:latest
         ephemeral:
           type: boolean
+          nullable: true
           default: false
           description: >
-            When true, the VM is automatically deleted when it reaches a terminal
-            state (stopped or error), and is also stopped+deleted on agent shutdown.
-            Useful for CI/CD jobs where VMs are disposable.
+            After the VM first reaches running, it is automatically deleted when it
+            later reaches stopped or error. It is also stopped and deleted on agent
+            shutdown even if it has never run. Useful for disposable CI/CD jobs.
         lifetimeSeconds:
           type: integer
           minimum: 1
@@ -1989,7 +3029,7 @@ components:
           nullable: true
           description: >
             Optional maximum lifetime in seconds. Countdown starts the first time
-            the VM enters RUNNING state and is persisted, so it survives agent
+            the VM enters running state and is persisted, so it survives agent
             restarts. On expiry the VM is stopped (and, if ephemeral, deleted).
           example: 3600
 
@@ -1998,31 +3038,38 @@ components:
       properties:
         cpuCount:
           type: integer
+          nullable: true
           minimum: 1
           maximum: 32
           description: Number of CPU cores
           example: 4
         memorySize:
+          nullable: true
           oneOf:
             - type: integer
               format: int64
               minimum: 2147483648
+              maximum: 137438953472
             - type: string
-              pattern: '^\d+(\.\d+)?\s*(MB|GB|mb|gb)$'
+              pattern: '^[ \t]*\d+(\.\d+)?[ \t]*([Mm][Bb]|[Gg][Bb]|[Tt][Bb])[ \t]*$'
           description: >
             Memory size as bytes (integer) or human-readable string (e.g., "4GB", "512MB").
-            Minimum 2 GB.
+            Decimal strings are accepted only when they resolve to a whole number of bytes.
+            Range 2 GB to 128 GB.
           example: "4GB"
         diskSize:
+          nullable: true
           oneOf:
             - type: integer
               format: int64
               minimum: 21474836480
+              maximum: 8796093022208
             - type: string
-              pattern: '^\d+(\.\d+)?\s*(MB|GB|mb|gb)$'
+              pattern: '^[ \t]*\d+(\.\d+)?[ \t]*([Mm][Bb]|[Gg][Bb]|[Tt][Bb])[ \t]*$'
           description: >
             Disk size as bytes (integer) or human-readable string (e.g., "64GB", "128GB").
-            Minimum 20 GB.
+            Decimal strings are accepted only when they resolve to a whole number of bytes.
+            Range 20 GB to 8 TB.
           example: "64GB"
 
     CloneVMRequest:
@@ -2034,60 +3081,89 @@ components:
           type: string
           minLength: 1
           maxLength: 100
-          description: Name for the cloned VM
+          description: >
+            Name for the cloned VM. Uses Unicode alphanumeric characters plus
+            hyphen, underscore, space, and dot. Leading or trailing whitespace
+            is not allowed.
           example: cloned-vm
         resources:
-          $ref: '#/components/schemas/VMResourcesDTO'
+          allOf:
+            - $ref: '#/components/schemas/VMResourcesDTO'
+          nullable: true
         ephemeral:
           type: boolean
+          nullable: true
           default: false
           description: >
-            When true, the cloned VM is automatically deleted when it reaches a
-            terminal state (stopped or error).
+            After the clone first reaches running, it is automatically deleted when
+            it later reaches stopped or error. It is always deleted on agent shutdown.
+        lifetimeSeconds:
+          type: integer
+          minimum: 1
+          maximum: 604800
+          nullable: true
+          description: >
+            Optional maximum clone lifetime in seconds. The persisted countdown
+            starts the first time the clone enters running. On expiry the clone
+            is stopped and, when ephemeral, deleted.
+          example: 3600
 
     UpdateVMRequest:
       type: object
       description: >
-        At least one field must be provided. Name can be changed in any non-deleted state.
+        At least one non-null field must be provided. Null optional fields are ignored.
+        Name can be changed in any non-deleted state.
         Resource changes require the VM to be stopped or created.
         Disk can only be enlarged, not shrunk.
       properties:
         name:
           type: string
+          nullable: true
           minLength: 1
           maxLength: 100
-          description: New name for the VM
+          description: >
+            New VM name. Uses Unicode alphanumeric characters plus hyphen,
+            underscore, space, and dot. Leading or trailing whitespace is not
+            allowed.
           example: "renamed-vm"
         resources:
           type: object
+          nullable: true
           properties:
             cpuCount:
               type: integer
+              nullable: true
               minimum: 1
               maximum: 32
               description: Number of virtual CPU cores
               example: 8
             memorySize:
+              nullable: true
               oneOf:
                 - type: integer
                   format: int64
                   minimum: 2147483648
+                  maximum: 137438953472
                 - type: string
-                  pattern: '^\d+(\.\d+)?\s*(MB|GB|TB|mb|gb|tb)$'
+                  pattern: '^[ \t]*\d+(\.\d+)?[ \t]*([Mm][Bb]|[Gg][Bb]|[Tt][Bb])[ \t]*$'
               description: >
                 Memory as bytes (integer) or human-readable string (e.g., "8GB", "16GB").
-                Minimum 2 GB.
+                Decimal strings are accepted only when they resolve to a whole number of bytes.
+                Range 2 GB to 128 GB.
               example: "16GB"
             diskSize:
+              nullable: true
               oneOf:
                 - type: integer
                   format: int64
                   minimum: 21474836480
+                  maximum: 8796093022208
                 - type: string
-                  pattern: '^\d+(\.\d+)?\s*(MB|GB|TB|mb|gb|tb)$'
+                  pattern: '^[ \t]*\d+(\.\d+)?[ \t]*([Mm][Bb]|[Gg][Bb]|[Tt][Bb])[ \t]*$'
               description: >
                 Disk size as bytes (integer) or human-readable string (e.g., "128GB").
-                Minimum 20 GB. Can only be enlarged, not shrunk.
+                Decimal strings are accepted only when they resolve to a whole number of bytes.
+                Range 20 GB to 8 TB. Can only be enlarged, not shrunk.
               example: "128GB"
 
     WipeAllResponse:
@@ -2098,16 +3174,16 @@ components:
       properties:
         deleted:
           type: integer
-          description: Number of VMs successfully deleted
+          description: Number of requested resources successfully deleted
         failed:
           type: integer
-          description: Number of VMs that failed to delete
+          description: Number of requested resources that failed to delete
         errors:
           type: array
           nullable: true
           items:
             type: string
-          description: Error messages for failed deletions
+          description: Error messages for failed deletions, omitted when empty
 
     InstallVMRequest:
       type: object
@@ -2115,10 +3191,15 @@ components:
         source:
           type: string
           nullable: true
+          minLength: 1
+          x-utf8-maxBytes: 8192
           description: >
             IPSW source. Accepts an HTTPS URL, a file:// URL, or an absolute
-            file path. If omitted, the latest macOS is downloaded from Apple.
-            HTTP URLs are rejected for security reasons.
+            file path. Input is limited to 8,192 UTF-8 bytes, and a normalized
+            local or file:// path is limited to 4,096 UTF-8 bytes. Embedded URL
+            credentials and fragments are rejected. If omitted, the latest
+            macOS is downloaded from Apple. HTTP URLs are rejected for security
+            reasons.
           example: https://updates.cdn-apple.com/.../UniversalMac.ipsw
 
     VMResponse:
@@ -2129,6 +3210,11 @@ components:
         - state
         - ephemeral
         - resources
+        - network
+        - guiOpen
+        - uptime
+        - lifetimeSeconds
+        - expiresAt
         - createdAt
         - updatedAt
       properties:
@@ -2138,25 +3224,27 @@ components:
           description: VM identifier
         name:
           type: string
-          description: VM name
+          description: VM name using the same syntax accepted by create and update requests
         state:
           type: string
           enum:
-            - CREATED
-            - INSTALLING
-            - STOPPED
-            - STARTING
-            - RUNNING
-            - STOPPING
-            - PAUSING
-            - PAUSED
-            - RESUMING
-            - ERROR
-            - DELETED
+            - created
+            - installing
+            - stopped
+            - starting
+            - running
+            - stopping
+            - pausing
+            - paused
+            - resuming
+            - error
+            - deleted
           description: Current VM state
         ephemeral:
           type: boolean
-          description: Whether the VM auto-deletes on terminal state (stopped or error)
+          description: >
+            Whether the VM auto-deletes on stopped or error after its first run and
+            is always deleted during agent shutdown
         resources:
           $ref: '#/components/schemas/VMResourcesResponse'
         network:
@@ -2171,7 +3259,7 @@ components:
         lifetimeSeconds:
           type: integer
           nullable: true
-          description: Configured max lifetime in seconds from first start, null if not set
+          description: Configured maximum lifetime in seconds from the first successful running state, null if not set
         expiresAt:
           type: string
           format: date-time
@@ -2195,19 +3283,26 @@ components:
       properties:
         cpuCount:
           type: integer
+          minimum: 1
+          maximum: 32
           description: Number of CPU cores
         memorySize:
-          type: string
-          description: Memory size as human-readable string
-          example: "8GB"
+          type: integer
+          format: int64
+          minimum: 2147483648
+          maximum: 137438953472
+          description: Exact memory size in bytes
+          example: 8589934592
         diskSize:
-          type: string
-          description: Disk size as human-readable string
-          example: "64GB"
+          type: integer
+          format: int64
+          minimum: 21474836480
+          maximum: 8796093022208
+          description: Exact disk size in bytes
+          example: 68719476736
 
     VMNetworkResponse:
       type: object
-      nullable: true
       required:
         - macAddress
       properties:
@@ -2219,11 +3314,15 @@ components:
         sshPort:
           type: integer
           nullable: true
+          minimum: 1024
+          maximum: 65535
           description: SSH forwarding port
           example: 2222
         vncPort:
           type: integer
           nullable: true
+          minimum: 1024
+          maximum: 65535
           description: VNC forwarding port
           example: 5901
         natIP:
@@ -2237,6 +3336,8 @@ components:
       required:
         - vms
         - total
+        - limit
+        - offset
       properties:
         vms:
           type: array
@@ -2244,21 +3345,22 @@ components:
             $ref: '#/components/schemas/VMResponse'
         total:
           type: integer
+          minimum: 0
           description: Total number of VMs (across all pages)
         limit:
           type: integer
-          nullable: true
+          minimum: 1
+          maximum: 1000
           description: Maximum number of results per page
         offset:
           type: integer
-          nullable: true
+          minimum: 0
           description: Number of results skipped
 
     SSHInfoResponse:
       type: object
       required:
         - host
-        - port
         - status
       properties:
         host:
@@ -2267,23 +3369,24 @@ components:
           example: "127.0.0.1"
         port:
           type: integer
-          description: SSH port
+          nullable: true
+          minimum: 1024
+          maximum: 65535
+          description: SSH port, omitted or null when forwarding is disabled
           example: 2222
         status:
           type: string
+          enum:
+            - ready
+            - unavailable
+            - disabled
           description: "Connection status: ready, unavailable, or disabled"
           example: "ready"
-        user:
-          type: string
-          nullable: true
-          description: SSH user
-          example: admin
 
     VNCInfoResponse:
       type: object
       required:
         - host
-        - port
         - status
       properties:
         host:
@@ -2292,10 +3395,17 @@ components:
           example: "127.0.0.1"
         port:
           type: integer
-          description: VNC port
+          nullable: true
+          minimum: 1024
+          maximum: 65535
+          description: VNC port, omitted or null when forwarding is disabled
           example: 5901
         status:
           type: string
+          enum:
+            - ready
+            - unavailable
+            - disabled
           description: "Forwarding status: ready, unavailable, or disabled"
           example: "ready"
 
@@ -2307,17 +3417,17 @@ components:
         state:
           type: string
           enum:
-            - CREATED
-            - INSTALLING
-            - STOPPED
-            - STARTING
-            - RUNNING
-            - STOPPING
-            - PAUSING
-            - PAUSED
-            - RESUMING
-            - ERROR
-            - DELETED
+            - created
+            - installing
+            - stopped
+            - starting
+            - running
+            - stopping
+            - pausing
+            - paused
+            - resuming
+            - error
+            - deleted
           description: Current VM state
         uptime:
           type: integer
@@ -2335,12 +3445,14 @@ components:
       properties:
         status:
           type: string
+          enum:
+            - healthy
           description: Health status
           example: healthy
         version:
           type: string
           description: Agent version
-          example: "0.1.0"
+          example: "1.0.0-beta.1"
         vmsTotal:
           type: integer
           description: Total VMs
@@ -2349,7 +3461,7 @@ components:
           description: Running VMs
         uptime:
           type: integer
-          description: Agent uptime in seconds
+          description: Seconds since the HTTP server started accepting requests
 
     InstallStatusResponse:
       type: object
@@ -2367,10 +3479,12 @@ components:
           enum:
             - not_started
             - started
-            - downloading
             - installing
+            - finalizing
             - completed
             - failed
+            - cancelled
+            - interrupted
         progress:
           type: number
           format: double
@@ -2402,6 +3516,7 @@ components:
             - downloading
             - installing
             - completed
+            - cancelled
             - failed
         bytesDownloaded:
           type: integer
@@ -2443,22 +3558,34 @@ components:
       properties:
         command:
           type: string
-          description: Shell command to execute via SSH
+          minLength: 1
+          x-utf8-maxBytes: 65536
+          description: Shell command to execute via SSH. Limited to 65,536 UTF-8 bytes.
           example: whoami
         user:
           type: string
+          nullable: true
+          minLength: 1
+          maxLength: 255
+          pattern: '^[A-Za-z0-9_][A-Za-z0-9_.-]*$'
           default: admin
-          description: SSH username
+          description: >
+            SSH username. ASCII letters, digits, dots, hyphens, and underscores
+            are accepted; the first character cannot be a dot or hyphen.
         password:
           type: string
-          default: admin
           nullable: true
-          description: SSH password. Set to null for key-based auth.
+          x-utf8-maxBytes: 16384
+          description: >
+            SSH password, limited to 16,384 UTF-8 bytes. NUL, carriage return,
+            and newline characters are rejected. Omit or set to null for key-based auth.
         timeout:
           type: integer
+          nullable: true
           minimum: 1
+          maximum: 600
           default: 30
-          description: Timeout in seconds (max 600)
+          description: Timeout in seconds
 
     CommandExecuteResponse:
       type: object
@@ -2467,6 +3594,8 @@ components:
         - exitCode
         - stdout
         - stderr
+        - stdoutTruncated
+        - stderrTruncated
       properties:
         vmId:
           type: string
@@ -2481,6 +3610,12 @@ components:
         stderr:
           type: string
           description: Standard error
+        stdoutTruncated:
+          type: boolean
+          description: Whether stdout exceeded the 5 MiB capture limit and was truncated
+        stderrTruncated:
+          type: boolean
+          description: Whether stderr exceeded the 5 MiB capture limit and was truncated
 
     KeystrokesRequest:
       type: object
@@ -2489,12 +3624,16 @@ components:
       properties:
         keystrokes:
           type: array
+          minItems: 1
+          maxItems: 1000
           items:
             type: string
+            maxLength: 10000
           description: |
             Keystroke sequences to inject.
-            Each string is parsed as a keystroke DSL sequence.
-          example: ["admin", "<tab>", "admin", "<enter>"]
+            Each string is parsed as a keystroke DSL sequence. The complete
+            array may contain at most 10,000 characters across all strings.
+          example: ["hello", "<tab>", "world", "<enter>"]
 
     KeystrokesResponse:
       type: object
@@ -2519,6 +3658,8 @@ components:
       required:
         - timestamp
         - type
+        - vmId
+        - data
       properties:
         timestamp:
           type: string
@@ -2544,16 +3685,10 @@ components:
             - INSTALL_STARTED
             - INSTALL_PROGRESS
             - INSTALL_COMPLETED
+            - INSTALL_CANCELLED
             - INSTALL_FAILED
             - GUI_OPENED
             - GUI_CLOSED
-            - IMAGE_PULL_STARTED
-            - IMAGE_PULLED
-            - IMAGE_PULL_FAILED
-            - IMAGE_PUSH_STARTED
-            - IMAGE_PUSHED
-            - IMAGE_PUSH_FAILED
-            - IMAGE_DELETED
             - VM_CLONED
             - VM_RESOURCES_UPDATED
             - SSH_READY
@@ -2589,7 +3724,7 @@ components:
             $ref: '#/components/schemas/EventResponse'
         total:
           type: integer
-          description: Total number of events
+          description: Number of retained events returned for this VM
 
     PullImageRequest:
       type: object
@@ -2598,7 +3733,13 @@ components:
       properties:
         reference:
           type: string
-          description: OCI image reference
+          minLength: 1
+          maxLength: 1024
+          x-utf8-maxBytes: 1024
+          description: >
+            OCI image reference, limited to 1,024 UTF-8 bytes. Repository names
+            are lowercase and at most 255 bytes; tags are at most 128 ASCII
+            characters; digests use sha256 followed by 64 lowercase hex digits.
           example: registry.example.com/vms/macos:latest
         timeout:
           type: integer
@@ -2606,16 +3747,21 @@ components:
           minimum: 1
           maximum: 604800
           description: >
-            Timeout in seconds for the pull operation. If omitted or null,
-            the operation runs without a time limit (unlimited). Maximum when
-            set is 604800 seconds (7 days).
+            Caller-supplied deadline in seconds for the complete pull. If
+            omitted or null, no deadline applies to the operation as a whole,
+            but registry checks and short ORAS metadata commands retain their
+            bounded internal deadlines. Maximum when set is 604800 seconds (7
+            days). It applies until durable commit; an internal deadline can fail
+            earlier, cancellation cleanup may finish later, and a durable
+            commit wins a concurrent timeout.
           example: 3600
         async:
           type: boolean
+          nullable: true
           default: false
           description: >
             When true, return immediately after creating the pull operation.
-            When false or omitted, wait for completion and return the final
+            When false, null, or omitted, wait for completion and return the final
             operation status.
 
     PushImageRequest:
@@ -2626,10 +3772,20 @@ components:
       properties:
         reference:
           type: string
-          description: OCI image reference to push to
+          minLength: 1
+          maxLength: 1024
+          x-utf8-maxBytes: 1024
+          description: >
+            OCI image reference to push to, limited to 1,024 UTF-8 bytes.
+            Repository names are lowercase and at most 255 bytes; tags are at
+            most 128 ASCII characters; digests use sha256 followed by 64
+            lowercase hex digits.
           example: registry.example.com/vms/macos:latest
         source:
           type: string
+          minLength: 39
+          maxLength: 42
+          pattern: '^(vm|image):[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$'
           description: >
             Source to push from. Use 'vm:<uuid>' to push from a VM bundle
             or 'image:<uuid>' to re-push an existing local image.
@@ -2640,16 +3796,25 @@ components:
           minimum: 1
           maximum: 604800
           description: >
-            Timeout in seconds for the push operation. If omitted or null,
-            the operation runs without a time limit (unlimited). Maximum when
-            set is 604800 seconds (7 days).
+            Caller-supplied deadline in seconds for the complete push, from source
+            reservation through durable local index finalization. If omitted or
+            null, no deadline applies to the operation as a whole, but registry
+            preflight and short ORAS metadata commands retain their bounded internal
+            deadlines. Maximum when set is 604800 seconds (7 days). If it expires
+            before manifest publication, the operation is cancelled and reports a
+            timeout after cleanup. An internal deadline can fail earlier and
+            cancellation cleanup may finish later. Once manifest publication starts,
+            an unknown commit outcome wins a concurrent timeout. After confirmed
+            registry commit, completion or a partial-commit result wins a concurrent
+            timeout.
           example: 7200
         async:
           type: boolean
+          nullable: true
           default: false
           description: >
             When true, return immediately after creating the push operation.
-            When false or omitted, wait for completion and return the final
+            When false, null, or omitted, wait for completion and return the final
             operation status.
 
     RegistryLoginRequest:
@@ -2660,15 +3825,17 @@ components:
         - password
       properties:
         registry:
-          type: string
-          description: Registry hostname
-          example: registry.example.com
+          $ref: '#/components/schemas/RegistryHost'
         username:
           type: string
-          description: Registry username
+          minLength: 1
+          x-utf8-maxBytes: 1024
+          description: Registry username, limited to 1024 UTF-8 bytes and without control characters
         password:
           type: string
-          description: Registry password
+          minLength: 1
+          x-utf8-maxBytes: 16384
+          description: Registry password, limited to 16384 UTF-8 bytes and without NUL, CR, or LF
 
     RegistryLogoutRequest:
       type: object
@@ -2676,9 +3843,7 @@ components:
         - registry
       properties:
         registry:
-          type: string
-          description: Registry hostname
-          example: registry.example.com
+          $ref: '#/components/schemas/RegistryHost'
 
     ImageResponse:
       type: object
@@ -2686,6 +3851,7 @@ components:
         - id
         - reference
         - localPath
+        - formatVersion
       properties:
         id:
           type: string
@@ -2697,6 +3863,7 @@ components:
         digest:
           type: string
           nullable: true
+          pattern: '^sha256:[a-f0-9]{64}$'
           description: Image digest (sha256)
         localPath:
           type: string
@@ -2706,6 +3873,22 @@ components:
           format: int64
           nullable: true
           description: Image size in bytes
+        resources:
+          allOf:
+            - $ref: '#/components/schemas/VMResourcesResponse'
+          nullable: true
+          description: VM resources restored when a VM is created from this image
+        formatVersion:
+          type: integer
+          format: int32
+          enum:
+            - 1
+          description: >
+            Validated Jeballto VM Bundle Format version stored in the local
+            record by Local Image Index v1. Current images report exactly 1.
+            An incompatible local index is rejected instead of being exposed
+            or rewritten through the API.
+          example: 1
         pulledAt:
           type: string
           format: date-time
@@ -2728,6 +3911,8 @@ components:
       required:
         - images
         - total
+        - limit
+        - offset
       properties:
         images:
           type: array
@@ -2738,11 +3923,9 @@ components:
           description: Total number of images (across all pages)
         limit:
           type: integer
-          nullable: true
           description: Maximum number of results per page
         offset:
           type: integer
-          nullable: true
           description: Number of results skipped
 
     ImageOperationListResponse:
@@ -2779,15 +3962,17 @@ components:
       properties:
         cancelled:
           type: integer
-          description: Number of active operations moved to cancellation
+          description: Number of active operations that accepted a cancellation request
         tasksCancelled:
           type: integer
-          description: Number of in-memory async tasks cancelled and awaited
+          description: Number of in-memory image operation tasks cancelled and awaited
         operations:
           type: array
           items:
             $ref: '#/components/schemas/ImageOperationStatusResponse'
-          description: Terminal statuses for operations cancelled by the request
+          description: >
+            Terminal statuses for operations targeted by the request. An operation
+            may be completed when its durable commit won the cancellation race.
 
     ImageOperationStatusResponse:
       type: object
@@ -2805,7 +3990,7 @@ components:
         operationId:
           type: string
           format: uuid
-          description: Async image operation identifier
+          description: Image operation identifier
         statusUrl:
           type: string
           description: Relative URL for polling this operation status
@@ -2834,17 +4019,20 @@ components:
           description: >
             Current operation status. `cancelling` means cancellation was
             requested and cleanup is still running. DELETE cancellation
-            endpoints wait for cleanup and normally return `cancelled`.
+            endpoints wait for cleanup and normally return `cancelled`, but can
+            return `completed` when the durable commit wins the race.
         stage:
           type: string
           enum:
             - compressing
             - uploading
+            - finalizing
           nullable: true
           description: >
-            Current push stage, when a push has started compression or upload
-            work. Pull operations do not report a single stage because blob
-            fetches, decompression, disk writes, and validation can overlap.
+            Current push stage, when a push has started compression, upload, or
+            durable local snapshot and commit work. Pull operations do not report
+            a single stage because blob fetches, decompression, disk writes, and
+            validation can overlap. Finalization has no fixed duration.
         progress:
           type: number
           format: double
@@ -2855,7 +4043,9 @@ components:
             Overall progress from 0.0 to 1.0, rounded to two decimal places,
             when known. Pull progress is based on completed compressed OCI
             artifact bytes. Push compression and upload each account for half
-            of the overall progress.
+            of the measurable work. Push finalization holds overall progress at
+            0.99 while the local snapshot, validation, manifest publication, and
+            local index commit finish. Only `completed` reports 1.0.
         stageProgress:
           type: number
           format: double
@@ -2863,8 +4053,10 @@ components:
           minimum: 0
           maximum: 1
           description: >
-            Current push stage progress from 0.0 to 1.0, rounded to two
-            decimal places, when known. Pull operations leave this null.
+            Current push stage progress from 0.0 to 1.0, rounded to two decimal
+            places, when known. Finalization reports 0 while the durable local
+            snapshot is being created and 1 after that snapshot is ready. Pull
+            operations omit this field.
         averageSpeedMBps:
           type: number
           format: double
@@ -2877,21 +4069,22 @@ components:
             OCI artifact bytes over the pull operation timeline. Push has
             sequential stages, so this is per-stage speed: uncompressed VM
             bundle bytes while compressing, then compressed OCI blob bytes while
-            uploading.
+            uploading. Finalization does not report a byte rate.
         chunksCompleted:
           type: integer
           minimum: 0
           description: >
             Number of completed chunk units. Pull counts completed compressed
             chunk blobs. Push counts local chunks while compressing, then
-            compressed OCI blobs while uploading.
+            compressed OCI blobs while uploading. Finalization reports zero.
         chunksTotal:
           type: integer
           nullable: true
           minimum: 0
           description: >
             Total chunk units expected, when known. Pull uses the number of
-            chunk layers in the manifest. Push uses the current stage total.
+            chunk layers in the manifest. Push uses the current stage total and
+            omits it during finalization.
         bytesCompleted:
           type: integer
           format: int64
@@ -2900,7 +4093,8 @@ components:
             Bytes completed for the operation or current push stage. Pull
             counts completed compressed OCI artifact bytes, including the config
             blob. Push counts uncompressed VM bundle bytes while compressing,
-            then compressed OCI blob bytes while uploading.
+            then compressed OCI blob bytes while uploading. Finalization reports
+            zero because it has no byte-level progress source.
         bytesTotal:
           type: integer
           format: int64
@@ -2909,7 +4103,7 @@ components:
           description: >
             Total bytes expected for the operation or current push stage, when
             known. Pull uses compressed OCI artifact bytes. Push uses the
-            current stage total.
+            current stage total and omits it during finalization.
         startedAt:
           type: string
           format: date-time
@@ -2926,16 +4120,44 @@ components:
         digest:
           type: string
           nullable: true
-          description: Image digest once available
+          pattern: '^sha256:[a-f0-9]{64}$'
+          description: >
+            Image digest once available. Commit-outcome-unknown and
+            partially-committed push failures expose the candidate or confirmed
+            digest here for reconciliation.
         image:
           allOf:
             - $ref: '#/components/schemas/ImageResponse'
           nullable: true
           description: Completed image record, when available
+        errorCode:
+          type: string
+          enum:
+            - IMAGE_PULL_FAILED
+            - IMAGE_PUSH_FAILED
+            - IMAGE_PUSH_COMMIT_OUTCOME_UNKNOWN
+            - IMAGE_PUSH_PARTIALLY_COMMITTED
+            - IMAGE_PULL_TIMEOUT
+            - IMAGE_PUSH_TIMEOUT
+            - IMAGE_PULL_REGISTRY_UNAVAILABLE
+            - IMAGE_PUSH_REGISTRY_UNAVAILABLE
+            - IMAGE_PULL_CANCELLED
+            - IMAGE_PUSH_CANCELLED
+            - IMAGE_NOT_FOUND
+            - IMAGE_IN_USE
+            - INVALID_REFERENCE
+            - INVALID_IMAGE
+            - UNSUPPORTED_IMAGE_FORMAT
+          description: >
+            Stable machine-readable error code for a failed or cancelled
+            operation. It is omitted for active and successfully completed
+            operations. For an asynchronous operation, poll this field instead
+            of parsing `error`; a successful status lookup still returns HTTP
+            200 when the recorded operation has failed.
         error:
           type: string
           nullable: true
-          description: Failure or cancellation message
+          description: Human-readable failure or cancellation diagnostic, not a stable programmatic contract
 
     SystemCapabilitiesResponse:
       type: object
@@ -3056,20 +4278,21 @@ components:
           required:
             - port
             - host
-            - enableHTTPS
             - maxConcurrentRequests
           properties:
             port:
               type: integer
+              minimum: 1
+              maximum: 65535
               description: API server port
             host:
               type: string
-              description: API server host
-            enableHTTPS:
-              type: boolean
-              description: Whether HTTPS is enabled
+              description: API server bind host. Defaults to all interfaces.
+              example: 0.0.0.0
             maxConcurrentRequests:
               type: integer
+              minimum: 1
+              maximum: 10000
               description: Maximum concurrent requests
         logging:
           type: object
@@ -3078,6 +4301,7 @@ components:
             - enableFileLogging
             - retentionDays
             - maxTotalSize
+            - timezone
           properties:
             level:
               type: string
@@ -3092,10 +4316,16 @@ components:
               description: Whether file logging is enabled
             retentionDays:
               type: integer
+              minimum: 1
               description: Number of days to retain log files
             maxTotalSize:
               type: string
-              description: 'Maximum total log storage (e.g. "2GB", "500MB")'
+              description: >
+                Maximum total log storage as a positive whole number followed
+                by MB or GB, case-insensitive. Suffixes use 1024-based units.
+                Minimum 1 MB. Historical logs are removed by retention cleanup.
+                The active daily log is truncated before a new entry would
+                exceed this budget.
             timezone:
               type: string
               nullable: true
@@ -3113,22 +4343,31 @@ components:
           properties:
             sshPortRangeStart:
               type: integer
+              minimum: 1024
+              maximum: 65535
               description: Start of SSH port range
             sshPortRangeEnd:
               type: integer
+              minimum: 1024
+              maximum: 65535
               description: End of SSH port range
             autoEnableSSHForwarding:
               type: boolean
               description: Whether SSH forwarding is auto-enabled
             vncPortRangeStart:
               type: integer
+              minimum: 1024
+              maximum: 65535
               description: Start of VNC port range
             vncPortRangeEnd:
               type: integer
+              minimum: 1024
+              maximum: 65535
               description: End of VNC port range
         images:
           type: object
           required:
+            - defaultRegistry
             - insecureRegistries
             - maxParallelImageBlobTransfers
             - maxParallelImageCompressions
@@ -3136,14 +4375,22 @@ components:
             - maxParallelImageDiskWrites
           properties:
             defaultRegistry:
-              type: string
+              allOf:
+                - $ref: '#/components/schemas/RegistryHost'
               nullable: true
-              description: Default OCI registry
+              description: >
+                Lowercase registry hostname with an optional port from 1 to
+                65535, used to expand unqualified image references. Set to null
+                to require an explicit registry in every reference.
             insecureRegistries:
               type: array
+              uniqueItems: true
               items:
-                type: string
-              description: Registries that use HTTP instead of HTTPS
+                $ref: '#/components/schemas/RegistryHost'
+              description: >
+                Unique lowercase registry hostnames with optional valid ports
+                that use plain HTTP instead of HTTPS. Credentials and image
+                artifacts are not protected in transit.
             maxParallelImageBlobTransfers:
               type: integer
               minimum: 1
@@ -3175,12 +4422,106 @@ components:
 
     UpdateConfigRequest:
       type: object
+      description: >
+        At least one supported field must have a non-null value, except timezone
+        and defaultRegistry, where null explicitly restores the system/default
+        behavior. Other null fields are ignored and do not make a request effective.
+      anyOf:
+        - required:
+            - logging
+          properties:
+            logging:
+              type: object
+              anyOf:
+                - required:
+                    - level
+                  properties:
+                    level:
+                      type: string
+                - required:
+                    - retentionDays
+                  properties:
+                    retentionDays:
+                      type: integer
+                - required:
+                    - maxTotalSize
+                  properties:
+                    maxTotalSize:
+                      type: string
+                - required:
+                    - timezone
+        - required:
+            - networking
+          properties:
+            networking:
+              type: object
+              anyOf:
+                - required:
+                    - sshPortRangeStart
+                  properties:
+                    sshPortRangeStart:
+                      type: integer
+                - required:
+                    - sshPortRangeEnd
+                  properties:
+                    sshPortRangeEnd:
+                      type: integer
+                - required:
+                    - autoEnableSSHForwarding
+                  properties:
+                    autoEnableSSHForwarding:
+                      type: boolean
+                - required:
+                    - vncPortRangeStart
+                  properties:
+                    vncPortRangeStart:
+                      type: integer
+                - required:
+                    - vncPortRangeEnd
+                  properties:
+                    vncPortRangeEnd:
+                      type: integer
+        - required:
+            - images
+          properties:
+            images:
+              type: object
+              anyOf:
+                - required:
+                    - defaultRegistry
+                - required:
+                    - insecureRegistries
+                  properties:
+                    insecureRegistries:
+                      type: array
+                - required:
+                    - maxParallelImageBlobTransfers
+                  properties:
+                    maxParallelImageBlobTransfers:
+                      type: integer
+                - required:
+                    - maxParallelImageCompressions
+                  properties:
+                    maxParallelImageCompressions:
+                      type: integer
+                - required:
+                    - maxParallelImageDecompressions
+                  properties:
+                    maxParallelImageDecompressions:
+                      type: integer
+                - required:
+                    - maxParallelImageDiskWrites
+                  properties:
+                    maxParallelImageDiskWrites:
+                      type: integer
       properties:
         logging:
           type: object
+          nullable: true
           properties:
             level:
               type: string
+              nullable: true
               enum:
                 - debug
                 - info
@@ -3189,11 +4530,18 @@ components:
               description: Log level
             retentionDays:
               type: integer
+              nullable: true
               minimum: 1
               description: Number of days to retain log files
             maxTotalSize:
               type: string
-              description: 'Maximum total log storage (e.g. "2GB", "500MB"). Minimum 1MB.'
+              nullable: true
+              description: >
+                Maximum total log storage as a positive whole number followed
+                by MB or GB, case-insensitive. Suffixes use 1024-based units.
+                Minimum 1 MB. Historical logs are removed by retention cleanup.
+                The active daily log is truncated before a new entry would
+                exceed this budget.
             timezone:
               type: string
               nullable: true
@@ -3202,44 +4550,62 @@ components:
                 Set to null to use system timezone.
         networking:
           type: object
+          nullable: true
+          description: Networking changes are persisted and take effect after an agent restart.
           properties:
             sshPortRangeStart:
               type: integer
+              nullable: true
               minimum: 1024
               maximum: 65535
               description: Start of SSH port range
             sshPortRangeEnd:
               type: integer
+              nullable: true
               minimum: 1024
               maximum: 65535
               description: End of SSH port range
             autoEnableSSHForwarding:
               type: boolean
+              nullable: true
               description: Auto-enable SSH forwarding for new VMs
             vncPortRangeStart:
               type: integer
+              nullable: true
               minimum: 1024
               maximum: 65535
               description: Start of VNC port range
             vncPortRangeEnd:
               type: integer
+              nullable: true
               minimum: 1024
               maximum: 65535
               description: End of VNC port range
         images:
           type: object
+          nullable: true
           properties:
             defaultRegistry:
-              type: string
+              allOf:
+                - $ref: '#/components/schemas/RegistryHost'
               nullable: true
-              description: Default OCI registry
+              description: >
+                Lowercase registry hostname with an optional port from 1 to
+                65535, used to expand unqualified image references. Set to null
+                to require an explicit registry in every reference.
             insecureRegistries:
               type: array
+              nullable: true
+              uniqueItems: true
               items:
-                type: string
-              description: Registries that use HTTP instead of HTTPS
+                $ref: '#/components/schemas/RegistryHost'
+              description: >
+                Unique lowercase registry hostnames with optional valid ports
+                that use plain HTTP instead of HTTPS. Credentials and image
+                artifacts are not protected in transit.
             maxParallelImageBlobTransfers:
               type: integer
+              nullable: true
               minimum: 1
               maximum: 64
               description: >
@@ -3247,6 +4613,7 @@ components:
                 This controls ORAS blob fetch and push processes. Default is 16.
             maxParallelImageCompressions:
               type: integer
+              nullable: true
               minimum: 1
               maximum: 32
               description: >
@@ -3254,6 +4621,7 @@ components:
                 Default is 4.
             maxParallelImageDecompressions:
               type: integer
+              nullable: true
               minimum: 1
               maximum: 8
               description: >
@@ -3261,6 +4629,7 @@ components:
                 Default is 2.
             maxParallelImageDiskWrites:
               type: integer
+              nullable: true
               minimum: 1
               maximum: 4
               description: >
@@ -3278,8 +4647,11 @@ components:
             - soft
             - hard
           description: >
-            Reset mode. "soft" deletes all VMs, images, and the IPSW cache.
-            "hard" deletes everything and terminates the application.
+            Reset mode. "soft" attempts to delete all VMs and images and clear
+            the IPSW cache while keeping configuration and logs. "hard" also
+            attempts to delete all other agent-owned state, including the API
+            token and all Jeballto registry credentials, and terminates only
+            after complete success.
 
     SystemResetResponse:
       type: object
@@ -3329,7 +4701,7 @@ components:
           nullable: true
           items:
             type: string
-          description: List of errors encountered during reset
+          description: List of errors encountered during reset, omitted when empty
 
     RegistryLoginResponse:
       type: object
@@ -3342,12 +4714,10 @@ components:
           description: Registry hostname
         status:
           type: string
+          enum:
+            - authenticated
           description: Authentication status
           example: authenticated
-        message:
-          type: string
-          nullable: true
-          description: Status message
 
     SuccessResponse:
       type: object
@@ -3375,56 +4745,10 @@ components:
           properties:
             code:
               type: string
-              description: Error code
-              enum:
-                - UNAUTHORIZED
-                - INVALID_ID
-                - INVALID_REQUEST
-                - PAYLOAD_TOO_LARGE
-                - NOT_FOUND
-                - CREATE_FAILED
-                - START_FAILED
-                - STOP_FAILED
-                - PAUSE_FAILED
-                - RESUME_FAILED
-                - DELETE_FAILED
-                - SSH_NOT_CONFIGURED
-                - VNC_NOT_CONFIGURED
-                - VNC_ENABLE_FAILED
-                - VNC_DISABLE_FAILED
-                - GUI_OPEN_FAILED
-                - GUI_CLOSE_FAILED
-                - VM_LIMIT_REACHED
-                - INSTALL_FAILED
-                - INSTALL_IN_PROGRESS
-                - EXECUTE_FAILED
-                - EXECUTE_TIMEOUT
-                - INVALID_STATE
-                - CAPABILITY_UNAVAILABLE
-                - TOO_MANY_REQUESTS
-                - IMAGE_NOT_FOUND
-                - IMAGE_PULL_FAILED
-                - IMAGE_PULL_CANCELLED
-                - IMAGE_PUSH_FAILED
-                - IMAGE_PUSH_CANCELLED
-                - INVALID_REFERENCE
-                - REGISTRY_AUTH_FAILED
-                - REGISTRY_LOGOUT_FAILED
-                - CONFIRMATION_REQUIRED
-                - CLONE_FAILED
-                - WIPE_FAILED
-                - RESET_FAILED
-                - CONFIG_UPDATE_FAILED
-                - INTERNAL_ERROR
+              description: Stable machine-readable error code for the specific operation
             message:
               type: string
               description: Error message
-            details:
-              type: object
-              nullable: true
-              additionalProperties:
-                type: string
-              description: Additional error details
 
     JeballtofileRequest:
       type: object
@@ -3436,22 +4760,38 @@ components:
           type: string
           minLength: 1
           maxLength: 100
-          description: VM name
+          description: >
+            VM name. Uses Unicode alphanumeric characters plus hyphen,
+            underscore, space, and dot. Leading or trailing whitespace is not
+            allowed.
           example: my-dev-vm
         source:
           type: string
+          nullable: true
+          minLength: 1
+          x-utf8-maxBytes: 8192
           description: >
-            IPSW source for macOS installation. Required when steps contain
-            an 'install' step. Accepts HTTPS URL, file:// URL, or absolute path.
+            IPSW source for macOS installation. Accepts HTTPS URL, file:// URL,
+            or absolute path. Input is limited to 8,192 UTF-8 bytes, and a
+            normalized local or file:// path is limited to 4,096 UTF-8 bytes.
+            Requires exactly one install step. Omit to download the latest macOS
+            during install.
           example: "https://updates.cdn-apple.com/.../RestoreImage.ipsw"
         resources:
-          $ref: '#/components/schemas/VMResourcesDTO'
+          allOf:
+            - $ref: '#/components/schemas/VMResourcesDTO'
+          nullable: true
         steps:
           type: array
           minItems: 1
+          maxItems: 1000
           items:
             $ref: '#/components/schemas/JeballtofileStep'
-          description: Ordered list of steps to execute
+          description: >
+            Ordered list of up to 1000 steps to execute. The full lifecycle sequence
+            is validated before a VM is created: install requires a newly created VM,
+            start requires an installed and stopped VM, and stop, GUI open,
+            keystrokes, and execute require a running VM.
 
     JeballtofileStep:
       type: object
@@ -3464,34 +4804,60 @@ components:
           description: Step type
         keystrokes:
           type: array
+          nullable: true
+          minItems: 1
+          maxItems: 1000
           items:
             type: string
-          description: Keystroke sequences (required for 'keystrokes' type)
+            maxLength: 10000
+          description: >
+            Keystroke sequences required for a keystrokes step. The complete
+            array may contain at most 10,000 characters across all strings.
         command:
           type: string
-          description: Shell command to execute (required for 'execute' type)
+          nullable: true
+          minLength: 1
+          x-utf8-maxBytes: 65536
+          description: Shell command to execute, limited to 65,536 UTF-8 bytes (required for 'execute' type)
         user:
           type: string
+          nullable: true
+          minLength: 1
+          maxLength: 255
+          pattern: '^[A-Za-z0-9_][A-Za-z0-9_.-]*$'
           default: admin
           description: SSH user (for 'execute' type)
         password:
           type: string
-          default: admin
-          description: SSH password (for 'execute' type)
+          nullable: true
+          x-utf8-maxBytes: 16384
+          description: >
+            SSH password for `execute`, limited to 16,384 UTF-8 bytes. NUL,
+            carriage return, and newline characters are rejected. Omit for key-based authentication.
         timeout:
           type: integer
+          nullable: true
           minimum: 1
           maximum: 600
           default: 30
           description: Command timeout in seconds (for 'execute' type)
         seconds:
           type: integer
+          nullable: true
           minimum: 1
           maximum: 300
           description: Wait duration in seconds (required for 'wait' type)
+      description: Fields belonging to a different step type are rejected.
 
     JeballtofileResponse:
       type: object
+      required:
+        - id
+        - vmId
+        - status
+        - currentStep
+        - totalSteps
+        - message
       properties:
         id:
           type: string
@@ -3513,6 +4879,13 @@ components:
 
     JeballtofileStatusResponse:
       type: object
+      required:
+        - id
+        - vmId
+        - status
+        - currentStep
+        - totalSteps
+        - stepResults
       properties:
         id:
           type: string
@@ -3537,6 +4910,10 @@ components:
 
     JeballtofileStepResult:
       type: object
+      required:
+        - step
+        - type
+        - status
       properties:
         step:
           type: integer
@@ -3553,6 +4930,9 @@ components:
 
     JeballtofileListResponse:
       type: object
+      required:
+        - executions
+        - total
       properties:
         executions:
           type: array
@@ -3562,6 +4942,73 @@ components:
           type: integer
 
   responses:
+    MethodNotAllowed:
+      description: The path exists but does not support the requested HTTP method
+      headers:
+        Allow:
+          description: Comma-separated methods supported by the requested path
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: METHOD_NOT_ALLOWED
+              message: The requested method is not allowed for this resource
+
+    PayloadTooLarge:
+      description: Request body exceeds the 1 MiB server limit
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: PAYLOAD_TOO_LARGE
+              message: Request body exceeds maximum size of 1048576 bytes
+
+    TooManyRequests:
+      description: HTTP connection capacity or image-operation capacity is exhausted
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            connectionCapacity:
+              value:
+                error:
+                  code: TOO_MANY_REQUESTS
+                  message: Maximum concurrent connections exceeded
+            imageOperationCapacity:
+              value:
+                error:
+                  code: TOO_MANY_IMAGE_OPERATIONS
+                  message: Maximum active image operation count reached
+
+    RequestHeadersTooLarge:
+      description: Request headers exceed the 64 KiB server limit
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: HEADERS_TOO_LARGE
+              message: Request headers exceed maximum size of 65536 bytes
+
+    MaintenanceInProgress:
+      description: A destructive maintenance operation is blocking mutations
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: MAINTENANCE_IN_PROGRESS
+              message: The agent is performing destructive maintenance
+
     BadRequest:
       description: Invalid request
       content:
@@ -3595,6 +5042,46 @@ components:
               code: NOT_FOUND
               message: VM not found
 
+    ImageNotFound:
+      description: Local image not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: IMAGE_NOT_FOUND
+              message: Image not found
+
+    ImageOperationNotFound:
+      description: Image pull or push operation not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: IMAGE_OPERATION_NOT_FOUND
+              message: Image operation not found
+
+    ImagePushSourceNotFound:
+      description: Source VM or local image not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            sourceVM:
+              value:
+                error:
+                  code: NOT_FOUND
+                  message: Source VM not found
+            sourceImage:
+              value:
+                error:
+                  code: IMAGE_NOT_FOUND
+                  message: Source image not found
+
     ConcurrentVMLimit:
       description: Concurrent VM limit reached (max 2 on Apple Silicon)
       content:
@@ -3627,3 +5114,14 @@ components:
             error:
               code: INTERNAL_ERROR
               message: Internal server error
+
+    GatewayTimeout:
+      description: A required external operation timed out
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: REGISTRY_AUTH_TIMEOUT
+              message: Registry operation timed out

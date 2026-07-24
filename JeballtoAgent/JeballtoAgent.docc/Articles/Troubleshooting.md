@@ -6,7 +6,7 @@ Common problems and how to fix them.
 
 **"Jeballto VM Agent requires Apple Silicon (arm64)"**
 
-Jeballto only runs on M1/M2/M3/M4 Macs. No Intel support.
+Jeballto runs on Apple Silicon Macs. Intel Macs are not supported.
 
 **"Failed to create listener" (port conflict)**
 
@@ -20,7 +20,9 @@ lsof -i :8011
 
 **Permission denied**
 
-Ensure the app has virtualization entitlement and Full Disk Access if running from a non-standard location.
+Use an app signed with the virtualization entitlement. The default application support, cache, and log directories
+do not require Full Disk Access. If you configured storage inside a protected location, choose a writable directory
+or grant only the access that location requires.
 
 **Local network permission denied (PolicyDenied)**
 
@@ -43,7 +45,8 @@ curl -X POST http://127.0.0.1:8011/v1/vms/$VM_ID/install \
 
 **VM_LIMIT_REACHED (409)**
 
-Max 2 VMs can run at once. Stop one first:
+At most 2 VMs can consume capacity at once. Installing, transitional, running, paused, and in-flight reserved VMs
+count. Stop one first or wait for its active lifecycle operation to finish:
 
 ```bash
 # See which VMs are running
@@ -81,7 +84,8 @@ curl -X POST http://127.0.0.1:8011/v1/vms/$VM_ID/install \
 
 **Insufficient disk space**
 
-Installation needs ~100 GB free (download + disk image). Check with `df -h`.
+Allow space for the configured VM disk, the downloaded IPSW, and installation working data. About 100 GB free is a
+reasonable starting point for the default 64 GB VM disk. Check with `df -h`.
 
 **Network timeout during auto-download**
 
@@ -89,7 +93,10 @@ Download the IPSW manually and use the local file path option.
 
 **Reclaiming disk space used by downloads**
 
-IPSWs are cached at `~/Library/Caches/Jeballto/IPSWCache/` (typically 12-18 GB each) and reused across installs. Clear with `POST /v1/system/reset`, or remove the directory manually while the agent is stopped.
+IPSWs are cached at `~/Library/Caches/Jeballto/IPSWCache/` and reused across installs. The cache can consume
+substantial space when it contains several restore images. To remove only this cache, stop the agent and delete that
+directory. A soft `POST /v1/system/reset?confirm=true` also clears it, but that endpoint is destructive: it attempts
+to delete every VM and local image too.
 
 ## Command Execution Fails
 
@@ -100,6 +107,12 @@ The VM's SSH port isn't assigned yet. Check the VM state and SSH info:
 ```bash
 curl http://127.0.0.1:8011/v1/vms/$VM_ID/state -H "Authorization: Bearer $TOKEN"
 curl http://127.0.0.1:8011/v1/vms/$VM_ID/ssh -H "Authorization: Bearer $TOKEN"
+```
+
+When automatic forwarding is disabled, enable it after the VM reaches `running`:
+
+```bash
+curl -X POST http://127.0.0.1:8011/v1/vms/$VM_ID/ssh -H "Authorization: Bearer $TOKEN"
 ```
 
 **Command timeout (504)**
@@ -117,9 +130,9 @@ Max timeout: 600 seconds.
 
 **"Connection refused" or SSH errors**
 
-1. VM must be in `RUNNING` state
+1. VM must be in `running` state
 2. Remote Login must be enabled in the guest: System Settings - General - Sharing - Remote Login
-3. The default credentials are `admin`/`admin`. If you changed them, pass the credentials explicitly:
+3. The API defaults the username to `admin` but does not assume a password. Configure key authentication in the guest or pass its actual credentials explicitly:
 
 ```bash
 curl -X POST http://127.0.0.1:8011/v1/vms/$VM_ID/execute \
@@ -130,8 +143,8 @@ curl -X POST http://127.0.0.1:8011/v1/vms/$VM_ID/execute \
 
 **Keystroke injection not working**
 
-- For `RUNNING` VMs: keystrokes go through `VZVirtualMachineView` (a hidden view is created if no GUI window is open)
-- For `INSTALLING` VMs: keystrokes also work (useful for setup wizard automation)
+- For `running` VMs: keystrokes go through `VZVirtualMachineView` (a hidden view is created if no GUI window is open)
+- For `installing` VMs: keystrokes also work (useful for setup wizard automation)
 - If nothing happens: try opening the GUI window first
 
 ```bash
@@ -153,7 +166,8 @@ The `oras` and `zstd` CLIs are required for image operations. Either bundle them
 }
 ```
 
-Install oras: `brew install oras`.
+Install both tools if needed, then set `orasPath` and `zstdPath` to their actual executable paths. A Homebrew install
+is not discovered automatically unless its path is configured. Released app bundles normally contain both tools.
 
 **Image pull fails (authentication)**
 
@@ -165,6 +179,21 @@ curl -X POST http://127.0.0.1:8011/v1/registries/login \
   -H "Content-Type: application/json" \
   -d '{"registry":"ghcr.io","username":"myuser","password":"ghp_mytoken"}'
 ```
+
+Jeballto stores successful registry logins in its own macOS Keychain service. Docker and standalone ORAS login state
+is intentionally ignored. If a credential was added with another tool, repeat the login through this API.
+
+**Image push remains at 0.99**
+
+Poll the operation's `statusUrl`. When it reports `status: "running"`, `stage: "finalizing"`, and `progress: 0.99`,
+compression and blob upload are complete, but the push is still creating and validating its durable local snapshot,
+publishing the OCI manifest, or committing the local image index. This stage has no fixed duration. Filesystem cloning
+can finish quickly, while an unsupported clone or cross-filesystem destination falls back to a correct regular copy.
+
+The byte and chunk counters reset during finalization, and byte totals and speed are omitted because the stage has no
+reliable byte-level progress source. Keep polling until a terminal status appears. Success is exactly
+`status: "completed"` with `progress: 1.0`. If the operation fails, use `errorCode` for recovery and `error` for the
+human-readable diagnostic.
 
 **Image pull fails (insecure registry)**
 
@@ -178,14 +207,43 @@ For local HTTP registries, add them to config.json:
 }
 ```
 
+Only do this on a trusted network. Plain HTTP exposes registry credentials and VM image artifacts in transit.
+
+**`UNSUPPORTED_IMAGE_FORMAT` when pulling an older image**
+
+Jeballto 1.0 requires **Jeballto VM Bundle Format v1**. Images pushed by pre-1.0 builds without a `formatVersion`
+field are legacy unversioned artifacts and are not accepted. Start from the original VM and push it again with a
+current agent, preferably under a new tag. A blocking pull reports HTTP 400 with `UNSUPPORTED_IMAGE_FORMAT` instead
+of downloading the chunk layers. `POST /v1/vms` returns the same error when its `image` field triggers an implicit
+pull.
+
+An asynchronous pull initially returns HTTP 202. Poll its `statusUrl` and inspect `errorCode`: an unsupported format
+finishes with `status: "failed"` and `errorCode: "UNSUPPORTED_IMAGE_FORMAT"`. The status lookup itself returns HTTP
+200 because the lookup succeeded. Use `errorCode` for program logic and `error` only as a human-readable diagnostic.
+
+`INVALID_IMAGE` means the artifact claims to be v1 but violates the v1 schema, chunk integrity, required bundle-file,
+or ASIF disk contract. Rebuild and push the image again rather than retrying the same digest.
+
+Pre-1.0 local image indexes without `formatVersion` and explicit managed-bundle ownership are rejected. Stop the
+agent, remove the incompatible `images.json` and `images.json.bak` files plus their managed UUID-named image bundles,
+then pull the images again or push them from the original VMs. There is no pre-1.0 local index migration.
+
+**`IMAGE_PUSH_COMMIT_OUTCOME_UNKNOWN` or `IMAGE_PUSH_PARTIALLY_COMMITTED`**
+
+These codes describe the OCI manifest commit boundary. `IMAGE_PUSH_COMMIT_OUTCOME_UNKNOWN` means manifest
+publication started, but interruption or invalid tool output prevented Jeballto from confirming whether the registry
+accepted it. `IMAGE_PUSH_PARTIALLY_COMMITTED` means the registry commit was confirmed, but the local image index
+could not be finalized. Inspect the tag in the registry, then pull the same reference. A successful pull rebuilds the
+authoritative local record. Do not treat either code as an ordinary safe-to-retry failure without reconciling the tag.
+
 **"Invalid image reference"**
 
-References must include a registry. Format: `registry/repo:tag`
+References must include a registry unless `images.defaultRegistry` is configured. Format: `registry/repo:tag`
 
 ```
 OK: ghcr.io/myorg/vm:latest
 OK: localhost:5000/vms/dev:latest
-NOT OK: myorg/vm:latest          (missing registry)
+CONDITIONAL: myorg/vm:latest     (valid only with images.defaultRegistry)
 NOT OK: vm:latest                (missing registry and repo)
 ```
 
@@ -209,11 +267,20 @@ curl http://127.0.0.1:8011/v1/vms/$VM_ID/ssh -H "Authorization: Bearer $TOKEN"
 
 **401 Unauthorized on every request**
 
-Get the token from config:
+Choose **Copy API Token** in the menu-bar item, then paste the full value into your shell:
 
 ```bash
-cat ~/Library/Application\ Support/Jeballto/config.json | grep token
+export TOKEN='paste-token-here'
 ```
+
+An ad hoc Debug build without an application Keychain access group uses the login Keychain, where
+`security find-generic-password -s com.jeballto.vmagent.api -a bearer-token -w` also works. Do not rely on that
+command for a signed Release because it uses the data protection Keychain.
+
+If startup reports Keychain status `-34018`, inspect the entitlements of the built app. Signed distributions
+need a provisioning-profile-backed `com.apple.application-identifier` to access the data protection Keychain.
+The built app must also contain `keychain-access-groups` with the same expanded identifier. Unsigned development
+builds automatically use the login Keychain instead.
 
 **404 Not Found**
 
@@ -225,16 +292,17 @@ curl http://127.0.0.1:8011/v1/vms -H "Authorization: Bearer $TOKEN"
 
 ## State Issues
 
-**VM stuck in STARTING/STOPPING/PAUSING/RESUMING**
+**VM stuck in a transitional state**
 
-Lifecycle failures now automatically transition to ERROR state. If a VM is still stuck in a transitional state (e.g. after a crash), restart the agent. On startup, transitional states are reset to STOPPED:
+Lifecycle failures automatically transition to `error`. If a VM is still stuck in `starting`, `stopping`,
+`pausing`, or `resuming` after a crash, restart the agent. On startup, transitional states are reset to `stopped`:
 
 ```bash
 killall JeballtoAgent
 open -a JeballtoAgent
 ```
 
-**VM in ERROR state**
+**VM in `error` state**
 
 Check events for the error message:
 
@@ -243,9 +311,11 @@ curl "http://127.0.0.1:8011/v1/vms/$VM_ID/events?limit=10" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-From ERROR you can stop (reach STOPPED) or delete:
+From `error`, use stop as the recovery action. A complete installed VM reaches `stopped`; an incomplete installation
+is cleaned and reaches `created`, where installation can be retried. You can also delete it:
 
 ```bash
+curl -X POST http://127.0.0.1:8011/v1/vms/$VM_ID/stop -H "Authorization: Bearer $TOKEN"
 curl -X DELETE http://127.0.0.1:8011/v1/vms/$VM_ID -H "Authorization: Bearer $TOKEN"
 ```
 
@@ -263,11 +333,14 @@ Enable in config.json:
 
 Restart agent. Logs are written to `~/Library/Logs/Jeballto/agent-YYYY-MM-DD.log`.
 
-Debug logging shows: all API requests, state transitions, event publishing, oras commands, SSH process details.
+Debug logging includes API request paths, registered routes, ORAS commands, and diagnostic messages emitted by each
+component. It does not produce a complete audit record of every state transition, event publication, or SSH process
+detail.
 
 ## Reset Everything
 
-Use hard reset to wipe VMs, images, config, caches, and logs. The agent exits after the response.
+Use hard reset to wipe VMs, images, config, caches, logs, the API token, and Jeballto's stored registry credentials.
+The agent exits after a fully successful response.
 
 ```bash
 curl -X POST "http://127.0.0.1:8011/v1/system/reset?confirm=true" \

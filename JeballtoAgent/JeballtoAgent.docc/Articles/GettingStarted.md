@@ -1,230 +1,123 @@
 # Getting Started
 
-Install, run, and make your first API call in under five minutes.
+Install JeballtoAgent, verify its API, and create your first VM.
 
-## Prerequisites
+## Requirements
 
-- Apple Silicon Mac (M1/M2/M3/M4)
-- macOS 26.0+
+- Apple Silicon Mac
+- macOS 26.0 or later
 
-## Install and Run
+## Install and Launch
 
 1. Download the latest release from [GitHub Releases](https://github.com/jeballto/jeballto/releases/latest).
-2. Unzip `JeballtoAgent.app`.
-3. Move it to `/Applications`.
-4. Open JeballtoAgent.
+2. Move `JeballtoAgent.app` to `/Applications`.
+3. Open JeballtoAgent.
+4. Allow Local Network access when macOS asks. SSH and VNC forwarding require it.
 
-On first launch, macOS asks for **Local Network** access. Click **Allow** - it is required for SSH and VNC port forwarding. If you miss the prompt, enable it later in System Settings > Privacy & Security > Local Network.
-
-First run also writes `~/Library/Application Support/Jeballto/config.json` with your auth token.
+JeballtoAgent runs from the menu bar. Choose **Copy API Token**, then set these shell variables:
 
 ```bash
-# Grab the auth token
-export TOKEN=$(cat ~/Library/Application\ Support/Jeballto/config.json | grep token | cut -d'"' -f4)
+export JEBALLTO_API='http://127.0.0.1:8011'
+export JEBALLTO_TOKEN='paste-token-here'
 ```
 
-## Create and Install a VM
+Verify that the agent is ready:
 
 ```bash
-# Create VM (4 CPU, 8GB RAM, 64GB disk)
-VM_ID=$(curl -s -X POST http://127.0.0.1:8011/v1/vms \
-  -H "Authorization: Bearer $TOKEN" \
+curl -fsS "$JEBALLTO_API/v1/health"
+```
+
+The health endpoint is the only endpoint that does not require authentication.
+
+## Create a VM
+
+```bash
+curl -fsS -X POST "$JEBALLTO_API/v1/vms" \
+  -H "Authorization: Bearer $JEBALLTO_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"name":"dev","resources":{"cpuCount":4,"memorySize":"8GB","diskSize":"64GB"}}' \
-  | grep -o '"id":"[^"]*' | cut -d'"' -f4)
-
-echo "VM ID: $VM_ID"
+  -d '{"name":"dev","resources":{"cpuCount":4,"memorySize":"8GB","diskSize":"64GB"}}'
 ```
 
-### Install macOS
-
-Pick one of three methods:
-
-**Auto-download latest from Apple (recommended):**
+Copy the `id` from the response:
 
 ```bash
-curl -X POST http://127.0.0.1:8011/v1/vms/$VM_ID/install \
-  -H "Authorization: Bearer $TOKEN"
+export VM_ID='paste-vm-id-here'
 ```
 
-**From a URL:**
+## Install macOS
+
+Start an installation using the latest compatible restore image from Apple:
 
 ```bash
-curl -X POST http://127.0.0.1:8011/v1/vms/$VM_ID/install \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"source":"https://example.com/macos.ipsw"}'
+curl -fsS -X POST "$JEBALLTO_API/v1/vms/$VM_ID/install" \
+  -H "Authorization: Bearer $JEBALLTO_TOKEN"
 ```
 
-**From a local file:**
+Installation runs asynchronously. Check its status:
 
 ```bash
-curl -X POST http://127.0.0.1:8011/v1/vms/$VM_ID/install \
-  -H "Authorization: Bearer $TOKEN" \
+curl -fsS "$JEBALLTO_API/v1/vms/$VM_ID/install/status" \
+  -H "Authorization: Bearer $JEBALLTO_TOKEN"
+```
+
+Repeat the status request until `status` is `completed`. Do not start the VM while installation is still active.
+If the status becomes `failed`, `cancelled`, or `interrupted`, inspect `message` and see <doc:Troubleshooting>.
+
+To install a specific IPSW instead, pass an HTTPS URL, a `file://` URL, or an absolute local path:
+
+```bash
+curl -fsS -X POST "$JEBALLTO_API/v1/vms/$VM_ID/install" \
+  -H "Authorization: Bearer $JEBALLTO_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"source":"/Users/me/Downloads/macOS.ipsw"}'
 ```
 
-**Monitor progress (0.0 to 1.0):**
+## Start and Open the VM
 
 ```bash
-watch -n 2 "curl -s http://127.0.0.1:8011/v1/vms/$VM_ID/install/status \
-  -H 'Authorization: Bearer $TOKEN'"
+curl -fsS -X POST "$JEBALLTO_API/v1/vms/$VM_ID/start" \
+  -H "Authorization: Bearer $JEBALLTO_TOKEN"
+
+curl -fsS -X POST "$JEBALLTO_API/v1/vms/$VM_ID/gui" \
+  -H "Authorization: Bearer $JEBALLTO_TOKEN"
 ```
 
-## Start and Access
+Closing the native VM window does not stop the VM.
+
+## Optional SSH Access
+
+Enable Remote Login inside the guest first. Then enable or inspect host forwarding with this idempotent request:
 
 ```bash
-# Start VM
-curl -X POST http://127.0.0.1:8011/v1/vms/$VM_ID/start \
-  -H "Authorization: Bearer $TOKEN"
-
-# Get SSH port (each VM gets a unique port)
-SSH_PORT=$(curl -s http://127.0.0.1:8011/v1/vms/$VM_ID/ssh \
-  -H "Authorization: Bearer $TOKEN" | grep -o '"port":[0-9]*' | cut -d':' -f2)
-
-# Connect via SSH (enable Remote Login in guest first: System Settings > Sharing)
-ssh -p $SSH_PORT admin@127.0.0.1
+curl -fsS -X POST "$JEBALLTO_API/v1/vms/$VM_ID/ssh" \
+  -H "Authorization: Bearer $JEBALLTO_TOKEN"
 ```
 
-## Run Commands Inside the VM
+Copy the returned `port`, then connect with the guest username:
 
 ```bash
-# Run a command via SSH (default: user=admin, password=admin)
-curl -X POST http://127.0.0.1:8011/v1/vms/$VM_ID/execute \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"command":"uname -a"}'
-
-# Run with a longer timeout (default 30s, max 600s)
-curl -X POST http://127.0.0.1:8011/v1/vms/$VM_ID/execute \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"command":"brew install git","timeout":120}'
+export SSH_PORT='paste-port-here'
+ssh -p "$SSH_PORT" admin@127.0.0.1
 ```
 
-### Keystroke Injection
+`status: "ready"` means the host proxy is listening. It does not prove that Remote Login is enabled in the guest.
 
-For when SSH is not available - like automating the macOS Setup Assistant or interacting with GUI apps:
+## Stop or Delete the VM
 
 ```bash
-# Type username, tab to password field, type password, press Enter
-curl -X POST http://127.0.0.1:8011/v1/vms/$VM_ID/keystrokes \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"keystrokes":["admin<tab>secretpassword<enter>"]}'
+curl -fsS -X POST "$JEBALLTO_API/v1/vms/$VM_ID/stop" \
+  -H "Authorization: Bearer $JEBALLTO_TOKEN"
 
-# Open Spotlight, type "terminal", open it
-curl -X POST http://127.0.0.1:8011/v1/vms/$VM_ID/keystrokes \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"keystrokes":["<leftCmdOn><space><leftCmdOff><wait2s>terminal<wait1s><enter>"]}'
+curl -fsS -X DELETE "$JEBALLTO_API/v1/vms/$VM_ID" \
+  -H "Authorization: Bearer $JEBALLTO_TOKEN"
 ```
 
-Special tokens: `<enter>`, `<tab>`, `<space>`, `<delete>`, `<esc>`, `<left>`, `<right>`, `<up>`, `<down>`, `<f1>`-`<f12>`, `<home>`, `<end>`, modifiers with `<leftCmdOn/Off>`, `<leftShiftOn/Off>`, `<leftCtrlOn/Off>`, `<leftAltOn/Off>`, and waits with `<wait5s>`, `<waitNs>`.
-
-Keys are sent ~75 ms apart. Add `<waitNs>` between actions that trigger animations or app launches.
-
-## GUI Window
-
-```bash
-# Open GUI window (idempotent - brings to front if already open)
-curl -X POST http://127.0.0.1:8011/v1/vms/$VM_ID/gui \
-  -H "Authorization: Bearer $TOKEN"
-
-# Close GUI window
-curl -X DELETE http://127.0.0.1:8011/v1/vms/$VM_ID/gui \
-  -H "Authorization: Bearer $TOKEN"
-```
-
-## Clone a VM
-
-Create a copy of an existing VM (new UUID, MAC address, machine ID):
-
-```bash
-curl -X POST http://127.0.0.1:8011/v1/vms/$VM_ID/clone \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"name":"dev-clone"}'
-```
-
-The source VM must be stopped (or use `?force=true`). The clone starts in `STOPPED` state.
-
-## VNC - Remote Desktop
-
-```bash
-# Enable VNC forwarding
-curl -X POST http://127.0.0.1:8011/v1/vms/$VM_ID/vnc \
-  -H "Authorization: Bearer $TOKEN"
-# -> {"host":"127.0.0.1","port":5901,"status":"ready"}
-
-# Connect with macOS built-in VNC client
-open vnc://localhost:5901
-
-# Check VNC status
-curl http://127.0.0.1:8011/v1/vms/$VM_ID/vnc \
-  -H "Authorization: Bearer $TOKEN"
-
-# Disable VNC forwarding (releases the port)
-curl -X DELETE http://127.0.0.1:8011/v1/vms/$VM_ID/vnc \
-  -H "Authorization: Bearer $TOKEN"
-```
-
-## OCI Images - Share VMs Across Machines
-
-```bash
-# Login to registry
-curl -X POST http://127.0.0.1:8011/v1/registries/login \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"registry":"ghcr.io","username":"myuser","password":"ghp_mytoken"}'
-
-# Push VM to registry
-curl -X POST http://127.0.0.1:8011/v1/images/push \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"reference":"ghcr.io/myorg/vms/dev:latest","source":"vm:'$VM_ID'"}'
-
-# Pull on another machine
-curl -X POST http://127.0.0.1:8011/v1/images/pull \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"reference":"ghcr.io/myorg/vms/dev:latest"}'
-
-# Create VM from pulled image (no install needed)
-curl -X POST http://127.0.0.1:8011/v1/vms \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"name":"from-image","image":"ghcr.io/myorg/vms/dev:latest"}'
-```
-
-## Common Operations
-
-```bash
-# List all VMs
-curl http://127.0.0.1:8011/v1/vms -H "Authorization: Bearer $TOKEN"
-
-# Check VM state
-curl http://127.0.0.1:8011/v1/vms/$VM_ID/state -H "Authorization: Bearer $TOKEN"
-
-# Pause VM (saves state, can resume later)
-curl -X POST http://127.0.0.1:8011/v1/vms/$VM_ID/pause -H "Authorization: Bearer $TOKEN"
-
-# Resume paused VM
-curl -X POST http://127.0.0.1:8011/v1/vms/$VM_ID/resume -H "Authorization: Bearer $TOKEN"
-
-# Stop VM
-curl -X POST http://127.0.0.1:8011/v1/vms/$VM_ID/stop -H "Authorization: Bearer $TOKEN"
-
-# Delete VM and all its files
-curl -X DELETE http://127.0.0.1:8011/v1/vms/$VM_ID -H "Authorization: Bearer $TOKEN"
-```
+Deleting a VM removes its bundle and cannot be undone.
 
 ## Next Steps
 
-- <doc:APIReference> - Complete REST API reference
-- <doc:Architecture> - How components interact
-- <doc:JeballtofileReference> - Automate VM provisioning with blueprints
-- <doc:OperatingTheAgent> - Status bar, auto-updates, login item, permissions
-- <doc:DevelopmentGuide> - Building and extending the agent
-- <doc:Troubleshooting> - Common issues and fixes
+- <doc:APIReference> - Complete REST API, OCI images, VNC, screenshots, commands, and keystrokes
+- <doc:JeballtofileReference> - Automated VM provisioning with JSON or YAML blueprints
+- <doc:OperatingTheAgent> - Status menu, caches, permissions, updates, and shutdown behavior
+- <doc:Troubleshooting> - Common errors and recovery
+- <doc:DevelopmentGuide> - Build, test, storage, and architecture details

@@ -4,14 +4,15 @@ A headless macOS virtual machine manager for Apple Silicon, exposing a REST API 
 
 ## Overview
 
-JeballtoAgent runs as a macOS menu-bar app on Apple Silicon (M1+, macOS 26.0+) and serves a REST API on `0.0.0.0:8011` by default. Same-machine examples use `localhost` or `127.0.0.1`. It writes an API token on first launch; see <doc:APIReference> for auth details.
+JeballtoAgent runs as a macOS menu-bar app on Apple Silicon with macOS 26.0+ and serves a REST API on port 8011, bound to all interfaces by default. It stores the API token in the macOS Keychain; see <doc:APIReference> for auth details.
 
 Two primary workflows:
 
 - **Blank VM:** create a VM, install macOS from an IPSW, start it, and interact via SSH or keystrokes.
 - **OCI image:** pull a previously pushed VM bundle, create a VM from it, start immediately - no install needed.
 
-Up to 2 VMs can run concurrently (Apple Silicon hardware limit). VM state is persisted across restarts.
+Jeballto allows up to 2 capacity-consuming VMs at once. Installing, transitional, running, and paused VMs count
+toward this product limit. VM state is persisted and reconciled across restarts.
 
 ## Getting Started
 

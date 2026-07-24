@@ -6,15 +6,17 @@ flowchart TD
         APIServer["APIServer\nHTTP · auth · routing"]
 
         APIServer --> VMManager
-        APIServer --> ImageManager
-        APIServer --> CommandExecutor
-        APIServer --> KeystrokeInjector
+        APIServer --> ImageOperationCoordinator
 
-        VMManager["VMManager\ncreate · start · stop · delete\npause · resume · clone · update\nlifetime expiry · shutdown cleanup"]
-        ImageManager["ImageManager\npull · push · delete\nlogin · logout"]
+        VMManager["VMManager\ncreate · start · stop · delete\npause · resume · clone · update\nSSH commands · GUI keystrokes\nlifetime expiry · shutdown cleanup"]
+        ImageOperationCoordinator["ImageOperationCoordinator\nadmission · capacity · tasks\nstatus · cancellation · drain"]
+        ImageManager["ImageManager\nimage directory · index commits\nregistry auth · source reservations"]
         CommandExecutor["CommandExecutor\nSSH commands"]
         KeystrokeInjector["KeystrokeInjector\nGUI keystrokes"]
 
+        ImageOperationCoordinator -->|"runs pull / push"| ImageManager
+        VMManager --> CommandExecutor
+        VMManager --> KeystrokeInjector
         VMManager --> VZVirtualMachine["VZVirtualMachine\nApple Virtualization"]
         ImageManager -->|"oras CLI"| Registry[("OCI Registry")]
     end
