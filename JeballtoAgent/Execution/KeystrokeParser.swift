@@ -11,6 +11,7 @@ enum KeystrokeParserError: Error, LocalizedError {
   case invalidWaitDuration(String)
   case tooManyActions(Int)
   case waitDurationTooLong(TimeInterval)
+  case unsupportedCharacter(Character, offset: Int)
 
   var errorDescription: String? {
     switch self {
@@ -19,6 +20,8 @@ enum KeystrokeParserError: Error, LocalizedError {
     case .tooManyActions(let count): "Too many keystroke actions (\(count), max \(KeystrokeParser.maxActions))"
     case .waitDurationTooLong(let duration):
       "Wait duration too long (\(duration)s, max \(KeystrokeParser.maxWaitDuration)s)"
+    case .unsupportedCharacter(let character, let offset):
+      "Unsupported character '\(character)' at offset \(offset); the keystroke layout is US ASCII"
     }
   }
 }
@@ -37,7 +40,19 @@ enum KeystrokeParser {
     var index = input.startIndex
 
     while index < input.endIndex {
-      if input[index] == "<" {
+      let offset = input.distance(from: input.startIndex, to: index)
+      if input[index] == "\\" {
+        let escapedIndex = input.index(after: index)
+        if escapedIndex < input.endIndex, input[escapedIndex] == "<" || input[escapedIndex] == ">"
+          || input[escapedIndex] == "\\"
+        {
+          try actions.append(contentsOf: charAction(input[escapedIndex], offset: offset + 1))
+          index = input.index(after: escapedIndex)
+        } else {
+          try actions.append(contentsOf: charAction(input[index], offset: offset))
+          index = input.index(after: index)
+        }
+      } else if input[index] == "<" {
         if let closeIndex = input[index...].firstIndex(of: ">") {
           let tokenStart = input.index(after: index)
           let token = String(input[tokenStart ..< closeIndex])
@@ -45,11 +60,11 @@ enum KeystrokeParser {
           actions.append(contentsOf: action)
           index = input.index(after: closeIndex)
         } else {
-          actions.append(contentsOf: charAction(input[index]))
+          try actions.append(contentsOf: charAction(input[index], offset: offset))
           index = input.index(after: index)
         }
       } else {
-        actions.append(contentsOf: charAction(input[index]))
+        try actions.append(contentsOf: charAction(input[index], offset: offset))
         index = input.index(after: index)
       }
 
@@ -150,7 +165,7 @@ enum KeystrokeParser {
     }
   }
 
-  private static func charAction(_ char: Character) -> [KeystrokeAction] {
+  private static func charAction(_ char: Character, offset: Int) throws -> [KeystrokeAction] {
     let str = String(char)
 
     // Check if this is a shifted symbol (e.g. &, !, @, #)
@@ -164,9 +179,18 @@ enum KeystrokeParser {
       ]
     }
 
-    let isUpper = char.isUppercase
-    let lookupChar = isUpper ? Character(char.lowercased()) : char
-    let keyCode = charToKeyCode[lookupChar] ?? 0
+    guard char.unicodeScalars.count == 1, let scalar = char.unicodeScalars.first, scalar.isASCII else {
+      throw KeystrokeParserError.unsupportedCharacter(char, offset: offset)
+    }
+    let isUpper = (65 ... 90).contains(scalar.value)
+    let lookupChar: Character = if isUpper, let lowercaseScalar = UnicodeScalar(scalar.value + 32) {
+      Character(String(lowercaseScalar))
+    } else {
+      char
+    }
+    guard let keyCode = charToKeyCode[lookupChar] else {
+      throw KeystrokeParserError.unsupportedCharacter(char, offset: offset)
+    }
 
     if isUpper {
       let shiftFlags = NSEvent.ModifierFlags.shift
