@@ -22,7 +22,7 @@ extension APIServer {
       )
     }
 
-    if let imageRef = createRequest.image, !imageRef.isEmpty, let response = requireCapability(.ociImagePackaging) {
+    if createRequest.image != nil, let response = requireCapability(.ociImagePackaging) {
       return response
     }
 
@@ -31,14 +31,34 @@ extension APIServer {
 
     do {
       let definition: VMDefinition
-      if let imageRef = createRequest.image, !imageRef.isEmpty {
-        let imageRecord = try await imageManager.pullImage(reference: imageRef)
-        definition = try await vmManager.createVMFromImage(
-          name: createRequest.name,
-          imagePath: imageRecord.localPath,
-          ephemeral: ephemeral,
-          lifetimeSeconds: lifetimeSeconds
+      if let imageRef = createRequest.image {
+        let pullResult = await pullImageForVMCreation(reference: imageRef)
+        guard case .success(let imageRecord) = pullResult else {
+          if case .failure(let response) = pullResult { return response }
+          return HTTPResponse.error("IMAGE_PULL_FAILED", message: "Image pull failed", statusCode: 500)
+        }
+        let imageClaim = try await imageManager.claimImageExportWithRecord(
+          imageRecord.id,
+          expectedReference: imageRecord.reference
         )
+        do {
+          guard let imageResources = imageClaim.record.resources else {
+            throw ImageManagerError.invalidImage(
+              "Image \(imageClaim.record.id.uuidString) is missing VM resource metadata"
+            )
+          }
+          definition = try await vmManager.createVMFromImage(
+            name: createRequest.name,
+            imagePath: imageClaim.record.localPath,
+            ephemeral: ephemeral,
+            lifetimeSeconds: lifetimeSeconds,
+            resources: imageResources
+          )
+          await imageManager.releaseImageExport(imageClaim.record.id, token: imageClaim.token)
+        } catch {
+          await imageManager.releaseImageExport(imageClaim.record.id, token: imageClaim.token)
+          throw error
+        }
       } else {
         let resources = createRequest.resources?.toVMResources() ?? VMResources.default
         guard resources.validate() else {
@@ -58,26 +78,44 @@ extension APIServer {
       let response = await makeVMResponse(from: definition)
       return HTTPResponse.json(response, statusCode: 201)
     } catch let error as ImageManagerError {
-      return APIRouteErrorMapper.imageManager(error, defaultCode: "IMAGE_PULL_FAILED")
+      return APIRouteErrorMapper.imageManager(
+        error,
+        defaultCode: "IMAGE_PULL_FAILED",
+        notFoundCode: "IMAGE_NOT_FOUND",
+        notFoundMessage: "The pulled image changed before VM creation could claim it"
+      )
     } catch let error as VMManagerError {
       return APIRouteErrorMapper.vmManager(error, defaultCode: "CREATE_FAILED")
     } catch { return HTTPResponse.error("CREATE_FAILED", message: error.localizedDescription, statusCode: 500) }
   }
 
   func handleListVMs(_ request: HTTPRequest) async -> HTTPResponse {
-    let allVMs = await vmManager.listVMs()
+    let pagination: (limit: Int, offset: Int)
+    do {
+      pagination = try HTTPQueryParameters.pagination(from: request)
+    } catch {
+      return invalidQueryParameter(error)
+    }
 
-    let requestedLimit = Int(request.queryParameters["limit"] ?? "") ?? 100
-    let limit = max(1, min(requestedLimit, 1000))
-    let offset = max(0, Int(request.queryParameters["offset"] ?? "") ?? 0)
+    let allVMs: [VMDefinition]
+    do {
+      allVMs = try await vmManager.listVMs()
+    } catch {
+      return HTTPResponse.error("LIST_VMS_FAILED", message: error.localizedDescription, statusCode: 500)
+    }
 
-    let paged = Array(allVMs.dropFirst(offset).prefix(limit))
+    let paged = Array(allVMs.dropFirst(pagination.offset).prefix(pagination.limit))
 
     var vmResponses: [VMResponse] = []
     for vm in paged {
       await vmResponses.append(makeVMResponse(from: vm))
     }
-    let response = VMListResponse(vms: vmResponses, total: allVMs.count, limit: limit, offset: offset)
+    let response = VMListResponse(
+      vms: vmResponses,
+      total: allVMs.count,
+      limit: pagination.limit,
+      offset: pagination.offset
+    )
     return HTTPResponse.json(response)
   }
 
@@ -122,8 +160,7 @@ extension APIServer {
     if let response = requireCapability(.macOSVirtualization) { return response }
 
     do {
-      try await vmManager.stopVM(vmId)
-      let definition = try await vmManager.getVM(vmId)
+      let definition = try await vmManager.stopVM(vmId)
       let response = await makeVMResponse(from: definition)
       return HTTPResponse.json(response)
     } catch let error as VMManagerError {
@@ -168,10 +205,15 @@ extension APIServer {
       return APIRouteErrorMapper.invalidID()
     }
 
-    let force = request.queryParameters["force"]?.lowercased() == "true"
+    let force: Bool
+    do {
+      force = try HTTPQueryParameters.boolean(named: "force", in: request, defaultValue: false) ?? false
+    } catch {
+      return invalidQueryParameter(error)
+    }
 
     do {
-      try await vmManager.deleteVM(vmId, deleteFiles: true, force: force)
+      try await vmManager.deleteVM(vmId, force: force)
       return HTTPResponse(statusCode: 204) // No content
     } catch let error as VMManagerError {
       return APIRouteErrorMapper.vmManager(
@@ -183,7 +225,13 @@ extension APIServer {
   }
 
   func handleWipeAllVMs(_ request: HTTPRequest) async -> HTTPResponse {
-    guard request.queryParameters["confirm"] == "true" else {
+    let confirmed: Bool
+    do {
+      confirmed = try HTTPQueryParameters.requiredTrue(named: "confirm", in: request)
+    } catch {
+      return invalidQueryParameter(error)
+    }
+    guard confirmed else {
       return HTTPResponse.error(
         "CONFIRMATION_REQUIRED",
         message: "Add ?confirm=true to confirm deletion of all VMs",
@@ -191,14 +239,28 @@ extension APIServer {
       )
     }
 
-    do {
-      await cancelActiveImageOperations()
-      let (deleted, failed, errors) = try await vmManager.wipeAllVMs()
-      let response = WipeAllResponse(deleted: deleted, failed: failed, errors: errors.isEmpty ? nil : errors)
-      return HTTPResponse.json(response)
-    } catch {
-      return HTTPResponse.error("WIPE_FAILED", message: error.localizedDescription, statusCode: 500)
+    guard await beginExclusiveMaintenance() else {
+      return HTTPResponse.error(
+        "MAINTENANCE_IN_PROGRESS",
+        message: "Another destructive maintenance operation is already running",
+        statusCode: 409
+      )
     }
+
+    let response: HTTPResponse
+    do {
+      await cancelAllJeballtofileExecutors()
+      await cancelActiveImageOperations()
+      await waitForActiveMutationsToDrain()
+      await cancelAllJeballtofileExecutors()
+      let (deleted, failed, errors) = try await vmManager.wipeAllVMs()
+      let body = WipeAllResponse(deleted: deleted, failed: failed, errors: errors.isEmpty ? nil : errors)
+      response = HTTPResponse.json(body)
+    } catch {
+      response = HTTPResponse.error("WIPE_FAILED", message: error.localizedDescription, statusCode: 500)
+    }
+    await endExclusiveMaintenance()
+    return response
   }
 
   func handleUpdateVM(_ request: HTTPRequest) async -> HTTPResponse {
@@ -260,25 +322,24 @@ extension APIServer {
       return HTTPResponse.error("INVALID_REQUEST", message: cloneValidation.error ?? "Invalid request", statusCode: 400)
     }
 
-    let resources = cloneRequest.resources?.toVMResources()
-    if let r = resources, !r.validate() {
-      return HTTPResponse.error(
-        "INVALID_RESOURCES",
-        message: "Invalid resources: CPU count 1-32, memory 2GB-128GB, disk 20GB-8TB",
-        statusCode: 400
-      )
+    let force: Bool
+    do {
+      force = try HTTPQueryParameters.boolean(named: "force", in: request, defaultValue: false) ?? false
+    } catch {
+      return invalidQueryParameter(error)
     }
-
-    let force = request.queryParameters["force"]?.lowercased() == "true"
     let ephemeral = cloneRequest.ephemeral ?? false
 
     do {
       let definition = try await vmManager.cloneVM(
         vmId,
         name: cloneRequest.name,
-        resources: resources,
+        cpuCount: cloneRequest.resources?.cpuCount,
+        memorySize: cloneRequest.resources?.memorySize?.bytes,
+        diskSize: cloneRequest.resources?.diskSize?.bytes,
         force: force,
-        ephemeral: ephemeral
+        ephemeral: ephemeral,
+        lifetimeSeconds: cloneRequest.lifetimeSeconds
       )
       let response = await makeVMResponse(from: definition)
       return HTTPResponse.json(response, statusCode: 201)

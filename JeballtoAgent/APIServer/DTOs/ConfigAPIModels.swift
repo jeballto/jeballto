@@ -18,13 +18,11 @@ struct ConfigResponse: Codable {
 struct APIConfigResponse: Codable {
   let port: Int
   let host: String
-  let enableHTTPS: Bool
   let maxConcurrentRequests: Int
 
   init(from config: APIConfig) {
     port = config.port
     host = config.host
-    enableHTTPS = config.enableHTTPS
     maxConcurrentRequests = config.maxConcurrentRequests
   }
 }
@@ -36,12 +34,29 @@ struct LoggingConfigResponse: Codable {
   let maxTotalSize: String
   let timezone: String?
 
+  enum CodingKeys: String, CodingKey {
+    case level
+    case enableFileLogging
+    case retentionDays
+    case maxTotalSize
+    case timezone
+  }
+
   init(from config: LoggingConfig) {
     level = config.level
     enableFileLogging = config.enableFileLogging
     retentionDays = config.retentionDays
     maxTotalSize = config.maxTotalSize
     timezone = config.timezone
+  }
+
+  func encode(to encoder: Encoder) throws {
+    var container = encoder.container(keyedBy: CodingKeys.self)
+    try container.encode(level, forKey: .level)
+    try container.encode(enableFileLogging, forKey: .enableFileLogging)
+    try container.encode(retentionDays, forKey: .retentionDays)
+    try container.encode(maxTotalSize, forKey: .maxTotalSize)
+    try container.encode(timezone, forKey: .timezone)
   }
 }
 
@@ -69,6 +84,15 @@ struct ImageConfigResponse: Codable {
   let maxParallelImageDecompressions: Int
   let maxParallelImageDiskWrites: Int
 
+  enum CodingKeys: String, CodingKey {
+    case defaultRegistry
+    case insecureRegistries
+    case maxParallelImageBlobTransfers
+    case maxParallelImageCompressions
+    case maxParallelImageDecompressions
+    case maxParallelImageDiskWrites
+  }
+
   init(from config: ImageConfig) {
     defaultRegistry = config.defaultRegistry
     insecureRegistries = config.insecureRegistries
@@ -76,6 +100,16 @@ struct ImageConfigResponse: Codable {
     maxParallelImageCompressions = config.maxParallelImageCompressions
     maxParallelImageDecompressions = config.maxParallelImageDecompressions
     maxParallelImageDiskWrites = config.maxParallelImageDiskWrites
+  }
+
+  func encode(to encoder: Encoder) throws {
+    var container = encoder.container(keyedBy: CodingKeys.self)
+    try container.encode(defaultRegistry, forKey: .defaultRegistry)
+    try container.encode(insecureRegistries, forKey: .insecureRegistries)
+    try container.encode(maxParallelImageBlobTransfers, forKey: .maxParallelImageBlobTransfers)
+    try container.encode(maxParallelImageCompressions, forKey: .maxParallelImageCompressions)
+    try container.encode(maxParallelImageDecompressions, forKey: .maxParallelImageDecompressions)
+    try container.encode(maxParallelImageDiskWrites, forKey: .maxParallelImageDiskWrites)
   }
 }
 
@@ -88,8 +122,12 @@ struct UpdateConfigRequest: Codable {
   private static let validLogLevels = ["debug", "info", "warning", "error"]
 
   func validate(currentConfig: NetworkingConfig? = nil) -> (valid: Bool, error: String?) {
-    if logging == nil, networking == nil, images == nil {
-      return (false, "At least one supported config section must be provided: logging, networking, or images")
+    guard containsSupportedUpdate else {
+      return (
+        false,
+        "At least one supported config field must have a non-null value; logging.timezone and "
+          + "images.defaultRegistry may be null to clear them"
+      )
     }
     if let error = Self.validateLogging(logging) {
       return (false, error)
@@ -101,6 +139,12 @@ struct UpdateConfigRequest: Codable {
       return (false, error)
     }
     return (true, nil)
+  }
+
+  private var containsSupportedUpdate: Bool {
+    logging?.containsSupportedUpdate == true
+      || networking?.containsSupportedUpdate == true
+      || images?.containsSupportedUpdate == true
   }
 
   private static func validateLogging(_ logging: LoggingConfigUpdate?) -> String? {
@@ -230,6 +274,10 @@ struct LoggingConfigUpdate: Codable {
       ? .some(container.decodeIfPresent(String.self, forKey: .timezone))
       : nil
   }
+
+  fileprivate var containsSupportedUpdate: Bool {
+    level != nil || retentionDays != nil || maxTotalSize != nil || timezone != nil
+  }
 }
 
 struct NetworkingConfigUpdate: Codable {
@@ -238,6 +286,14 @@ struct NetworkingConfigUpdate: Codable {
   let autoEnableSSHForwarding: Bool?
   let vncPortRangeStart: Int?
   let vncPortRangeEnd: Int?
+
+  fileprivate var containsSupportedUpdate: Bool {
+    sshPortRangeStart != nil
+      || sshPortRangeEnd != nil
+      || autoEnableSSHForwarding != nil
+      || vncPortRangeStart != nil
+      || vncPortRangeEnd != nil
+  }
 }
 
 struct ImageConfigUpdate: Codable {
@@ -274,5 +330,14 @@ struct ImageConfigUpdate: Codable {
     maxParallelImageCompressions = try container.decodeIfPresent(Int.self, forKey: .maxParallelImageCompressions)
     maxParallelImageDecompressions = try container.decodeIfPresent(Int.self, forKey: .maxParallelImageDecompressions)
     maxParallelImageDiskWrites = try container.decodeIfPresent(Int.self, forKey: .maxParallelImageDiskWrites)
+  }
+
+  fileprivate var containsSupportedUpdate: Bool {
+    defaultRegistry != nil
+      || insecureRegistries != nil
+      || maxParallelImageBlobTransfers != nil
+      || maxParallelImageCompressions != nil
+      || maxParallelImageDecompressions != nil
+      || maxParallelImageDiskWrites != nil
   }
 }
