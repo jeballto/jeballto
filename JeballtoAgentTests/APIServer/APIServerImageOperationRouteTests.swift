@@ -262,6 +262,75 @@ struct APIServerImageOperationRouteTests {
   }
 
   @Test
+  func asyncPushFromMissingVMRecordsNotFound() async throws {
+    try await withTemporaryDirectory { root in
+      let server = makeTestAPIServer(root: root)
+      let vmId = UUID()
+      let body = Data(
+        #"{"source":"vm:\#(vmId.uuidString)","reference":"registry.example.com/repo:tag","async":true}"#.utf8
+      )
+
+      let acceptedResponse = await server.handlePushImage(
+        HTTPRequest(method: "POST", path: "/v1/images/push", headers: [:], body: body, queryParameters: [:])
+      )
+      let accepted = try decodedImageOperationStatus(acceptedResponse)
+      let operationId = try #require(UUID(uuidString: accepted.operationId))
+      _ = await server.imageOperationCoordinator.wait(for: operationId)
+      let statusResponse = await server.handleGetImagePushOperation(
+        HTTPRequest(
+          method: "GET",
+          path: "/v1/images/push/operations/\(operationId.uuidString)",
+          headers: [:],
+          body: nil,
+          queryParameters: [:]
+        )
+      )
+      let status = try decodedImageOperationStatus(statusResponse)
+
+      #expect(acceptedResponse.statusCode == 202)
+      #expect(statusResponse.statusCode == 200)
+      #expect(status.status == "failed")
+      #expect(status.errorCode == "NOT_FOUND")
+      #expect(status.error?.contains(vmId.uuidString) == true)
+    }
+  }
+
+  @Test
+  func asyncPushFromNonStoppedVMRecordsInvalidState() async throws {
+    try await withTemporaryDirectory { root in
+      let server = makeTestAPIServer(root: root)
+      let definition = try await server.vmManager.createVM(name: "created-push-vm", resources: .default)
+      let body = Data(
+        #"{"source":"vm:\#(definition.id.uuidString)","reference":"registry.example.com/repo:tag","async":true}"#.utf8
+      )
+
+      let acceptedResponse = await server.handlePushImage(
+        HTTPRequest(method: "POST", path: "/v1/images/push", headers: [:], body: body, queryParameters: [:])
+      )
+      let accepted = try decodedImageOperationStatus(acceptedResponse)
+      let operationId = try #require(UUID(uuidString: accepted.operationId))
+      _ = await server.imageOperationCoordinator.wait(for: operationId)
+      let statusResponse = await server.handleGetImagePushOperation(
+        HTTPRequest(
+          method: "GET",
+          path: "/v1/images/push/operations/\(operationId.uuidString)",
+          headers: [:],
+          body: nil,
+          queryParameters: [:]
+        )
+      )
+      let status = try decodedImageOperationStatus(statusResponse)
+
+      #expect(acceptedResponse.statusCode == 202)
+      #expect(statusResponse.statusCode == 200)
+      #expect(status.status == "failed")
+      #expect(status.errorCode == "INVALID_STATE")
+      #expect(status.error?.contains("must be stopped") == true)
+      try await server.vmManager.deleteVM(definition.id)
+    }
+  }
+
+  @Test
   func successfulAsyncPushRoutePublishesCompletedStatusAfterFinalizing() async throws {
     try await withTemporaryDirectory { root in
       let orasPath = "\(root)/oras"

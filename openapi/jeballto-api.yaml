@@ -2143,9 +2143,12 @@ paths:
         push operation record. When `async` is false or omitted, the endpoint
         blocks until the push reaches a terminal status and returns the final
         operation status with `image` populated on success. When `async` is
-        true, the endpoint returns immediately with the started operation status
-        and a `statusUrl`; source or registry preflight failures are then recorded
-        as a failed operation status. Without `timeout`, there is no caller-supplied
+        true, the endpoint first resolves and reserves the source. A successful
+        reservation returns 202 with the started operation status and a `statusUrl`
+        without waiting for registry preflight, packaging, or upload. A source
+        reservation failure returns 202 with a terminal failed operation status.
+        Registry preflight failures occur after a started response and are recorded
+        in the operation status. Without `timeout`, there is no caller-supplied
         deadline for the complete push. Registry reachability preflight and short
         ORAS metadata commands retain bounded internal deadlines. When set,
         `timeout` starts before source reservation and applies through durable local
@@ -2181,7 +2184,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ImageOperationStatusResponse'
         '202':
-          description: Push operation started
+          description: Push operation accepted, possibly already failed during source reservation
           content:
             application/json:
               schema:
@@ -2398,7 +2401,7 @@ paths:
                       id: a44fb6ea-59f6-478f-b9f7-c76fbdebcf2a
                       reference: registry.example.com/vms/macos:latest
                       digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
-                      localPath: /Users/example/Library/Application Support/Jeballto/images/a44fb6ea-59f6-478f-b9f7-c76fbdebcf2a.bundle
+                      localPath: /Users/example/Library/Application Support/Jeballto/Images/a44fb6ea-59f6-478f-b9f7-c76fbdebcf2a.bundle
                       size: 68719476736
                       resources:
                         cpuCount: 4
@@ -3813,7 +3816,9 @@ components:
           nullable: true
           default: false
           description: >
-            When true, return immediately after creating the push operation.
+            When true, resolve and reserve the source, then return the accepted
+            operation without waiting for registry preflight, packaging, or upload.
+            A source reservation failure is returned as a terminal failed operation.
             When false, null, or omitted, wait for completion and return the final
             operation status.
 
@@ -3885,7 +3890,7 @@ components:
             - 1
           description: >
             Validated Jeballto VM Bundle Format version stored in the local
-            record by Local Image Index v1. Current images report exactly 1.
+            record by Local Image Index v2. Current images report exactly 1.
             An incompatible local index is rejected instead of being exposed
             or rewritten through the API.
           example: 1
@@ -4145,8 +4150,10 @@ components:
             - IMAGE_PUSH_CANCELLED
             - IMAGE_NOT_FOUND
             - IMAGE_IN_USE
+            - NOT_FOUND
             - INVALID_REFERENCE
             - INVALID_IMAGE
+            - INVALID_STATE
             - UNSUPPORTED_IMAGE_FORMAT
           description: >
             Stable machine-readable error code for a failed or cancelled
