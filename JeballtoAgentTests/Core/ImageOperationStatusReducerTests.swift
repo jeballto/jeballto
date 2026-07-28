@@ -162,6 +162,29 @@ struct ImageOperationStatusReducerTests {
   }
 
   @Test
+  func pushSourceFailuresPreserveVMRouteErrorCodes() {
+    let vmId = UUID()
+    let cases: [(VMManagerError, ImageOperationErrorCode)] = [
+      (.vmNotFound(vmId), .notFound),
+      (.invalidState("VM must be stopped before image export"), .invalidState),
+      (.timeout("source reservation exceeded its deadline"), .imagePushTimeout),
+    ]
+
+    for (error, expectedCode) in cases {
+      var status = makeStatus(
+        kind: .push,
+        reference: "registry.example.com/vm:latest",
+        source: "vm:\(vmId.uuidString)"
+      )
+      ImageOperationStatusReducer.fail(&status, error: error)
+
+      #expect(status.errorCode == expectedCode)
+      #expect(ImageOperationStatusResponse(from: status).errorCode == expectedCode.rawValue)
+      #expect(status.error == error.localizedDescription)
+    }
+  }
+
+  @Test
   func infrastructureFailuresUseOperationSpecificCodes() {
     let cases = [
       InfrastructureFailureCase(
