@@ -689,8 +689,6 @@ reported by the polled status endpoint with HTTP 200, `status: "failed"`, and `e
 `UNSUPPORTED_IMAGE_FORMAT` or `INVALID_IMAGE`. Timeout failures use `IMAGE_PULL_TIMEOUT` or `IMAGE_PUSH_TIMEOUT`,
 and registry reachability failures use `IMAGE_PULL_REGISTRY_UNAVAILABLE` or
 `IMAGE_PUSH_REGISTRY_UNAVAILABLE`. Cancelled operations use `IMAGE_PULL_CANCELLED` or `IMAGE_PUSH_CANCELLED`.
-An asynchronous push from a missing VM uses `NOT_FOUND`, while a VM that cannot be exported in its current state
-uses `INVALID_STATE`.
 Pushes also use `IMAGE_PUSH_COMMIT_OUTCOME_UNKNOWN` when manifest publication started but its registry outcome could
 not be confirmed, and `IMAGE_PUSH_PARTIALLY_COMMITTED` when the registry commit was confirmed but the local index
 could not be finalized. Both statuses expose the candidate or confirmed manifest `digest`. Inspect or pull the
@@ -739,8 +737,7 @@ finalization, subject to the commit-wins rules above.
 Image IDs identify local records, not artifact digests. A successful same-reference push, re-push, pull repair, or tag
 replacement may return a new `ImageResponse.id` even when the manifest digest did not change.
 
-To return after source reservation without waiting for registry preflight, packaging, or upload, set `async` to
-`true`:
+To return immediately with operation status, set `async` to `true`:
 
 ```bash
 curl -X POST http://127.0.0.1:8011/v1/images/push \
@@ -752,12 +749,6 @@ curl -X POST http://127.0.0.1:8011/v1/images/push \
     "async": true
   }'
 ```
-
-The agent resolves and reserves the source before it exposes the operation as started. A successful reservation
-returns HTTP 202 with `status: "started"`. If source reservation fails, the same HTTP 202 response contains a
-terminal `status: "failed"` operation with `completedAt`, `errorCode`, and `error` populated. Registry preflight and
-the remaining push work begin only after a successful started response, and later failures are available through
-the operation status endpoint.
 
 ```http
 GET /v1/images/push/operations/{operationId}

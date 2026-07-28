@@ -204,8 +204,8 @@ Persistence contracts have separate integer versions:
 
 | Contract | Current version | Version field | Compatibility rule |
 |---|---:|---|---|
-| VM database | v2 | Top-level `version` in `vms.json` | Requires version 2 and the complete v2 `VMDefinition` schema |
-| Local image index | v2 | Top-level `version` in `images.json` | Requires version 2, `formatVersion: 1`, explicit owned-bundle metadata, and a managed UUID bundle path |
+| VM database | v1 | Top-level `version` in `vms.json` | Requires version 1 and the complete v1 `VMDefinition` schema |
+| Local image index | v1 | Top-level `version` in `images.json` | Requires version 1, `formatVersion: 1`, explicit owned-bundle metadata, and a managed UUID bundle path |
 | Jeballto VM Bundle Format | v1 | `formatVersion` in the OCI config blob | Requires integer 1 before chunk layers are fetched or reconstructed |
 
 The three version numbers are independent from the application version and from each other. Readers fail closed on

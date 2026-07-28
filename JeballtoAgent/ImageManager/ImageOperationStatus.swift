@@ -43,10 +43,8 @@ enum ImageOperationErrorCode: String, CaseIterable, Sendable {
   case imagePushCancelled = "IMAGE_PUSH_CANCELLED"
   case imageNotFound = "IMAGE_NOT_FOUND"
   case imageInUse = "IMAGE_IN_USE"
-  case notFound = "NOT_FOUND"
   case invalidReference = "INVALID_REFERENCE"
   case invalidImage = "INVALID_IMAGE"
-  case invalidState = "INVALID_STATE"
   case unsupportedImageFormat = "UNSUPPORTED_IMAGE_FORMAT"
 }
 
@@ -319,22 +317,6 @@ enum ImageOperationStatusReducer {
       case .pushPartiallyCommitted:
         return .imagePushPartiallyCommitted
       case .pullFailed, .pushFailed, .deleteFailed:
-        break
-      }
-    }
-
-    if let vmManagerError = error as? VMManagerError {
-      switch vmManagerError {
-      case .vmNotFound:
-        return .notFound
-      case .invalidState:
-        return .invalidState
-      case .timeout:
-        return kind == .pull ? .imagePullTimeout : .imagePushTimeout
-      case .invalidResources,
-           .invalidInstallationSource,
-           .operationFailed,
-           .concurrentVMLimitReached:
         break
       }
     }
