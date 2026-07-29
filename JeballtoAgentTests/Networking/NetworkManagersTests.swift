@@ -6,6 +6,12 @@ import Testing
 @Suite(.tags(.concurrency))
 struct NetworkManagersTests {
   @Test
+  func tcpProxyListenerIsNotRestrictedToLoopback() {
+    let parameters = TCPProxy.makeListenerParameters()
+    #expect(parameters.requiredLocalEndpoint == nil)
+  }
+
+  @Test
   func intentionalLocalNetworkBrowserCancellationIsNotReportedAsFailure() {
     #expect(LocalNetworkPermission.browserFailureDescription(.cancelled) == nil)
     #expect(

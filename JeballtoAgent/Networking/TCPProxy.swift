@@ -56,9 +56,10 @@ final class TCPProxy: @unchecked Sendable {
       return
     }
 
-    // Create TCP listener parameters
-    let parameters = NWParameters.tcp
-    parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any)
+    // Do not constrain requiredLocalEndpoint. SSH and VNC forwarding ports must
+    // accept connections on every host interface so remote CI controllers can
+    // reach them through the same host used for the Jeballto API.
+    let parameters = Self.makeListenerParameters()
 
     // Create listener
     guard let rawLocalPort = UInt16(exactly: localPort), rawLocalPort > 0,
@@ -109,12 +110,16 @@ final class TCPProxy: @unchecked Sendable {
       }
       guard ready else { throw TCPProxyError.listenerStoppedBeforeReady(localPort) }
 
-      logInfo("TCP proxy started: localhost:\(localPort) -> \(remoteHost):\(remotePort)", category: "TCPProxy")
+      logInfo("TCP proxy started: 0.0.0.0:\(localPort) -> \(remoteHost):\(remotePort)", category: "TCPProxy")
     } catch let error as TCPProxyError {
       throw error
     } catch {
       throw TCPProxyError.listenerFailed(error)
     }
+  }
+
+  static func makeListenerParameters() -> NWParameters {
+    NWParameters.tcp
   }
 
   /// Stops the TCP proxy

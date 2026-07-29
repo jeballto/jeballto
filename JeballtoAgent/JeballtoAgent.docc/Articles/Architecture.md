@@ -192,8 +192,8 @@ A slow subscriber delays later callbacks and events on that delivery queue, but 
 
 - Allocates SSH ports from a configurable range (default 2222-2223)
 - Allocates VNC ports from a configurable range (default 5901-5902)
-- Creates TCP proxy: `localhost:port -> VM_NAT_IP:22` (SSH)
-- Creates TCP proxy: `localhost:port -> VM_NAT_IP:5900` (VNC)
+- Creates TCP proxy on all host interfaces: `host:port -> VM_NAT_IP:22` (SSH)
+- Creates TCP proxy on all host interfaces: `host:port -> VM_NAT_IP:5900` (VNC)
 - Releases ports when a VM stops or is deleted; startup clears stale persisted SSH, VNC, and NAT assignments before
   new forwarding is configured
 
