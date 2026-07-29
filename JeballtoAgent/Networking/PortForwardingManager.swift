@@ -83,9 +83,9 @@ actor PortForwardingManager {
   }
 
   /// Sets up SSH port forwarding for a VM
-  /// Creates TCP proxy: localhost:sshPort -> VM_NAT_IP:22
+  /// Creates TCP proxy: host:sshPort -> VM_NAT_IP:22 on all host interfaces
   private func setupSSHForwarding(vmId: UUID, vmIPAddress: String, sshPort: Int) throws {
-    let forwardInfo = "localhost:\(sshPort) -> \(vmIPAddress):22"
+    let forwardInfo = "0.0.0.0:\(sshPort) -> \(vmIPAddress):22"
     logInfo("Setting up SSH forwarding for VM \(vmId): \(forwardInfo)", category: "PortForwarding")
 
     // Check if proxy already exists
@@ -191,9 +191,9 @@ actor PortForwardingManager {
   }
 
   /// Sets up VNC port forwarding for a VM
-  /// Creates TCP proxy: localhost:vncPort -> VM_NAT_IP:5900
+  /// Creates TCP proxy: host:vncPort -> VM_NAT_IP:5900 on all host interfaces
   private func setupVNCForwarding(vmId: UUID, vmIPAddress: String, vncPort: Int) throws {
-    let forwardInfo = "localhost:\(vncPort) -> \(vmIPAddress):5900"
+    let forwardInfo = "0.0.0.0:\(vncPort) -> \(vmIPAddress):5900"
     logInfo("Setting up VNC forwarding for VM \(vmId): \(forwardInfo)", category: "PortForwarding")
 
     // Check if proxy already exists

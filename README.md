@@ -48,6 +48,8 @@ Run `task setup` once, then use `task build`, `task test`, and `task pre-commit:
 1. Download the latest ZIP from [Releases](https://github.com/jeballto/jeballto/releases/latest).
 2. Move `JeballtoAgent.app` to `/Applications` and open it.
 3. Allow Local Network access when macOS asks. SSH and VNC forwarding require it.
+
+SSH and VNC forwarding ports listen on all host interfaces so remote CI controllers can connect. Restrict access to the configured forwarding port ranges with the host firewall when the machine is on an untrusted network.
 4. Choose **Copy API Token** in the Jeballto menu-bar item.
 
 ### Create, install, and open a VM
