@@ -94,9 +94,9 @@ Download the IPSW manually and use the local file path option.
 **Reclaiming disk space used by downloads**
 
 IPSWs are cached at `~/Library/Caches/Jeballto/IPSWCache/` and reused across installs. The cache can consume
-substantial space when it contains several restore images. To remove only this cache, stop the agent and delete that
-directory. A soft `POST /v1/system/reset?confirm=true` also clears it, but that endpoint is destructive: it attempts
-to delete every VM and local image too.
+substantial space when it contains several restore images. A soft system reset preserves this cache, while a hard
+system reset removes it along with other agent-owned state. To remove only the cache, stop the agent and delete that
+directory manually. Restarting the agent does not clear downloaded IPSWs.
 
 ## Command Execution Fails
 

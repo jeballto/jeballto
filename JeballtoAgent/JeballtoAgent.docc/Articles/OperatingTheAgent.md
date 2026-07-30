@@ -71,11 +71,10 @@ old work that has no lock. A symbolic or otherwise unsafe lock target is preserv
 transfers delete their operation cache. Failed or cancelled transfers keep verified work until the process exits,
 and a later startup removes the inactive session.
 
-**Clearing caches:**
-
-- `POST /v1/system/reset` (either mode) attempts to clear the IPSW cache. Hard reset reaches cache cleanup only after
-  every VM and image has been removed successfully.
-- Or remove the directory manually while the agent is stopped.
+Stopping and starting the agent preserves downloaded IPSWs. Startup cleanup is limited to stale image-operation work.
+A soft system reset also preserves downloaded IPSWs so they remain reusable after VMs and local OCI images are
+removed. A hard system reset clears the IPSW cache. To clear only this cache, remove the directory manually while the
+agent is stopped.
 
 An image wipe clears only the current process's image work session and keeps its lock files. It does not scan foreign
 session directories. The next exclusive startup removes inactive or old lockless work. Remove directories with

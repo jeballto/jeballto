@@ -105,16 +105,13 @@ extension APIServer {
     let imagesFailed = imageResult.failed
     errors.append(contentsOf: imageResult.errors)
 
-    // 3. Clear IPSW cache
-    let ipswCacheCleared = clearIPSWCache(&errors)
-
     let response = SystemResetResponse(
       mode: "soft",
       vmsDeleted: vmsDeleted,
       vmsFailed: vmsFailed,
       imagesDeleted: imagesDeleted,
       imagesFailed: imagesFailed,
-      ipswCacheCleared: ipswCacheCleared,
+      ipswCacheCleared: false,
       configDeleted: false,
       logsDeleted: false,
       willTerminate: false,
@@ -238,22 +235,6 @@ extension APIServer {
 
   // MARK: - Helpers
 
-  private func clearIPSWCache(_ errors: inout [String]) -> Bool {
-    clearCacheDirectory(JeballtoCachePaths.ipswCache, label: "IPSW", errors: &errors)
-  }
-
-  private func clearCacheDirectory(_ cacheDir: URL, label: String, errors: inout [String]) -> Bool {
-    guard Self.filesystemEntryExists(at: cacheDir.path) else { return true }
-
-    do {
-      try FileManager.default.removeItem(at: cacheDir)
-      return true
-    } catch {
-      errors.append("Failed to clear \(label) cache: \(error.localizedDescription)")
-      return false
-    }
-  }
-
   static func clearOwnedCacheDirectories(
     root: URL,
     imageWorkSession: URL,
@@ -268,6 +249,7 @@ extension APIServer {
     case .directory:
       break
     }
+
     var ipswCleared = true
     let ipswDirectory = root.appendingPathComponent("IPSWCache", isDirectory: true)
     if filesystemEntryExists(at: ipswDirectory.path) {

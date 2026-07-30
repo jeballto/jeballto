@@ -2143,19 +2143,18 @@ paths:
         push operation record. When `async` is false or omitted, the endpoint
         blocks until the push reaches a terminal status and returns the final
         operation status with `image` populated on success. When `async` is
-        true, the endpoint first resolves and reserves the source. A successful
-        reservation returns 202 with the started operation status and a `statusUrl`
-        without waiting for registry preflight, packaging, or upload. A source
-        reservation failure returns 202 with a terminal failed operation status.
-        Registry preflight failures occur after a started response and are recorded
-        in the operation status. Without `timeout`, there is no caller-supplied
-        deadline for the complete push. Registry reachability preflight and short
-        ORAS metadata commands retain bounded internal deadlines. When set,
-        `timeout` starts before source reservation and applies through durable local
-        index finalization, subject to the commit-wins rules below. If it expires
-        before manifest publication, the operation is cancelled and reports a
-        timeout after cleanup. Blobs are uploaded first, then a validated durable
-        local bundle and complete staged index are prepared before the manifest is
+        true, the endpoint registers a started operation and returns 202 with its
+        `statusUrl` before resolving or reserving the source. Source lookup,
+        reservation, registry preflight, packaging, and upload run in the
+        coordinator-owned task. Any failure in those stages is recorded later in
+        the operation status. Without `timeout`, there is no caller-supplied deadline
+        for the complete push. Registry reachability preflight and short ORAS
+        metadata commands retain bounded internal deadlines. When set, `timeout`
+        starts before source reservation and applies through durable local index
+        finalization, subject to the commit-wins rules below. If it expires before
+        manifest publication, the operation is cancelled and reports a timeout
+        after cleanup. Blobs are uploaded first, then a validated durable local
+        bundle and complete staged index are prepared before the manifest is
         published. The staged index is atomically finalized after manifest success.
         Once manifest publication starts, an unconfirmed outcome or a confirmed
         commit with failed local finalization wins a concurrent timeout and requires
@@ -2184,7 +2183,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ImageOperationStatusResponse'
         '202':
-          description: Push operation accepted, possibly already failed during source reservation
+          description: Push operation started; source lookup and reservation continue asynchronously
           content:
             application/json:
               schema:
@@ -2196,7 +2195,9 @@ paths:
         '404':
           $ref: '#/components/responses/ImagePushSourceNotFound'
         '409':
-          description: Source is not in a pushable state, is in use, or a required capability is unavailable
+          description: >-
+            For a blocking push, the source is not in a pushable state or is in
+            use; for either mode, a required capability may be unavailable
           content:
             application/json:
               schema:
@@ -2831,11 +2832,11 @@ paths:
       description: >
         Reset agent-owned local state. Both modes first cancel tracked
         installations, image operations, and Jeballtofile executions. Soft mode
-        attempts to delete all VMs and images and clear the IPSW cache while
-        preserving configuration and logs; partial failures are reported in a
-        200 response. Hard mode terminates only when every cleanup step succeeds.
-        A partial hard reset returns 500 and leaves the process running. Requires
-        confirm=true as a safety guard.
+        attempts to delete all VMs and images while preserving the IPSW cache,
+        configuration, and logs; partial failures are reported in a 200 response.
+        Hard mode clears downloaded IPSWs and terminates only when every cleanup
+        step succeeds. A partial hard reset returns 500 and leaves the process
+        running. Requires confirm=true as a safety guard.
       operationId: systemReset
       parameters:
         - name: confirm
@@ -3196,6 +3197,7 @@ components:
           nullable: true
           minLength: 1
           x-utf8-maxBytes: 8192
+          x-normalized-utf8-maxBytes: 4096
           description: >
             IPSW source. Accepts an HTTPS URL, a file:// URL, or an absolute
             file path. Input is limited to 8,192 UTF-8 bytes, and a normalized
@@ -3816,11 +3818,10 @@ components:
           nullable: true
           default: false
           description: >
-            When true, resolve and reserve the source, then return the accepted
-            operation without waiting for registry preflight, packaging, or upload.
-            A source reservation failure is returned as a terminal failed operation.
-            When false, null, or omitted, wait for completion and return the final
-            operation status.
+            When true, register and return a started operation before source
+            lookup or reservation. Source preparation and push failures are
+            reported later through the operation status. When false, null, or
+            omitted, wait for completion and return the final operation status.
 
     RegistryLoginRequest:
       type: object
@@ -4654,10 +4655,10 @@ components:
             - soft
             - hard
           description: >
-            Reset mode. "soft" attempts to delete all VMs and images and clear
-            the IPSW cache while keeping configuration and logs. "hard" also
-            attempts to delete all other agent-owned state, including the API
-            token and all Jeballto registry credentials, and terminates only
+            Reset mode. "soft" attempts to delete all VMs and images while
+            keeping downloaded IPSWs, configuration, and logs. "hard" also
+            attempts to delete downloaded IPSWs, configuration, logs, the API
+            token, and all Jeballto registry credentials. It terminates only
             after complete success.
 
     SystemResetResponse:
@@ -4777,6 +4778,7 @@ components:
           nullable: true
           minLength: 1
           x-utf8-maxBytes: 8192
+          x-normalized-utf8-maxBytes: 4096
           description: >
             IPSW source for macOS installation. Accepts HTTPS URL, file:// URL,
             or absolute path. Input is limited to 8,192 UTF-8 bytes, and a
@@ -5072,7 +5074,7 @@ components:
               message: Image operation not found
 
     ImagePushSourceNotFound:
-      description: Source VM or local image not found
+      description: Source VM or local image not found during a blocking push
       content:
         application/json:
           schema:

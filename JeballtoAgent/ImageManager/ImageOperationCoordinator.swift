@@ -41,12 +41,7 @@ actor ImageOperationCoordinator {
     var task: Task<Result<ImageRecord, Error>, Never>?
   }
 
-  private struct PendingAdmission: Sendable {
-    let task: Task<ImageOperationPreparedWork, Error>
-  }
-
   private var operations: [UUID: OperationEntry] = [:]
-  private var pendingAdmissions: [UUID: PendingAdmission] = [:]
   private var acceptsAdmissions = true
   private let maxActiveOperations: Int
   private let maxTerminalOperations: Int
@@ -62,56 +57,17 @@ actor ImageOperationCoordinator {
     source: String? = nil,
     prepare: @Sendable @escaping () async throws -> ImageOperationPreparedWork
   ) async throws -> ImageOperationRegistration {
+    try Task.checkCancellation()
     guard acceptsAdmissions else {
       throw ImageOperationCoordinatorError.admissionsClosed
     }
 
     let activeCount = operations.values.count(where: { $0.status.state.isTerminal == false })
-      + pendingAdmissions.count
     guard activeCount < maxActiveOperations else {
       throw ImageOperationCoordinatorError.capacityReached(limit: maxActiveOperations)
     }
 
     let operationId = UUID()
-    let preparationTask = Task<ImageOperationPreparedWork, Error> {
-      try Task.checkCancellation()
-      return try await prepare()
-    }
-    pendingAdmissions[operationId] = PendingAdmission(task: preparationTask)
-
-    let prepared: ImageOperationPreparedWork
-    do {
-      prepared = try await withTaskCancellationHandler {
-        try await preparationTask.value
-      } onCancel: {
-        preparationTask.cancel()
-      }
-    } catch {
-      pendingAdmissions.removeValue(forKey: operationId)
-      if acceptsAdmissions == false {
-        throw ImageOperationCoordinatorError.admissionsClosed
-      }
-      if error is CancellationError {
-        throw error
-      }
-      return registerPreparationFailure(
-        id: operationId,
-        kind: kind,
-        reference: reference,
-        source: source,
-        error: error
-      )
-    }
-
-    guard Task.isCancelled == false,
-          acceptsAdmissions,
-          pendingAdmissions.removeValue(forKey: operationId) != nil else
-    {
-      preparationTask.cancel()
-      await prepared.release()
-      throw CancellationError()
-    }
-
     let status = ImageOperationStatusReducer.makeStatus(
       id: operationId,
       kind: kind,
@@ -122,6 +78,7 @@ actor ImageOperationCoordinator {
 
     let coordinator = self
     let task = Task<Result<ImageRecord, Error>, Never> {
+      var prepared: ImageOperationPreparedWork?
       let progressSink: ImageOperationProgressSink = { update in
         await coordinator.update(operationId, update: update)
       }
@@ -129,14 +86,19 @@ actor ImageOperationCoordinator {
       let result: Result<ImageRecord, Error>
       do {
         try Task.checkCancellation()
-        result = try await .success(prepared.run(ImageOperationProgressReporter(sink: progressSink)))
+        let work = try await prepare()
+        prepared = work
+        try Task.checkCancellation()
+        result = try await .success(work.run(ImageOperationProgressReporter(sink: progressSink)))
       } catch is CancellationError {
         result = .failure(CancellationError())
       } catch {
         result = .failure(error)
       }
 
-      await prepared.release()
+      if let prepared {
+        await prepared.release()
+      }
       await coordinator.finish(operationId, result: result)
       return result
     }
@@ -197,12 +159,6 @@ actor ImageOperationCoordinator {
   func closeAdmissionsAndDrain() async -> Int {
     acceptsAdmissions = false
 
-    let pending = pendingAdmissions.values.map(\.task)
-    pendingAdmissions.removeAll()
-    for task in pending {
-      task.cancel()
-    }
-
     let activeIds = operations.values
       .map(\.status)
       .filter { $0.state.isTerminal == false }
@@ -210,9 +166,6 @@ actor ImageOperationCoordinator {
     let tasks = markCancellingAndCollectTasks(activeIds)
     for task in tasks {
       task.cancel()
-    }
-    for task in pending {
-      _ = try? await task.value
     }
     for task in tasks {
       _ = await task.value
@@ -261,28 +214,6 @@ actor ImageOperationCoordinator {
     }
     operations[operationId] = entry
     trimTerminalOperationsIfNeeded()
-  }
-
-  private func registerPreparationFailure(
-    id: UUID,
-    kind: ImageOperationKind,
-    reference: String,
-    source: String?,
-    error: Error
-  ) -> ImageOperationRegistration {
-    var status = ImageOperationStatusReducer.makeStatus(
-      id: id,
-      kind: kind,
-      reference: reference,
-      source: source
-    )
-    ImageOperationStatusReducer.fail(&status, error: error)
-    let task = Task<Result<ImageRecord, Error>, Never> {
-      .failure(error)
-    }
-    operations[id] = OperationEntry(status: status, task: task)
-    trimTerminalOperationsIfNeeded()
-    return ImageOperationRegistration(status: status)
   }
 
   private func markCancellingAndCollectTasks(_ operationIds: [UUID]) -> [Task<Result<ImageRecord, Error>, Never>] {

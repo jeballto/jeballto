@@ -288,6 +288,7 @@ struct APIServerImageOperationRouteTests {
       let status = try decodedImageOperationStatus(statusResponse)
 
       #expect(acceptedResponse.statusCode == 202)
+      #expect(accepted.status == "started")
       #expect(statusResponse.statusCode == 200)
       #expect(status.status == "failed")
       #expect(status.errorCode == "NOT_FOUND")

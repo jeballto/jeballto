@@ -21,6 +21,7 @@ struct APIServerHardResetTests {
       #expect(probe.events == ["deleteSecrets"])
       #expect(FileManager.default.fileExists(atPath: "\(root)/config.json") == false)
       #expect(FileManager.default.fileExists(atPath: "\(root)/app-support/state") == false)
+      #expect(body.ipswCacheCleared)
       #expect(FileManager.default.fileExists(atPath: "\(root)/cache/IPSWCache") == false)
       #expect(FileManager.default.fileExists(atPath: "\(root)/logs/agent-2026-01-01.log") == false)
 
