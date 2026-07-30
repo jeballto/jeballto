@@ -135,14 +135,14 @@ directory, the index, registry auth and source reservations; the coordinator own
 
 | Concern | Behaviour |
 |---|---|
-| Admission | One atomic step. An operation that is still preparing counts against capacity, so concurrent callers cannot each pass the check and overshoot |
+| Admission | One atomic step. The coordinator registers `started` before source preparation, so the action route can return immediately and the operation counts against capacity |
 | Capacity | 8 active operations; beyond that the route answers 429 `TOO_MANY_IMAGE_OPERATIONS` |
-| Source reservation | Claimed inside `prepare`, before the operation is visible as started, so a delete racing a push sees 409 `IMAGE_IN_USE` rather than a partially started operation |
+| Source reservation | Claimed inside the coordinator-owned task during `prepare`; source lookup or reservation failures terminalize the already-visible operation |
 | Cancellation | `cancelAndWait` marks the operation cancelling, cancels the task, and waits for it. Every waiter observes the same authoritative outcome |
 | Durable commit | A cancellation arriving after the work committed does not rewrite the result as cancelled |
 | Terminalization | Exactly once. A terminal operation stays terminal, and a second cancel is a no-op |
 | Retention | The newest 100 terminal operations are kept so clients can still read a final status |
-| Drain | `closeAdmissionsAndDrain()` refuses new admissions, cancels pending preparations and active tasks, and waits. Used by reset and shutdown; `resumeAdmissions()` reopens |
+| Drain | `closeAdmissionsAndDrain()` refuses new admissions, cancels active tasks including those still preparing, and waits. Used by reset and shutdown; `resumeAdmissions()` reopens |
 
 Because the coordinator owns the task handles, `APIServer` keeps no image-operation bookkeeping of its own.
 

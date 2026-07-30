@@ -40,9 +40,10 @@ JeballtoAgent.docc/Articles/      - DocC docs (Architecture, APIReference, Jebal
   `getVMInstance()`, and `getVMState()`. `activeVMCount()` includes capacity-consuming states and actor-owned reservations.
 - `PersistenceStore` - ACTOR, ALL methods SYNC. Call `ensureLoaded()` first in every public method
 - `ImageManager` - ACTOR with mixed sync/async declarations; external calls always cross the actor boundary
-- `ImageOperationCoordinator` - ACTOR. Sole owner of image-operation admission, capacity (8 active, pending
-  admissions included), task handles, status, cancellation, terminalization, retention (newest 100 terminal), and
-  drain. An operation reserves its source VM or image inside `prepare`, before it becomes visible as started.
+- `ImageOperationCoordinator` - ACTOR. Sole owner of image-operation admission, capacity (8 active, including
+  operations still preparing), task handles, status, cancellation, terminalization, retention (newest 100 terminal),
+  and drain. An operation becomes visible as started before its coordinator-owned task prepares and reserves its
+  source VM or image.
 - `NetworkManager` - ACTOR; MAC allocation methods are sync, NAT resolution is async
 - `PortForwardingManager` - ACTOR, all SYNC
 - `EventBus` - regular CLASS, DispatchQueue-based, all SYNC, NOT actor

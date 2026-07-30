@@ -739,7 +739,7 @@ finalization, subject to the commit-wins rules above.
 Image IDs identify local records, not artifact digests. A successful same-reference push, re-push, pull repair, or tag
 replacement may return a new `ImageResponse.id` even when the manifest digest did not change.
 
-To return after source reservation without waiting for registry preflight, packaging, or upload, set `async` to
+To return without waiting for source lookup, reservation, registry preflight, packaging, or upload, set `async` to
 `true`:
 
 ```bash
@@ -753,11 +753,9 @@ curl -X POST http://127.0.0.1:8011/v1/images/push \
   }'
 ```
 
-The agent resolves and reserves the source before it exposes the operation as started. A successful reservation
-returns HTTP 202 with `status: "started"`. If source reservation fails, the same HTTP 202 response contains a
-terminal `status: "failed"` operation with `completedAt`, `errorCode`, and `error` populated. Registry preflight and
-the remaining push work begin only after a successful started response, and later failures are available through
-the operation status endpoint.
+The agent registers the operation and returns HTTP 202 with `status: "started"` before resolving or reserving the
+source. Source lookup, reservation, registry preflight, and later push failures are reported through the operation
+status endpoint with terminal `status: "failed"`, `completedAt`, `errorCode`, and `error` fields.
 
 ```http
 GET /v1/images/push/operations/{operationId}
@@ -1081,11 +1079,12 @@ POST /v1/system/reset?confirm=true
 
 Two modes. Both first cancel tracked installations, image operations, and Jeballtofile executions:
 
-- **soft** - Attempts to delete all VMs and images and clear the IPSW cache. Config and logs are preserved. It returns
-  200 with failure counts and messages even when part of the cleanup fails, and the agent keeps running.
-- **hard** - First requires every VM and image deletion to succeed, then attempts to delete caches, the API token,
-  all Jeballto registry credentials, config, and agent log files. It terminates only after every hard-reset step succeeds. A partial failure returns 500,
-  reports what was removed, and leaves the process running so the user can correct the cause and retry.
+- **soft** - Attempts to delete all VMs and images. Downloaded IPSWs, config, and logs are preserved. It returns 200
+  with failure counts and messages even when part of the cleanup fails, and the agent keeps running.
+- **hard** - First requires every VM and image deletion to succeed, then attempts to delete downloaded IPSWs,
+  disposable image work, the API token, all Jeballto registry credentials, config, and agent log files. It terminates
+  only after every hard-reset step succeeds. A partial failure returns 500, reports what was removed, and leaves the
+  process running so the user can correct the cause and retry.
 
 ```bash
 # Soft reset
@@ -1104,7 +1103,7 @@ curl -X POST "http://127.0.0.1:8011/v1/system/reset?confirm=true" \
   "vmsFailed": 0,
   "imagesDeleted": 2,
   "imagesFailed": 0,
-  "ipswCacheCleared": true,
+  "ipswCacheCleared": false,
   "configDeleted": false,
   "logsDeleted": false,
   "willTerminate": false
@@ -1116,7 +1115,7 @@ curl -X POST "http://127.0.0.1:8011/v1/system/reset?confirm=true" \
 | `mode` | string | `soft` or `hard` |
 | `vmsDeleted` / `vmsFailed` | int | Counts of VM delete attempts |
 | `imagesDeleted` / `imagesFailed` | int | Counts of image delete attempts |
-| `ipswCacheCleared` | bool | `~/Library/Caches/Jeballto/IPSWCache/` was cleared |
+| `ipswCacheCleared` | bool | `false` for soft reset; `true` when hard reset cleared the IPSW cache |
 | `configDeleted` / `logsDeleted` | bool | Only true in `hard` mode |
 | `willTerminate` | bool | Agent is exiting after this response (hard mode) |
 | `errors` | string[] | Per-item failure messages; omitted when no errors occurred |

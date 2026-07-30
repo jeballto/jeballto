@@ -1116,7 +1116,9 @@ struct ImageManagerCleanupTests {
   @Test
   func startupCleanupPreservesActiveSessionsAndRemovesOnlyAnUnlockedSession() throws {
     try withTemporaryDirectory(prefix: "image-work-cleanup") { root in
-      let imageWorkRoot = URL(fileURLWithPath: root, isDirectory: true).appendingPathComponent("ImageWork")
+      let cacheRoot = URL(fileURLWithPath: root, isDirectory: true)
+      let imageWorkRoot = cacheRoot.appendingPathComponent("ImageWork")
+      let cachedIPSW = cacheRoot.appendingPathComponent("IPSWCache/restore.ipsw")
       let activeSession = imageWorkRoot.appendingPathComponent("sessions/active-session", isDirectory: true)
       let otherActiveSession = imageWorkRoot.appendingPathComponent("sessions/other-active", isDirectory: true)
       let inactiveSession = imageWorkRoot.appendingPathComponent("sessions/inactive", isDirectory: true)
@@ -1129,6 +1131,11 @@ struct ImageManagerCleanupTests {
       try FileManager.default.createDirectory(at: activeCache, withIntermediateDirectories: true)
       try FileManager.default.createDirectory(at: otherActiveCache, withIntermediateDirectories: true)
       try FileManager.default.createDirectory(at: inactiveCache, withIntermediateDirectories: true)
+      try FileManager.default.createDirectory(
+        at: cachedIPSW.deletingLastPathComponent(),
+        withIntermediateDirectories: true
+      )
+      try Data("keep ipsw".utf8).write(to: cachedIPSW)
       inactiveOwner.release()
 
       ImageManager.cleanupImageWorkDirectory(imageWorkRoot: imageWorkRoot, activeSessionURL: activeSession)
@@ -1136,6 +1143,7 @@ struct ImageManagerCleanupTests {
       #expect(FileManager.default.fileExists(atPath: activeCache.path))
       #expect(FileManager.default.fileExists(atPath: otherActiveCache.path))
       #expect(FileManager.default.fileExists(atPath: inactiveCache.path) == false)
+      #expect(try Data(contentsOf: cachedIPSW) == Data("keep ipsw".utf8))
       withExtendedLifetime((activeOwner, otherActiveOwner)) {}
     }
   }

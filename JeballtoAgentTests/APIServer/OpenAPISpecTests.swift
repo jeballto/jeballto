@@ -83,6 +83,90 @@ struct OpenAPISpecTests {
   }
 
   @Test
+  func ipswInstallSchemasMatchRuntimeWireValues() throws {
+    let spec = try spec
+    let statuses = try Self.enumValues(
+      in: spec,
+      schemaName: "InstallStatusResponse",
+      propertyName: "status"
+    )
+    let expectedStatuses = Set([
+      VMInstallation.State.installing.rawValue,
+      VMInstallation.State.finalizing.rawValue,
+      VMInstallation.State.completed.rawValue,
+      VMInstallation.State.failed.rawValue,
+      VMInstallation.State.cancelled.rawValue,
+      VMInstallation.State.interrupted.rawValue,
+      "not_started",
+      "started",
+    ])
+    #expect(statuses == expectedStatuses)
+
+    let phases = try Self.enumValues(
+      in: spec,
+      schemaName: "InstallStatusResponse",
+      propertyName: "phase"
+    )
+    #expect(phases == Set(["setup", "downloading", "installing", "completed", "cancelled", "failed"]))
+
+    let source = try Self.propertyBlock(
+      in: spec,
+      schemaName: "InstallVMRequest",
+      propertyName: "source"
+    )
+    #expect(source.contains("x-utf8-maxBytes: \(IPSWSourceValidator.maximumSourceLength)"))
+    #expect(source.contains("x-normalized-utf8-maxBytes: \(IPSWSourceValidator.maximumLocalPathLength)"))
+  }
+
+  @Test
+  func systemResetSchemaMatchesEncodedResponseAndIPSWContract() throws {
+    let response = SystemResetResponse(
+      mode: "soft",
+      vmsDeleted: 0,
+      vmsFailed: 0,
+      imagesDeleted: 0,
+      imagesFailed: 0,
+      ipswCacheCleared: false,
+      configDeleted: false,
+      logsDeleted: false,
+      willTerminate: false,
+      errors: nil
+    )
+    let object = try #require(
+      JSONSerialization.jsonObject(with: JSONEncoder().encode(response)) as? [String: Any]
+    )
+    let encodedFields = Set(object.keys)
+    let requiredFields = try Self.requiredFields(in: spec, schemaName: "SystemResetResponse")
+    let documentedFields = try Self.propertyNames(in: spec, schemaName: "SystemResetResponse")
+
+    #expect(encodedFields == requiredFields)
+    #expect(documentedFields == requiredFields.union(["errors"]))
+    #expect(documentedFields.contains("ipswCacheCleared"))
+
+    let resetOperation = try Self.operationBlock(in: spec, path: "/system/reset", method: "post")
+    #expect(resetOperation.contains("while preserving the IPSW cache"))
+    #expect(resetOperation.contains("Hard mode clears downloaded IPSWs"))
+  }
+
+  @Test
+  func asyncPushDescriptionMatchesCoordinatorAdmissionOrder() throws {
+    let spec = try spec
+    let operation = try Self.operationBlock(in: spec, path: "/images/push", method: "post")
+    let asyncProperty = try Self.propertyBlock(
+      in: spec,
+      schemaName: "PushImageRequest",
+      propertyName: "async"
+    )
+
+    #expect(operation.contains("registers a started operation and returns 202"))
+    #expect(operation.contains("before resolving or reserving the source"))
+    #expect(operation.contains("source lookup and reservation continue asynchronously"))
+    #expect(operation.contains("possibly already failed during source reservation") == false)
+    #expect(asyncProperty.contains("return a started operation before source"))
+    #expect(asyncProperty.contains("reported later through the operation status"))
+  }
+
+  @Test
   func imageNotFoundResponsesUseRuntimeErrorCodes() throws {
     let spec = try spec
     let expectedReferences = [
@@ -193,6 +277,55 @@ struct OpenAPISpecTests {
     return lines[componentIndex ..< endIndex].joined(separator: "\n")
   }
 
+  private static func propertyBlock(
+    in spec: String,
+    schemaName: String,
+    propertyName: String
+  ) throws -> String {
+    let lines = try schemaLines(in: spec, schemaName: schemaName)
+    guard let propertyIndex = lines.firstIndex(of: "        \(propertyName):") else {
+      throw OpenAPISpecTestError.missingProperty(schemaName, propertyName)
+    }
+    let endIndex = lines[(propertyIndex + 1)...].firstIndex { line in
+      line.hasPrefix("        ") && line.hasPrefix("          ") == false && line.hasSuffix(":")
+    } ?? lines.endIndex
+    return lines[propertyIndex ..< endIndex].joined(separator: "\n")
+  }
+
+  private static func propertyNames(in spec: String, schemaName: String) throws -> Set<String> {
+    let lines = try schemaLines(in: spec, schemaName: schemaName)
+    guard let propertiesIndex = lines.firstIndex(of: "      properties:") else {
+      throw OpenAPISpecTestError.missingProperties(schemaName)
+    }
+    return Set(lines[(propertiesIndex + 1)...].compactMap { line in
+      guard line.hasPrefix("        "), line.hasPrefix("          ") == false, line.hasSuffix(":") else {
+        return nil
+      }
+      return String(line.dropFirst(8).dropLast())
+    })
+  }
+
+  private static func requiredFields(in spec: String, schemaName: String) throws -> Set<String> {
+    let lines = try schemaLines(in: spec, schemaName: schemaName)
+    guard let requiredIndex = lines.firstIndex(of: "      required:") else {
+      throw OpenAPISpecTestError.missingRequiredFields(schemaName)
+    }
+    return Set(lines[(requiredIndex + 1)...].prefix { $0.hasPrefix("        - ") }.map {
+      String($0.dropFirst(10))
+    })
+  }
+
+  private static func schemaLines(in spec: String, schemaName: String) throws -> [String] {
+    let lines = spec.components(separatedBy: .newlines)
+    guard let schemaIndex = lines.firstIndex(of: "    \(schemaName):") else {
+      throw OpenAPISpecTestError.missingSchema(schemaName)
+    }
+    let endIndex = lines[(schemaIndex + 1)...].firstIndex { line in
+      line.hasPrefix("    ") && line.hasPrefix("      ") == false && line.hasSuffix(":")
+    } ?? lines.endIndex
+    return Array(lines[schemaIndex ..< endIndex])
+  }
+
   private static func documentedRouteSignatures(in spec: String) -> Set<HTTPRouteSignature> {
     let methods = Set(["get", "post", "put", "patch", "delete", "head", "options", "trace"])
     var result: Set<HTTPRouteSignature> = []
@@ -299,6 +432,8 @@ struct OpenAPISpecTests {
 private enum OpenAPISpecTestError: Error {
   case missingSchema(String)
   case missingProperty(String, String)
+  case missingProperties(String)
+  case missingRequiredFields(String)
   case missingEnum(String, String)
   case missingPath(String)
   case missingMethod(path: String, method: String)

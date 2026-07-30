@@ -44,10 +44,10 @@ struct ImageOperationCoordinatorTests {
     _ = await coordinator.cancelAll()
   }
 
-  /// The admission model counts operations that are still preparing. Without this, N callers
-  /// could clear the capacity check simultaneously and only be counted once each became visible.
+  /// Preparation runs after registration, so accepted operations are visible and consume
+  /// capacity while source lookup or reservation is still in progress.
   @Test
-  func pendingAdmissionsCountTowardCapacity() async throws {
+  func preparingOperationsAreVisibleAndCountTowardCapacity() async throws {
     let coordinator = ImageOperationCoordinator(maxActiveOperations: 2)
     let firstPreparing = AsyncTestSignal()
     let secondPreparing = AsyncTestSignal()
@@ -71,8 +71,7 @@ struct ImageOperationCoordinatorTests {
     await firstPreparing.wait()
     await secondPreparing.wait()
 
-    // Both are pending, neither is visible as started yet - capacity must already be full.
-    #expect(await coordinator.list(activeOnly: true).isEmpty)
+    #expect(await coordinator.list(activeOnly: true).count == 2)
     await #expect(throws: ImageOperationCoordinatorError.self) {
       _ = try await start(on: coordinator, run: runUntilCancelled)
     }
@@ -86,23 +85,25 @@ struct ImageOperationCoordinatorTests {
   }
 
   @Test
-  func preparationFailureIsRecordedAsATerminalOperation() async throws {
+  func preparationFailureStartsAsynchronouslyThenBecomesTerminal() async throws {
     let coordinator = ImageOperationCoordinator()
 
     let registration = try await coordinator.start(kind: .pull, reference: testImageOperationReference) {
       throw ImageManagerError.registryUnavailable("offline")
     }
 
-    #expect(registration.status.state == .failed)
-    #expect(registration.status.errorCode == .imagePullRegistryUnavailable)
+    #expect(registration.status.state == .started)
+    #expect(registration.status.errorCode == nil)
+    _ = await coordinator.wait(for: registration.status.id)
     let status = try #require(await coordinator.status(for: registration.status.id))
     #expect(status.state == .failed)
+    #expect(status.errorCode == .imagePullRegistryUnavailable)
     // A failed admission must not hold a slot.
     #expect(await coordinator.list(activeOnly: true).isEmpty)
   }
 
-  /// If the caller goes away between a successful prepare and registration, the prepared work
-  /// must be released rather than leaked - it may hold a source reservation.
+  /// Cancellation during preparation must release prepared work if the preparation callback
+  /// completes after observing cancellation, because it may have acquired a source reservation.
   @Test
   func cancellationAfterPreparationReleasesPreparedWork() async throws {
     let coordinator = ImageOperationCoordinator()
@@ -110,27 +111,25 @@ struct ImageOperationCoordinatorTests {
     let releasePreparation = AsyncTestSignal()
     let released = AsyncTestSignal()
 
-    let starting = Task {
-      try await coordinator.start(kind: .push, reference: testImageOperationReference) {
-        await preparing.signal()
-        await releasePreparation.wait()
-        return ImageOperationPreparedWork(
-          run: runUntilCancelled,
-          release: { await released.signal() }
-        )
-      }
+    let registration = try await coordinator.start(kind: .push, reference: testImageOperationReference) {
+      await preparing.signal()
+      await releasePreparation.wait()
+      return ImageOperationPreparedWork(
+        run: runUntilCancelled,
+        release: { await released.signal() }
+      )
     }
 
     await preparing.wait()
-    starting.cancel()
+    let cancellation = Task {
+      await coordinator.cancelAndWait(registration.status.id)
+    }
     await releasePreparation.signal()
 
-    await #expect(throws: CancellationError.self) {
-      _ = try await starting.value
-    }
+    #expect(await cancellation.value)
     await released.wait()
     #expect(await released.hasBeenSignalled())
-    #expect(await coordinator.list(activeOnly: false).isEmpty)
+    #expect(await coordinator.status(for: registration.status.id)?.state == .cancelled)
   }
 
   @Test

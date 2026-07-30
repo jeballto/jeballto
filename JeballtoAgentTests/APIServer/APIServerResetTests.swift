@@ -5,7 +5,41 @@ import Testing
 @Suite(.tags(.apiRoutes), .serialized)
 struct APIServerResetTests {
   @Test
-  func cacheCleanupRemovesOnlyOwnedChildrenAndPreservesOverrideRootContents() throws {
+  func softResetPreservesIPSWCache() async throws {
+    try await withTemporaryDirectory(prefix: "soft-reset-ipsw") { root in
+      let cacheRoot = URL(fileURLWithPath: "\(root)/cache", isDirectory: true)
+      let cachedIPSW = cacheRoot.appendingPathComponent("IPSWCache/restore.ipsw")
+      try FileManager.default.createDirectory(
+        at: cachedIPSW.deletingLastPathComponent(),
+        withIntermediateDirectories: true
+      )
+      try Data("keep ipsw".utf8).write(to: cachedIPSW)
+      let environment = SystemResetEnvironment(
+        appSupportDirectory: "\(root)/app-support",
+        defaultLogDirectory: "\(root)/logs",
+        cacheRoot: cacheRoot,
+        deleteSecrets: {},
+        terminate: {}
+      )
+      let server = makeTestAPIServer(root: root, systemResetEnvironment: environment)
+
+      let response = await server.handleSystemReset(HTTPRequest(
+        method: "POST",
+        path: "/v1/system/reset",
+        headers: ["content-type": "application/json"],
+        body: Data(#"{"mode":"soft"}"#.utf8),
+        queryParameters: ["confirm": "true"]
+      ))
+      let body = try JSONDecoder().decode(SystemResetResponse.self, from: #require(response.body))
+
+      #expect(response.statusCode == 200)
+      #expect(body.ipswCacheCleared == false)
+      #expect(try Data(contentsOf: cachedIPSW) == Data("keep ipsw".utf8))
+    }
+  }
+
+  @Test
+  func hardResetCacheCleanupRemovesIPSWsAndDisposableImageWork() throws {
     try withTemporaryDirectory(prefix: "reset-cache-root") { root in
       let cacheRoot = URL(fileURLWithPath: root, isDirectory: true)
       let ipsw = cacheRoot.appendingPathComponent("IPSWCache", isDirectory: true)
@@ -15,6 +49,8 @@ struct APIServerResetTests {
         .appendingPathComponent(UUID().uuidString, isDirectory: true)
       let sentinel = cacheRoot.appendingPathComponent("unrelated.txt")
       try FileManager.default.createDirectory(at: ipsw, withIntermediateDirectories: true)
+      let cachedIPSW = ipsw.appendingPathComponent("restore.ipsw")
+      try Data("remove ipsw".utf8).write(to: cachedIPSW)
       let sessionLock = try ImageWorkSessionLock(sessionURL: imageWorkSession)
       let workItem = imageWorkSession.appendingPathComponent("work")
       try Data("remove".utf8).write(to: workItem)
@@ -29,7 +65,7 @@ struct APIServerResetTests {
 
       #expect(ipswCleared)
       #expect(errors.isEmpty)
-      #expect(FileManager.default.fileExists(atPath: ipsw.path) == false)
+      #expect(FileManager.default.fileExists(atPath: cachedIPSW.path) == false)
       #expect(FileManager.default.fileExists(atPath: workItem.path) == false)
       #expect(FileManager.default.fileExists(atPath: imageWorkSession.path))
       #expect(FileManager.default.fileExists(atPath: sentinel.path))
